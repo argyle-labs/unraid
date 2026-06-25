@@ -2241,6 +2241,7 @@ dependencies = [
  "derive",
  "dispatch",
  "graphql",
+ "graphql_client",
  "inventory",
  "macro-runtime",
  "notifications",
@@ -2251,6 +2252,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3723,14 +3725,9 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 name = "unraid"
 version = "0.1.0"
 dependencies = [
- "graphql_client",
  "plugin-toolkit",
  "plugin-toolkit-build",
- "serde",
- "serde_json",
- "sha2 0.10.9",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "wiremock",
 ]

@@ -13,9 +13,7 @@ use plugin_toolkit::prelude::*;
 
 use crate::{Config, schema_pull};
 
-#[derive(clap::Args, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(crate = "plugin_toolkit::serde")]
-#[schemars(crate = "plugin_toolkit::schemars")]
+#[plugin_struct(args)]
 pub struct UnraidSchemaArgs {
     /// Base URL of a live Unraid host (e.g. `https://<host>.local`).
     /// Required to do anything other than list embedded versions.
@@ -42,9 +40,8 @@ pub struct UnraidSchemaArgs {
     pub dir: Option<PathBuf>,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug)]
-#[serde(crate = "plugin_toolkit::serde")]
-#[schemars(crate = "plugin_toolkit::schemars")]
+#[plugin_struct]
+#[derive(Debug)]
 pub struct PulledSchema {
     pub version: String,
     pub path: String,
@@ -52,9 +49,8 @@ pub struct PulledSchema {
     pub bytes: u64,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug)]
-#[serde(crate = "plugin_toolkit::serde")]
-#[schemars(crate = "plugin_toolkit::schemars")]
+#[plugin_struct]
+#[derive(Debug)]
 pub struct DriftReport {
     pub probed_version: String,
     /// Hex sha256 of the committed introspection JSON for `probed_version`,
@@ -64,9 +60,8 @@ pub struct DriftReport {
     pub identical: bool,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug)]
-#[serde(crate = "plugin_toolkit::serde")]
-#[schemars(crate = "plugin_toolkit::schemars")]
+#[plugin_struct]
+#[derive(Debug)]
 pub struct UnraidSchemaOutput {
     /// Versions with a committed introspection JSON inside the
     /// `unraid-generated` crate.
@@ -143,9 +138,8 @@ async fn unraid_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plugin_toolkit::contract::ToolCtx;
     use plugin_toolkit::contract::config::{Config as OrcaConfig, Model};
-    use serde_json::json;
+    use plugin_toolkit::prelude::{json, ToolCtx};
     use std::path::PathBuf;
     use std::sync::Arc;
     use wiremock::matchers::{method, path};

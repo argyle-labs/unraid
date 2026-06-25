@@ -18,10 +18,10 @@
 use crate::endpoint::{EndpointRow, endpoint_db};
 use crate::{Client, Config};
 use plugin_toolkit::contract::TopologyClaim;
-use plugin_toolkit::{anyhow, runtime, tracing};
+use plugin_toolkit::prelude::*;
 
 /// Collect docker container claims from every registered Unraid endpoint.
-pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
+pub async fn collect_claims() -> Result<Vec<TopologyClaim>> {
     // Pull the endpoint list, then drop the connection before any await —
     // rusqlite's `Connection` is not `Send` and must not cross an await.
     let endpoints = {
@@ -43,7 +43,7 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
     Ok(out)
 }
 
-async fn collect_for_endpoint(ep: &EndpointRow) -> anyhow::Result<Vec<TopologyClaim>> {
+async fn collect_for_endpoint(ep: &EndpointRow) -> Result<Vec<TopologyClaim>> {
     let cfg = Config::new(ep.base_url.clone(), ep.api_key.clone()).insecure(ep.insecure);
     let data = Client::new(cfg).docker_containers().await?;
     Ok(data

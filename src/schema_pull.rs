@@ -15,9 +15,8 @@
 //! "write into the repo source tree" and "stash in a tmpdir for diffing"
 //! use cases.
 
-use crate::{Client, Config, UnraidError};
-use plugin_toolkit::anyhow::{self, Context, Result, anyhow};
-use sha2::{Digest, Sha256};
+use crate::{Client, Config};
+use plugin_toolkit::prelude::*;
 use std::path::{Path, PathBuf};
 
 /// Drift report: live server schema vs the committed one for the
@@ -40,8 +39,7 @@ pub async fn check_drift(cfg: Config) -> Result<DriftReport> {
     let client = Client::new(cfg.clone());
     let probed_version = client
         .probe_version()
-        .await
-        .map_err(map_err)?
+        .await?
         .ok_or_else(|| anyhow!("unraid server returned null version"))?;
     let live = run_introspection(&cfg).await?;
     let live_sha256 = sha256_hex(live.as_bytes());
@@ -69,9 +67,7 @@ pub fn embedded_for(probed: &str) -> Option<&'static str> {
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex(&hasher.finalize())
+    plugin_toolkit::hash::sha256_hex(bytes)
 }
 
 /// Result of a successful schema pull.
@@ -94,8 +90,7 @@ pub async fn schema_pull(cfg: Config, dir: &Path) -> Result<SchemaPull> {
 
     let version = client
         .probe_version()
-        .await
-        .map_err(map_err)?
+        .await?
         .ok_or_else(|| anyhow!("unraid server returned null version — auth ok but vars empty"))?;
 
     let introspection_json = run_introspection(&cfg).await?;
@@ -133,11 +128,11 @@ pub async fn introspect_raw(
     headers: &std::collections::HashMap<String, String>,
     insecure: bool,
 ) -> Result<String> {
-    let body = serde_json::json!({
-        "query": plugin_toolkit::graphql::INTROSPECTION_QUERY,
+    let body = json!({
+        "query": graphql::INTROSPECTION_QUERY,
         "operationName": "IntrospectionQuery",
     });
-    let http = plugin_toolkit::http::Client::new();
+    let http = http::Client::new();
     let mut builder = http.post(endpoint).json(body);
     for (k, v) in headers {
         builder = builder.header(k, v);
@@ -149,22 +144,10 @@ pub async fn introspect_raw(
     Ok(resp.text())
 }
 
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-fn map_err(e: UnraidError) -> anyhow::Error {
-    anyhow::Error::new(e)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use plugin_toolkit::prelude::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
