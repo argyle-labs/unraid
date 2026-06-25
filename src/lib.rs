@@ -25,8 +25,7 @@ use crate::generated::v7_3_1::{
     Shares, VarsVersion, add_plugin, array_status, docker_containers, installed_plugins,
     parity_history, remove_plugin, shares, vars_version,
 };
-use plugin_toolkit::graphql::{Client as GraphQlClient, GraphQlErrors};
-use plugin_toolkit::thiserror::Error;
+use plugin_toolkit::graphql::{Client as GraphQlClient, GraphQLQuery, GraphQlErrors};
 use plugin_toolkit::tracing;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -105,10 +104,31 @@ impl Config {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum UnraidError {
-    #[error(transparent)]
-    GraphQl(#[from] GraphQlErrors),
+    GraphQl(GraphQlErrors),
+}
+
+impl std::fmt::Display for UnraidError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnraidError::GraphQl(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for UnraidError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            UnraidError::GraphQl(e) => Some(e),
+        }
+    }
+}
+
+impl From<GraphQlErrors> for UnraidError {
+    fn from(e: GraphQlErrors) -> Self {
+        UnraidError::GraphQl(e)
+    }
 }
 
 /// Result of [`Client::warn_on_drift`].
@@ -308,7 +328,7 @@ impl Client {
 
     async fn run<Q>(&self, variables: Q::Variables) -> Result<Q::ResponseData, UnraidError>
     where
-        Q: graphql_client::GraphQLQuery,
+        Q: GraphQLQuery,
     {
         Ok(self
             .gql
@@ -325,7 +345,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use plugin_toolkit::prelude::json;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

@@ -8,37 +8,27 @@ build = "build.rs"
 name = "unraid"
 path = "src/lib.rs"
 
-# Unraid GraphQL plugin. The typed client is codegenned by `graphql_client`
-# from committed introspection schemas (`schemas/<version>.introspection.json`)
-# against the `.graphql` query files in `queries/` — `build.rs` runs codegen
-# through `plugin_toolkit_build::graphql::generate`, emitting one module per
-# committed Unraid version. Add a new version by dropping its introspection
-# JSON into `schemas/` and rebuilding.
+# Unraid GraphQL plugin. The typed client is codegenned from committed
+# introspection schemas (`schemas/<version>.introspection.json`) against the
+# `.graphql` query files in `queries/` — `build.rs` runs codegen through
+# `plugin_toolkit_build::graphql::generate`, which rewrites every emitted
+# `serde::` / `graphql_client::` path to `::plugin_toolkit::*` and anchors the
+# generated serde derives, so the generated module names no external crate.
+# Add a new version by dropping its introspection JSON into `schemas/`.
 
 [dependencies]
-# The SOLE orca dependency. All macro-emitted paths (`#[orca_tool]`,
-# `endpoint_resource!`, dispatch's `register_op!`) resolve through
-# `::plugin_toolkit::*`, and every orca primitive the plugin source touches
-# (contract / graphql / http / runtime / tracing / serde / schemars / clap /
-# anyhow / inventory / db / rusqlite / async-trait / dispatch / derive /
-# macro-runtime) is re-exported by the toolkit + its prelude.
+# The SOLE dependency. Every external crate the plugin needs (serde, serde_json,
+# schemars, clap, graphql_client, sha2, thiserror, anyhow, tracing, tokio, …) is
+# reached through `plugin_toolkit::*` / its prelude, injected by
+# `#[plugin_struct]` / `#[orca_tool]`, or rewritten into the generated GraphQL
+# module by the build-time codegen. The plugin source names no external crate.
 #
-# Pinned to the orca rc tag that carries the plugin-toolkit surface. The
-# committed `[patch]` in `.cargo/config.toml` overrides this to the local
-# in-tree toolkit for development; the git tag is what an external checkout
-# without the orca repo resolves against.
+# Pinned to the orca rc tag that carries the plugin-toolkit surface. REQUIRES an
+# rc >= the one containing the codegen path-rewrite + `plugin_toolkit::hash` +
+# `graphql::GraphQLQuery` re-export (the single-dep toolkit slice). Until that rc
+# is cut, the committed `[patch]` in `.cargo/config.toml` resolves these to the
+# local in-tree toolkit at ../orca.
 plugin-toolkit = { git = "https://github.com/scottdkey/orca", tag = "v0.0.8-rc.7" }
-
-# Genuinely-external, non-orca runtime deps. `graphql_client`'s derive emits
-# bare `::graphql_client` / `::serde` / `::serde_json` crate-root paths in the
-# generated query modules that no `crate = ...` attribute can redirect, and
-# thiserror v2's derive emits bare `::thiserror`. These are the plugin's own
-# transitive deps, exactly as a third-party plugin would carry them.
-graphql_client = { version = "0.14", default-features = false }
-serde       = { version = "1", features = ["derive"] }
-serde_json  = "1"
-thiserror   = "2"
-sha2        = "0.10"
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
