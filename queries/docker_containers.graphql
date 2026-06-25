@@ -1,0 +1,13 @@
+query DockerContainers {
+  docker {
+    id
+    containers {
+      id
+      names
+      image
+      state
+      status
+      autoStart
+    }
+  }
+}

@@ -1,0 +1,55 @@
+[package]
+name = "unraid"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "unraid"
+path = "src/lib.rs"
+
+# Unraid GraphQL plugin. The typed client is codegenned by `graphql_client`
+# from committed introspection schemas (`schemas/<version>.introspection.json`)
+# against the `.graphql` query files in `queries/` — `build.rs` runs codegen
+# through `plugin_toolkit_build::graphql::generate`, emitting one module per
+# committed Unraid version. Add a new version by dropping its introspection
+# JSON into `schemas/` and rebuilding.
+
+[dependencies]
+# The SOLE orca dependency. All macro-emitted paths (`#[orca_tool]`,
+# `endpoint_resource!`, dispatch's `register_op!`) resolve through
+# `::plugin_toolkit::*`, and every orca primitive the plugin source touches
+# (contract / graphql / http / runtime / tracing / serde / schemars / clap /
+# anyhow / inventory / db / rusqlite / async-trait / dispatch / derive /
+# macro-runtime) is re-exported by the toolkit + its prelude.
+#
+# Pinned to the orca rc tag that carries the plugin-toolkit surface. The
+# committed `[patch]` in `.cargo/config.toml` overrides this to the local
+# in-tree toolkit for development; the git tag is what an external checkout
+# without the orca repo resolves against.
+plugin-toolkit = { git = "https://github.com/scottdkey/orca", tag = "v0.0.8-rc.7" }
+
+# Genuinely-external, non-orca runtime deps. `graphql_client`'s derive emits
+# bare `::graphql_client` / `::serde` / `::serde_json` crate-root paths in the
+# generated query modules that no `crate = ...` attribute can redirect, and
+# thiserror v2's derive emits bare `::thiserror`. These are the plugin's own
+# transitive deps, exactly as a third-party plugin would carry them.
+graphql_client = { version = "0.14", default-features = false }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "2"
+sha2        = "0.10"
+
+[dev-dependencies]
+tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
+tempfile = "3"
+
+[build-dependencies]
+plugin-toolkit-build = { git = "https://github.com/scottdkey/orca", tag = "v0.0.8-rc.7" }
+
+# Match orca's workspace lint floor: discarding a Result/Option via
+# `let _ = ...` was a load-bearing past incident, so keep it a hard error here
+# too — the plugin must stay portable back into the orca workspace.
+[lints.clippy]
+let_underscore_must_use = "deny"

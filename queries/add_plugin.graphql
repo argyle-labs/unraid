@@ -1,0 +1,3 @@
+mutation AddPlugin($input: PluginManagementInput!) {
+  addPlugin(input: $input)
+}
