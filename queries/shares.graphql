@@ -1,0 +1,19 @@
+query Shares {
+  shares {
+    id
+    name
+    free
+    used
+    size
+    include
+    exclude
+    cache
+    comment
+    allocator
+    splitLevel
+    floor
+    cow
+    color
+    luksStatus
+  }
+}

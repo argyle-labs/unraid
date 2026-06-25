@@ -1,0 +1,13 @@
+query ParityHistory {
+  parityHistory {
+    date
+    duration
+    speed
+    status
+    errors
+    progress
+    correcting
+    paused
+    running
+  }
+}

@@ -1,0 +1,3 @@
+query InstalledPlugins {
+  installedUnraidPlugins
+}
