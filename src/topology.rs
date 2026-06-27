@@ -15,7 +15,7 @@
 //! so it can't blank out claims from the others. Returns empty silently
 //! when no endpoints are registered.
 
-use crate::endpoint::{EndpointRow, endpoint_db};
+use crate::endpoint::{endpoint_db, EndpointRow};
 use crate::{Client, Config};
 use plugin_toolkit::contract::TopologyClaim;
 use plugin_toolkit::prelude::*;
