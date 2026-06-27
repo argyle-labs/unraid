@@ -15,7 +15,7 @@ use crate::{Config, schema_pull};
 
 #[plugin_struct(args)]
 pub struct UnraidSchemaArgs {
-    /// Base URL of a live Unraid host (e.g. `https://willow.local`).
+    /// Base URL of a live Unraid host (e.g. `https://tower.local`).
     /// Required to do anything other than list embedded versions.
     #[arg(long)]
     pub from: Option<String>,
