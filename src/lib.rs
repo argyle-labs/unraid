@@ -21,9 +21,9 @@ pub mod topology;
 pub mod version;
 
 use crate::generated::v7_3_1::{
-    AddPlugin, ArrayStatus, DockerContainers, InstalledPlugins, ParityHistory, RemovePlugin,
-    Shares, VarsVersion, add_plugin, array_status, docker_containers, installed_plugins,
-    parity_history, remove_plugin, shares, vars_version,
+    add_plugin, array_status, docker_containers, installed_plugins, parity_history, remove_plugin,
+    shares, vars_version, AddPlugin, ArrayStatus, DockerContainers, InstalledPlugins,
+    ParityHistory, RemovePlugin, Shares, VarsVersion,
 };
 use plugin_toolkit::graphql::{Client as GraphQlClient, GraphQLQuery, GraphQlErrors};
 use plugin_toolkit::tracing;
