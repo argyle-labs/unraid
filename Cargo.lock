@@ -576,6 +576,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 
@@ -2229,6 +2230,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
+name = "plugin-abi"
+version = "0.0.8-rc.8"
+dependencies = [
+ "abi_stable",
+ "schemars 1.2.1",
+ "serde",
+]
+
+[[package]]
 name = "plugin-toolkit"
 version = "0.0.8-rc.8"
 dependencies = [
@@ -2251,6 +2261,7 @@ dependencies = [
  "macro-runtime",
  "notifications",
  "openapi",
+ "plugin-abi",
  "progenitor-client",
  "regex",
  "regress 0.10.5",
