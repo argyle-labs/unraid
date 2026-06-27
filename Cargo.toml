@@ -7,6 +7,9 @@ build = "build.rs"
 [lib]
 name = "unraid"
 path = "src/lib.rs"
+# cdylib: the loadable plugin orca's plugin-loader `dlopen`s (-> `libunraid.so`).
+# rlib: keeps the crate usable as a normal Rust dependency (tests, codegen).
+crate-type = ["cdylib", "rlib"]
 
 # Unraid GraphQL plugin. The typed client is codegenned from committed
 # introspection schemas (`schemas/<version>.introspection.json`) against the
@@ -29,6 +32,13 @@ path = "src/lib.rs"
 # is cut, the committed `[patch]` in `.cargo/config.toml` resolves these to the
 # local in-tree toolkit at ../orca.
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+
+# The ONE genuine non-orca dep: `#[export_root_module]` (in `abi_export.rs`)
+# expands to bare `::abi_stable` paths in this crate's root — the cdylib FFI
+# boundary orca's plugin-loader `dlopen`s — so it can't route through the
+# toolkit. Pinned to the orca workspace version (0.11) so the layout hash baked
+# into the cdylib matches what the loader checks at load time.
+abi_stable = "0.11"
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }

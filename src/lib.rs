@@ -14,6 +14,7 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 }
 
+pub mod abi_export;
 pub mod endpoint;
 pub mod schema_pull;
 pub mod tools;
