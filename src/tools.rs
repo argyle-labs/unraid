@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use plugin_toolkit::prelude::*;
 
-use crate::{Config, schema_pull};
+use crate::{schema_pull, Config};
 
 #[plugin_struct(args)]
 pub struct UnraidSchemaArgs {
@@ -79,10 +79,7 @@ pub struct UnraidSchemaOutput {
 /// live host and either pulls a fresh introspection (when `dir` set) or
 /// reports drift (when `check_drift` set).
 #[orca_tool(domain = "unraid", verb = "schema")]
-async fn unraid_schema(
-    args: UnraidSchemaArgs,
-    _ctx: &ToolCtx,
-) -> Result<UnraidSchemaOutput> {
+async fn unraid_schema(args: UnraidSchemaArgs, _ctx: &ToolCtx) -> Result<UnraidSchemaOutput> {
     let embedded_versions = crate::generated::SCHEMAS
         .iter()
         .map(|(v, _)| (*v).to_string())
@@ -119,9 +116,10 @@ async fn unraid_schema(
         });
     }
 
-    let dir = args.dir.as_deref().ok_or_else(|| {
-        anyhow!("`dir` is required when `from` is set without `check_drift`")
-    })?;
+    let dir = args
+        .dir
+        .as_deref()
+        .ok_or_else(|| anyhow!("`dir` is required when `from` is set without `check_drift`"))?;
     let out = schema_pull::schema_pull(cfg, dir).await?;
     Ok(UnraidSchemaOutput {
         embedded_versions,
