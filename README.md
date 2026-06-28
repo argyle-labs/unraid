@@ -1,6 +1,6 @@
 # unraid
 
-An [orca](https://github.com/scottdkey/orca) plugin that adapts an Unraid host's
+An [orca](https://github.com/argyle-labs/orca) plugin that adapts an Unraid host's
 GraphQL API into the orca system: typed queries over array / shares / Docker /
 plugins, an endpoint registry, a topology collector, and version-aware schema
 drift detection.
