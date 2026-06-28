@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon-256.png" width="120" alt="unraid" />
+</p>
+
 # unraid
 
 An [orca](https://github.com/argyle-labs/orca) plugin that adapts an Unraid host's
