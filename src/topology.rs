@@ -22,12 +22,9 @@ use plugin_toolkit::prelude::*;
 
 /// Collect docker container claims from every registered Unraid endpoint.
 pub async fn collect_claims() -> Result<Vec<TopologyClaim>> {
-    // Pull the endpoint list, then drop the connection before any await —
-    // rusqlite's `Connection` is not `Send` and must not cross an await.
-    let endpoints = {
-        let conn = runtime::open_db()?;
-        endpoint_db::list(&conn)?
-    };
+    // `endpoint_db::list()` routes through the host DB channel and manages its
+    // own connection, so nothing non-`Send` crosses the awaits below.
+    let endpoints = endpoint_db::list()?;
 
     let mut out = Vec::new();
     for ep in endpoints.into_iter().filter(|e| e.enabled) {
