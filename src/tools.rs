@@ -11,7 +11,50 @@ use std::path::PathBuf;
 
 use plugin_toolkit::prelude::*;
 
-use crate::{Config, schema_pull};
+use crate::endpoint::endpoint_db;
+use crate::{Client, Config, schema_pull};
+
+/// Resolve a [`Client`] for an auto-generated surface tool (`crate::surface`).
+///
+/// Connection selection, in order: an explicit `from` + `api_key` override wins
+/// (paired with optional `insecure`); otherwise the named endpoint from the
+/// registry (`unraid.{list,create,...}`); otherwise, when `endpoint` is omitted
+/// and exactly one endpoint is registered, that sole endpoint. Anything else is
+/// an error naming the fix.
+pub(crate) async fn surface_client(
+    endpoint: Option<String>,
+    from: Option<String>,
+    api_key: Option<String>,
+    insecure: Option<bool>,
+) -> Result<Client> {
+    if let Some(url) = from {
+        let key = api_key.ok_or_else(|| anyhow!("`api_key` is required when `from` is set"))?;
+        return Ok(Client::new(
+            Config::new(url, key).insecure(insecure.unwrap_or(false)),
+        ));
+    }
+    let row = match endpoint {
+        Some(name) => endpoint_db::get(&name)?
+            .ok_or_else(|| anyhow!("no unraid endpoint named `{name}` — see `unraid.list`"))?,
+        None => {
+            let mut all = endpoint_db::list()?;
+            match all.len() {
+                1 => all.remove(0),
+                0 => bail!(
+                    "no unraid endpoints registered — add one with `unraid.create`, \
+                     or pass `from` + `api_key`"
+                ),
+                n => bail!(
+                    "{n} unraid endpoints registered — pass `endpoint` to pick one, \
+                     or `from` + `api_key`"
+                ),
+            }
+        }
+    };
+    Ok(Client::new(
+        Config::new(row.base_url, row.api_key).insecure(row.insecure),
+    ))
+}
 
 #[plugin_struct(args)]
 pub struct UnraidSchemaArgs {
