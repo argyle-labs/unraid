@@ -1,7 +1,7 @@
 [package]
 name = "unraid"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Adapts an Unraid host's GraphQL API into orca — typed queries, topology, schema-drift detection"
 build = "build.rs"
 

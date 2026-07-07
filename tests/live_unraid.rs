@@ -62,7 +62,13 @@ async fn live_read_sweep() {
     };
     let key = std::env::var("UNRAID_TEST_KEY").expect("UNRAID_TEST_KEY");
     let insecure = std::env::var("UNRAID_TEST_INSECURE").is_ok();
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // Best-effort: a provider may already be installed process-wide.
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        eprintln!("live_unraid: rustls provider already installed");
+    }
 
     let cfg = Config::new(url, key).insecure(insecure);
     let client = Client::new_probed(cfg).await.expect("probe unraid version");
