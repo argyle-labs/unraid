@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use plugin_toolkit::prelude::*;
 
-use crate::{schema_pull, Config};
+use crate::{Config, schema_pull};
 
 #[plugin_struct(args)]
 pub struct UnraidSchemaArgs {
@@ -137,7 +137,7 @@ async fn unraid_schema(args: UnraidSchemaArgs, _ctx: &ToolCtx) -> Result<UnraidS
 mod tests {
     use super::*;
     use plugin_toolkit::contract::config::{Config as OrcaConfig, Model};
-    use plugin_toolkit::prelude::{json, ToolCtx};
+    use plugin_toolkit::prelude::{ToolCtx, json};
     use std::path::PathBuf;
     use std::sync::Arc;
     use wiremock::matchers::{method, path};

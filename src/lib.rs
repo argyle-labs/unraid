@@ -16,15 +16,16 @@ pub mod generated {
 
 pub mod abi_export;
 pub mod endpoint;
+pub mod registration;
 pub mod schema_pull;
 pub mod tools;
 pub mod topology;
 pub mod version;
 
 use crate::generated::v7_3_1::{
-    add_plugin, array_status, docker_containers, installed_plugins, parity_history, remove_plugin,
-    shares, vars_version, AddPlugin, ArrayStatus, DockerContainers, InstalledPlugins,
-    ParityHistory, RemovePlugin, Shares, VarsVersion,
+    AddPlugin, ArrayStatus, DockerContainers, InstalledPlugins, ParityHistory, RemovePlugin,
+    Shares, VarsVersion, add_plugin, array_status, docker_containers, installed_plugins,
+    parity_history, remove_plugin, shares, vars_version,
 };
 use plugin_toolkit::graphql::{Client as GraphQlClient, GraphQLQuery, GraphQlErrors};
 use plugin_toolkit::tracing;
