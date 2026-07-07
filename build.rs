@@ -10,22 +10,23 @@
 //! Codegen plumbing is centralised in `orca-plugin-toolkit-build` per
 //! [[feedback-plugin-toolkit-is-the-gateway]].
 //!
-//! After codegen, the unraid-local `build/surface.rs` prototype walks the
-//! emitted query modules and generates one `#[orca_tool]` per GraphQL
+//! After codegen, the shared `plugin_toolkit_build::surface::graphql` pass walks
+//! the emitted query modules and generates one `#[orca_tool]` per GraphQL
 //! operation (the GraphQL analogue of proxmox's OpenAPI surface pass).
 
-#[path = "build/surface.rs"]
-mod surface;
-
 fn main() {
-    println!("cargo:rerun-if-changed=build/surface.rs");
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let schemas_dir = manifest_dir.join("schemas");
     let queries_dir = manifest_dir.join("queries");
-    plugin_toolkit_build::graphql::generate(schemas_dir, queries_dir)
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    plugin_toolkit_build::graphql::generate(&schemas_dir, &queries_dir)
         .expect("unraid graphql codegen");
 
-    // Prototype: generate the orca tool surface from the just-emitted query
-    // modules — one `#[orca_tool]` per GraphQL operation.
-    surface::generate().expect("unraid surface codegen");
+    // Generate the orca tool surface from the just-emitted query modules via the
+    // shared toolkit pass (was the local `build/surface.rs` prototype). Mutations
+    // surface as `data_mutation = true` + `role = "admin"`; a specific operation
+    // can opt out to `role = "read"` via a `# @orca:user-callable` comment in its
+    // `.graphql` file.
+    plugin_toolkit_build::surface::graphql::generate(&out_dir, &queries_dir, "unraid")
+        .expect("unraid surface codegen");
 }
