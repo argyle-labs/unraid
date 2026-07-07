@@ -4226,9 +4226,13 @@ name = "unraid"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
+ "anyhow",
  "plugin-toolkit",
  "plugin-toolkit-build",
+ "prettyplease",
+ "quote",
  "rustls",
+ "syn 2.0.118",
  "tempfile",
  "tokio",
  "wiremock",

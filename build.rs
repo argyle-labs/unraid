@@ -9,11 +9,23 @@
 //!
 //! Codegen plumbing is centralised in `orca-plugin-toolkit-build` per
 //! [[feedback-plugin-toolkit-is-the-gateway]].
+//!
+//! After codegen, the unraid-local `build/surface.rs` prototype walks the
+//! emitted query modules and generates one `#[orca_tool]` per GraphQL
+//! operation (the GraphQL analogue of proxmox's OpenAPI surface pass).
+
+#[path = "build/surface.rs"]
+mod surface;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build/surface.rs");
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let schemas_dir = manifest_dir.join("schemas");
     let queries_dir = manifest_dir.join("queries");
     plugin_toolkit_build::graphql::generate(schemas_dir, queries_dir)
         .expect("unraid graphql codegen");
+
+    // Prototype: generate the orca tool surface from the just-emitted query
+    // modules — one `#[orca_tool]` per GraphQL operation.
+    surface::generate().expect("unraid surface codegen");
 }

@@ -14,6 +14,17 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 }
 
+/// Auto-generated orca tool surface — one `#[orca_tool]` per GraphQL operation,
+/// emitted by `build/surface.rs` from the codegen'd query modules. Query
+/// operations surface as read tools, mutations as `role = "admin"` tools; args
+/// carry the operation's `Variables` (plus endpoint/override selection) and the
+/// return is the typed `ResponseData`. Adding a `.graphql` file auto-surfaces a
+/// tool — nothing here is hand-written.
+#[allow(non_camel_case_types, clippy::all)]
+pub mod surface {
+    include!(concat!(env!("OUT_DIR"), "/unraid_surface.rs"));
+}
+
 pub mod abi_export;
 pub mod endpoint;
 pub mod registration;
@@ -326,6 +337,17 @@ impl Client {
     ) -> Result<remove_plugin::ResponseData, UnraidError> {
         self.run::<RemovePlugin>(remove_plugin::Variables { input })
             .await
+    }
+
+    /// Run any generated [`GraphQLQuery`] and return its typed `ResponseData`.
+    /// This is the generic entry the auto-generated tool surface
+    /// (`build/surface.rs`) dispatches through; the hand-written methods above
+    /// are thin typed aliases over the same path.
+    pub async fn query<Q>(&self, variables: Q::Variables) -> Result<Q::ResponseData, UnraidError>
+    where
+        Q: GraphQLQuery,
+    {
+        self.run::<Q>(variables).await
     }
 
     async fn run<Q>(&self, variables: Q::Variables) -> Result<Q::ResponseData, UnraidError>

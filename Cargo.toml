@@ -53,6 +53,16 @@ rustls   = "0.23"
 [build-dependencies]
 plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
+# Prototype GraphQL→orca-surface generator (build/surface.rs). Walks the emitted
+# query modules, pairs each operation via its `OPERATION_NAME`/`QUERY` consts,
+# anchors JsonSchema/Deserialize on the operation types, and emits one
+# `#[orca_tool]` per operation. The GraphQL analogue of proxmox's OpenAPI surface
+# pass; lifts into plugin-toolkit-build once proven.
+syn          = { version = "2", features = ["full", "extra-traits", "parsing", "printing"] }
+quote        = "1"
+prettyplease = "0.2"
+anyhow       = "1"
+
 # Match orca's workspace lint floor: discarding a Result/Option via
 # `let _ = ...` was a load-bearing past incident, so keep it a hard error here
 # too — the plugin must stay portable back into the orca workspace.
