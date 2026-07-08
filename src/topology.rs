@@ -54,6 +54,7 @@ async fn collect_for_endpoint(ep: &EndpointRow) -> Result<Vec<TopologyClaim>> {
             macs: Vec::new(),
             provider: "unraid".to_string(),
             provider_instance: ep.name.clone(),
+            ..Default::default()
         })
         .collect())
 }
