@@ -11,9 +11,18 @@ category = "infra"
 [lib]
 name = "unraid"
 path = "src/lib.rs"
-# cdylib: the loadable plugin orca's plugin-loader `dlopen`s (-> `libunraid.so`).
-# rlib: keeps the crate usable as a normal Rust dependency (tests, codegen).
-crate-type = ["cdylib", "rlib"]
+# Dynamic (subprocess) plugin: orca spawns the `[[bin]]` and drives it over the
+# orca socket, so no `cdylib` artifact is emitted. `rlib` retains the in-crate
+# `#[cfg(test)]` harness + lets the `[[bin]]`, the codegen build, and the
+# workspace use it as a normal Rust lib.
+crate-type = ["rlib"]
+
+# The orca plugin entrypoint orca spawns and drives over the socket. `main.rs`
+# is the toolkit's `serve_tool_plugin!` hybrid arm (tool surface + topology
+# backend), replacing the retired cdylib `export_tool_plugin!` FFI export.
+[[bin]]
+name = "unraid"
+path = "src/main.rs"
 
 # Unraid GraphQL plugin. The typed client is codegenned from committed
 # introspection schemas (`schemas/<version>.introspection.json`) against the
@@ -29,6 +38,10 @@ crate-type = ["cdylib", "rlib"]
 # reached through `plugin_toolkit::*` / its prelude, injected by
 # `#[plugin_struct]` / `#[orca_tool]`, or rewritten into the generated GraphQL
 # module by the build-time codegen. The plugin source names no external crate.
+# The dynamic (subprocess) plugin names no external crate at all: retiring the
+# cdylib dropped the lone `abi_stable` FFI dep, since `serve_tool_plugin!`
+# reaches orca over the socket rather than across a `#[export_root_module]`
+# ABI boundary.
 #
 # Pinned to the orca rc tag that carries the plugin-toolkit surface. REQUIRES an
 # rc >= the one containing the codegen path-rewrite + `plugin_toolkit::hash` +
@@ -36,13 +49,6 @@ crate-type = ["cdylib", "rlib"]
 # is cut, the committed `[patch]` in `.cargo/config.toml` resolves these to the
 # local in-tree toolkit at ../orca.
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
-
-# The ONE genuine non-orca dep: `#[export_root_module]` (in `abi_export.rs`)
-# expands to bare `::abi_stable` paths in this crate's root — the cdylib FFI
-# boundary orca's plugin-loader `dlopen`s — so it can't route through the
-# toolkit. Pinned to the orca workspace version (0.11) so the layout hash baked
-# into the cdylib matches what the loader checks at load time.
-abi_stable = "0.11"
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
