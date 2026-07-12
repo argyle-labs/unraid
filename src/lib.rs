@@ -25,7 +25,6 @@ pub mod surface {
     include!(concat!(env!("OUT_DIR"), "/unraid_surface.rs"));
 }
 
-pub mod abi_export;
 pub mod endpoint;
 pub mod registration;
 pub mod schema_pull;
