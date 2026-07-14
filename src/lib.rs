@@ -25,6 +25,7 @@ pub mod surface {
     include!(concat!(env!("OUT_DIR"), "/unraid_surface.rs"));
 }
 
+pub mod checks;
 pub mod endpoint;
 pub mod registration;
 pub mod schema_pull;
@@ -32,10 +33,14 @@ pub mod tools;
 pub mod topology;
 pub mod version;
 
+/// Diagnostics-provider registry name (the `Finding.provider` / `RepairArgs.provider`
+/// key and the `diagnostics` [`crate::registration`] backend name).
+pub const PROVIDER: &str = "unraid";
+
 use crate::generated::v7_3_1::{
     AddPlugin, ArrayStatus, DockerContainers, InstalledPlugins, ParityHistory, RemovePlugin,
-    Shares, VarsVersion, add_plugin, array_status, docker_containers, installed_plugins,
-    parity_history, remove_plugin, shares, vars_version,
+    Shares, VarsVersion, Vms, add_plugin, array_status, docker_containers, installed_plugins,
+    parity_history, remove_plugin, shares, vars_version, vms,
 };
 use plugin_toolkit::graphql::{Client as GraphQlClient, GraphQLQuery, GraphQlErrors};
 use plugin_toolkit::tracing;
@@ -242,6 +247,14 @@ impl Client {
 
     pub async fn parity_history(&self) -> Result<parity_history::ResponseData, UnraidError> {
         self.run::<ParityHistory>(parity_history::Variables).await
+    }
+
+    /// Enumerate VM domains this Unraid host manages. Used by the diagnostics
+    /// `docker-vm-autostart` check to flag running VMs that can stall an array
+    /// stop — the 7.3.1 `VmDomain` type exposes no autostart flag, so only
+    /// running state is available.
+    pub async fn vms(&self) -> Result<vms::ResponseData, UnraidError> {
+        self.run::<Vms>(vms::Variables).await
     }
 
     pub async fn add_plugin(
