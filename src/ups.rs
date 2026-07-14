@@ -54,7 +54,7 @@ pub fn state(args_json: &str) -> Result<String, String> {
                 },
                 model: (!d.model.is_empty()).then_some(d.model),
                 battery_charge: Some(d.battery.charge_level as f64),
-                battery_runtime_secs: Some(d.battery.estimated_runtime),
+                battery_runtime_ms: Some(d.battery.estimated_runtime * 1000),
                 input_voltage: Some(d.power.input_voltage),
                 load_percent: Some(d.power.load_percentage as f64),
                 on_battery,
@@ -83,8 +83,9 @@ pub fn config_get(args_json: &str) -> Result<String, String> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "default".to_string()),
         battery_level: c.battery_level,
-        minutes: c.minutes,
-        timeout: c.timeout,
+        // Unraid reports these in its native minutes/seconds; orca carries ms.
+        low_runtime_ms: c.minutes.map(|m| m * 60_000),
+        on_battery_timeout_ms: c.timeout.map(|s| s * 1000),
         kill_power: c.kill_ups.map(|k| k.eq_ignore_ascii_case("yes")),
         shutdown_cmd: None,
     };
@@ -100,6 +101,9 @@ pub fn config_set(args_json: &str) -> Result<String, String> {
     let Some(client) = first_client() else {
         return Err("no Unraid endpoint registered (not on the peer?)".to_string());
     };
+    // `UPSConfigInput` fields (`minutes`, `timeout`) are Unraid's own API units,
+    // NOT orca units — orca carries ms and we convert to Unraid's native
+    // minutes/seconds here at the API boundary (the edge).
     let input = UPSConfigInput {
         service: None,
         ups_cable: None,
@@ -108,8 +112,8 @@ pub fn config_set(args_json: &str) -> Result<String, String> {
         device: None,
         override_ups_capacity: None,
         battery_level: cfg.battery_level,
-        minutes: cfg.minutes,
-        timeout: cfg.timeout,
+        minutes: cfg.low_runtime_ms.map(|ms| ms / 60_000),
+        timeout: cfg.on_battery_timeout_ms.map(|ms| ms / 1000),
         kill_ups: cfg.kill_power.map(|k| {
             if k {
                 UPSKillPower::YES
