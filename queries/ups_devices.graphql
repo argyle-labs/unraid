@@ -1,0 +1,16 @@
+query UpsDevices {
+  upsDevices {
+    id
+    name
+    model
+    status
+    battery {
+      chargeLevel
+      estimatedRuntime
+    }
+    power {
+      inputVoltage
+      loadPercentage
+    }
+  }
+}
