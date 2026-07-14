@@ -1,0 +1,3 @@
+mutation ConfigureUps($config: UPSConfigInput!) {
+  configureUps(config: $config)
+}

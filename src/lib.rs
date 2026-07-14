@@ -31,6 +31,7 @@ pub mod registration;
 pub mod schema_pull;
 pub mod tools;
 pub mod topology;
+pub mod ups;
 pub mod version;
 
 /// Diagnostics-provider registry name (the `Finding.provider` / `RepairArgs.provider`
@@ -38,9 +39,10 @@ pub mod version;
 pub const PROVIDER: &str = "unraid";
 
 use crate::generated::v7_3_1::{
-    AddPlugin, ArrayStatus, DockerContainers, InstalledPlugins, ParityHistory, RemovePlugin,
-    Shares, VarsVersion, Vms, add_plugin, array_status, docker_containers, installed_plugins,
-    parity_history, remove_plugin, shares, vars_version, vms,
+    AddPlugin, ArrayStatus, ConfigureUps, DockerContainers, InstalledPlugins, ParityHistory,
+    RemovePlugin, Shares, UpsConfiguration, UpsDevices, VarsVersion, Vms, add_plugin, array_status,
+    configure_ups, docker_containers, installed_plugins, parity_history, remove_plugin, shares,
+    ups_configuration, ups_devices, vars_version, vms,
 };
 use plugin_toolkit::graphql::{Client as GraphQlClient, GraphQLQuery, GraphQlErrors};
 use plugin_toolkit::tracing;
@@ -242,6 +244,26 @@ impl Client {
     /// read path on Unraid).
     pub async fn docker_containers(&self) -> Result<docker_containers::ResponseData, UnraidError> {
         self.run::<DockerContainers>(docker_containers::Variables)
+            .await
+    }
+
+    /// `upsDevices` — live UPS state (battery, power) for the core ups provider.
+    pub async fn ups_devices(&self) -> Result<ups_devices::ResponseData, UnraidError> {
+        self.run::<UpsDevices>(ups_devices::Variables).await
+    }
+
+    /// `upsConfiguration` — apcupsd thresholds + kill-power for the ups provider.
+    pub async fn ups_configuration(&self) -> Result<ups_configuration::ResponseData, UnraidError> {
+        self.run::<UpsConfiguration>(ups_configuration::Variables)
+            .await
+    }
+
+    /// `configureUps` — apply UPS thresholds / kill-power over the Unraid API.
+    pub async fn configure_ups(
+        &self,
+        config: configure_ups::UPSConfigInput,
+    ) -> Result<configure_ups::ResponseData, UnraidError> {
+        self.run::<ConfigureUps>(configure_ups::Variables { config })
             .await
     }
 

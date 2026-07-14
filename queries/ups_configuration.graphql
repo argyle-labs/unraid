@@ -1,0 +1,10 @@
+query UpsConfiguration {
+  upsConfiguration {
+    service
+    upsName
+    batteryLevel
+    minutes
+    timeout
+    killUps
+  }
+}

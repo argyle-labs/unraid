@@ -25,7 +25,7 @@ use std::path::Path;
 use plugin_toolkit::contract::diagnostics::{
     DiagnoseArgs, Finding, RepairArgs, RepairOutcome, RepairSpec, Severity,
 };
-use plugin_toolkit::export::runtime;
+use plugin_toolkit::reactor;
 use plugin_toolkit::serde_json;
 
 use crate::endpoint::{EndpointRow, endpoint_db};
@@ -96,6 +96,7 @@ fn config_repair(id: &str, description: &str) -> RepairSpec {
         description: description.to_string(),
         automatic: false,
         privileged: true,
+        delegate: None,
     }
 }
 
@@ -257,7 +258,7 @@ fn check_docker_vm_autostart() -> Option<Finding> {
     if rows.is_empty() {
         return None;
     }
-    let (offenders, errors) = runtime().block_on(collect_autostart(&rows));
+    let (offenders, errors) = reactor::block_on(collect_autostart(&rows));
     if offenders.is_empty() {
         if errors.is_empty() {
             return Some(finding(
@@ -302,7 +303,7 @@ fn check_unclean_shutdown() -> Option<Finding> {
         Err(_) => return None,
     };
     let row = rows.into_iter().next()?;
-    let running = runtime().block_on(async move {
+    let running = reactor::block_on(async move {
         let cfg = Config::new(row.base_url, row.api_key).insecure(row.insecure);
         Client::new(cfg)
             .parity_history()

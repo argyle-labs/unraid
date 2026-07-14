@@ -20,11 +20,13 @@
 //! update,delete}` endpoint registry) to the tool surface.
 
 use plugin_toolkit::abi::BackendDef;
-use plugin_toolkit::export::{runtime, topology_backend_def};
+use plugin_toolkit::backend_def::topology_backend_def;
+use plugin_toolkit::reactor;
 use plugin_toolkit::serde_json;
 
 const TOPO_PREFIX: &str = "unraid.__topo";
 const DIAG_PREFIX: &str = "unraid.__diag";
+const UPS_PREFIX: &str = "unraid.__ups";
 
 /// Backend descriptors this plugin advertises:
 /// - a `topology` collector (`unraid.__topo.collect_claims`), derived from the
@@ -39,6 +41,12 @@ pub fn backends_json() -> String {
             domain: "diagnostics".to_string(),
             name: crate::PROVIDER.to_string(),
             invoke_prefix: DIAG_PREFIX.to_string(),
+            ..Default::default()
+        },
+        BackendDef {
+            domain: "ups".to_string(),
+            name: crate::PROVIDER.to_string(),
+            invoke_prefix: UPS_PREFIX.to_string(),
             ..Default::default()
         },
     ];
@@ -66,15 +74,25 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
             other => Err(format!("unknown diagnostics op: {other}")),
         });
     }
+    if let Some(op) = name
+        .strip_prefix(UPS_PREFIX)
+        .and_then(|s| s.strip_prefix('.'))
+    {
+        return Some(match op {
+            "state" => crate::ups::state(args_json),
+            "config_get" => crate::ups::config_get(args_json),
+            "config_set" => crate::ups::config_set(args_json),
+            other => Err(format!("unknown ups op: {other}")),
+        });
+    }
     None
 }
 
 fn dispatch_topology(op: &str) -> Result<String, String> {
     match op {
         "collect_claims" => {
-            let claims = runtime()
-                .block_on(crate::topology::collect_claims())
-                .map_err(|e| e.to_string())?;
+            let claims =
+                reactor::block_on(crate::topology::collect_claims()).map_err(|e| e.to_string())?;
             serde_json::to_string(&claims).map_err(|e| e.to_string())
         }
         other => Err(format!("unknown topology op: {other}")),
