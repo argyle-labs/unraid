@@ -105,6 +105,10 @@ pub struct Config {
 }
 
 impl Config {
+    /// Local nginx proxy for the Unraid GraphQL API — the reachable URL for a
+    /// colocated collector when no explicit `base_url` is set.
+    pub const LOCAL_BASE_URL: &'static str = "http://127.0.0.1";
+
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
@@ -119,7 +123,24 @@ impl Config {
     }
 
     fn endpoint(&self) -> String {
-        format!("{}/graphql", self.base_url.trim_end_matches('/'))
+        format!("{}/graphql", self.base())
+    }
+
+    /// The base URL to build requests against. On Unraid the GraphQL API is
+    /// reached through the local nginx proxy at `http://127.0.0.1` (which
+    /// fronts the root-owned unix socket), and the topology collector runs
+    /// COLOCATED on the box — so an empty/unset `base_url` resolves to that
+    /// loopback default instead of yielding a relative URL. This also keeps
+    /// the collector working if the stored `base_url` is ever lost (an
+    /// endpoint's URL is not load-bearing when the daemon is on the same host).
+    /// An explicit `base_url` (e.g. a remote `from` probe) is honored as-is.
+    fn base(&self) -> &str {
+        let trimmed = self.base_url.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            Self::LOCAL_BASE_URL
+        } else {
+            trimmed
+        }
     }
 }
 
@@ -573,5 +594,28 @@ mod tests {
         let c = Config::new("http://srv/", "tok").insecure(true);
         assert_eq!(c.endpoint(), "http://srv/graphql");
         assert!(c.insecure);
+    }
+
+    #[test]
+    fn endpoint_defaults_empty_base_url_to_loopback() {
+        // Colocated collector: an empty/blank stored base_url must resolve to
+        // the local nginx proxy, not yield a relative URL.
+        assert_eq!(
+            Config::new("", "tok").endpoint(),
+            "http://127.0.0.1/graphql"
+        );
+        assert_eq!(
+            Config::new("   ", "tok").endpoint(),
+            "http://127.0.0.1/graphql"
+        );
+    }
+
+    #[test]
+    fn endpoint_honors_explicit_base_url() {
+        // A real base_url (e.g. a remote `from` probe) is used as-is.
+        assert_eq!(
+            Config::new("http://10.10.10.10", "tok").endpoint(),
+            "http://10.10.10.10/graphql"
+        );
     }
 }
