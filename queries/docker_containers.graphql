@@ -8,6 +8,9 @@ query DockerContainers {
       state
       status
       autoStart
+      iconUrl
+      webUiUrl
+      isUpdateAvailable
     }
   }
 }
