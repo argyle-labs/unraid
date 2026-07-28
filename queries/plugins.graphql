@@ -1,0 +1,11 @@
+# Rich plugin listing: name + installed version (and whether each plugin
+# ships an API/CLI module). Complements `installedUnraidPlugins` (which
+# returns only package names) so orca can show versions and detect drift.
+query Plugins {
+  plugins {
+    name
+    version
+    hasApiModule
+    hasCliModule
+  }
+}

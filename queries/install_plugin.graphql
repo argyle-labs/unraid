@@ -1,0 +1,21 @@
+# Install OR update an Unraid plugin by its `.plg` URL. `forced: true`
+# reinstalls even when the plugin is already present — that IS the update
+# path. Routing orca's own update through Unraid's plugin manager (rather
+# than an unprivileged in-daemon copy) is what makes it durable: the plugin
+# manager runs as root and owns the USB /boot write, so the refreshed binary
+# survives reboot instead of being reverted to the stale flash copy.
+#
+# Returns a PluginInstallOperation; the install runs asynchronously, so poll
+# `pluginInstallOperations` (or fetch by id) for QUEUED → RUNNING → SUCCEEDED.
+mutation InstallPlugin($input: InstallPluginInput!) {
+  unraidPlugins {
+    installPlugin(input: $input) {
+      id
+      url
+      name
+      status
+      createdAt
+      finishedAt
+    }
+  }
+}

@@ -27,7 +27,8 @@ orca talks to a live Unraid host through its **GraphQL API** (typed queries, no 
 | --- | --- |
 | `unraid.list` / `unraid.detail` / `unraid.create` / `unraid.update` / `unraid.delete` | Endpoint registry — register the Unraid hosts orca reads (base URL, `x-api-key`, self-signed TLS). The API key is stored secret-side. |
 | `unraid.schema` | Inspect the embedded GraphQL schemas, pull a fresh introspection from a live host, or check drift between live and committed. |
-| `unraid.<operation>` | **Auto-generated, one per GraphQL operation** — e.g. `unraid.array_status`, `unraid.shares`, `unraid.docker_containers`, `unraid.installed_plugins`, `unraid.parity_history`, `unraid.add_plugin`, `unraid.remove_plugin`. Args carry the operation's typed variables; the return is its typed response. Mutations require `role = "admin"`. See below. |
+| `unraid.<operation>` | **Auto-generated, one per GraphQL operation** — e.g. `unraid.array_status`, `unraid.shares`, `unraid.docker_containers`, `unraid.parity_history`. Args carry the operation's typed variables; the return is its typed response. Mutations require `role = "admin"`. See below. |
+| `unraid.plugins` / `unraid.installed_plugins` / `unraid.add_plugin` / `unraid.remove_plugin` / `unraid.install_plugin` / `unraid.plugin_install_operations` | **Plugin management** over the Unraid plugin manager: list (with versions), add, remove, and install/update by `.plg` URL. `unraid.install_plugin` with `forced: true` is the update path — because the plugin manager runs as root and owns the USB `/boot` write, routing orca's **own** update through it is what makes a self-update survive reboot (vs. the unprivileged daemon, which can't write flash). Installs are async — poll `unraid.plugin_install_operations` for `QUEUED → RUNNING → SUCCEEDED`. |
 
 ### Auto-generated operation tools
 
