@@ -209,7 +209,7 @@ mod tests {
             Some("true")
         );
         // Reachability is not a bridge-internal address.
-        assert!(claim.addresses.is_empty());
+        assert!(claim.routes.is_empty());
     }
 
     #[test]
