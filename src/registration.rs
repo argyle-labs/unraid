@@ -20,13 +20,18 @@
 //! update,delete}` endpoint registry) to the tool surface.
 
 use plugin_toolkit::abi::BackendDef;
-use plugin_toolkit::backend_def::topology_backend_def;
+use plugin_toolkit::backend_def::{backup_kind_backend_def, topology_backend_def};
 use plugin_toolkit::reactor;
 use plugin_toolkit::serde_json;
 
 const TOPO_PREFIX: &str = "unraid.__topo";
 const DIAG_PREFIX: &str = "unraid.__diag";
 const UPS_PREFIX: &str = "unraid.__ups";
+const BACKUP_PREFIX: &str = "unraid.__backup";
+
+/// The backup KIND this plugin contributes: an Unraid host's persistent
+/// configuration (`/boot/config` and its disk-based equivalents).
+const BACKUP_KIND: &str = "unraid-config";
 
 /// Backend descriptors this plugin advertises:
 /// - a `topology` collector (`unraid.__topo.collect_claims`), derived from the
@@ -34,6 +39,11 @@ const UPS_PREFIX: &str = "unraid.__ups";
 /// - a `diagnostics` provider (`unraid.__diag.{diagnose,repair}`) surfacing the
 ///   power-loss shutdown/logging checks (see [`crate::checks`]). Built by hand
 ///   like raccoon's, since the toolkit has no `diagnostics_backend_def` helper.
+/// - a `ups` provider (`unraid.__ups.*`) managing the host's apcupsd through the
+///   GraphQL API (see [`crate::ups`]);
+/// - a `backup_kind` provider (`unraid.__backup.*`) contributing the
+///   `unraid-config` KIND that captures/restores the host's flash config (see
+///   [`crate::backup`]).
 pub fn backends_json() -> String {
     let defs: Vec<BackendDef> = vec![
         topology_backend_def("unraid", TOPO_PREFIX),
@@ -49,6 +59,7 @@ pub fn backends_json() -> String {
             invoke_prefix: UPS_PREFIX.to_string(),
             ..Default::default()
         },
+        backup_kind_backend_def(BACKUP_KIND, BACKUP_PREFIX),
     ];
     serde_json::to_string(&defs).unwrap_or_else(|_| "[]".to_string())
 }
@@ -84,6 +95,12 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
             "config_set" => crate::ups::config_set(args_json),
             other => Err(format!("unknown ups op: {other}")),
         });
+    }
+    if let Some(op) = name
+        .strip_prefix(BACKUP_PREFIX)
+        .and_then(|s| s.strip_prefix('.'))
+    {
+        return Some(crate::backup::dispatch(op, args_json));
     }
     None
 }
