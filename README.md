@@ -54,3 +54,13 @@ Mint one on the host — `unraid-api apikey --create --name "orca collector"` �
 - `src/schema_pull.rs` / `src/version.rs` — introspection pull + version parsing.
 - `schemas/` + `queries/` — committed introspection JSON and `.graphql` queries, codegenned by `build.rs`.
 - `assets/` — plugin icon.
+
+## Design notes (incident-driven capability specs)
+
+Not yet-shipped behaviour — implementation specs for capabilities this plugin
+should grow, each written from a real incident:
+
+- [docs/diagnostics.md](docs/diagnostics.md) — ZFS/array/NFS storage diagnostics.
+- [docs/smb-user-permissions.md](docs/smb-user-permissions.md) — SMB user, group
+  membership, and per-share read/write-list management (the plugin must fully
+  own SMB users + share permissions, durably across unraid's stateless boot).
