@@ -17,10 +17,19 @@
 //! (suggest-then-confirm) and idempotent — re-running a repair on an
 //! already-correct config is a no-op that reports success. Report-only checks
 //! (`array-unmount-blockers`, `unclean-shutdown`) carry no [`RepairSpec`].
+//!
+//! Alongside the shutdown-survival checks this provider also converges
+//! **data-share ownership** (`share-ownership`): every entry under the managed
+//! shares must be `nobody:users` (99:100) and group-writable, or app imports
+//! over SMB/NFS collide with the nobody-owned tree and fail. The check walks the
+//! shares in-process (`std::os::unix::fs` chown/chmod — no shell-out), and its
+//! privileged repair chowns/chmods only the drifted entries. This is the
+//! plugin-native replacement for the hand-installed reconciler cron.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use plugin_toolkit::contract::diagnostics::{
     DiagnoseArgs, Finding, RepairArgs, RepairOutcome, RepairSpec, Severity,
@@ -70,6 +79,26 @@ const RC_SAMBA: &str = "/etc/rc.d/rc.samba";
 /// Optional override for the managed-user list (comma/space separated). The
 /// primary source is the account list parsed from [`FLASH_SMBPASSWD`].
 const SMB_USERS_ENV: &str = "UNRAID_SMB_USERS";
+/// Ownership convergence target: the uid/gid every entry under a managed data
+/// share must have. On Unraid `99:100` is `nobody:users` — the identity SMB/NFS
+/// writes are meant to map to. A file owned by any other uid (a container running
+/// as root, or a client that authenticated as a non-nobody SMB user like `orca`)
+/// collides with the nobody-owned tree and blocks app imports over the share —
+/// the willow Sonarr-import root cause.
+const NOBODY_UID: u32 = 99;
+const USERS_GID: u32 = 100;
+
+/// Data-share roots whose entire tree must stay `nobody:users` + group-writable.
+/// Overridable via `UNRAID_NOBODY_SHARES` (comma-separated absolute paths). The
+/// default deliberately excludes `appdata`/`system`/`domains`/`isos`, where
+/// containers and VMs legitimately own files as other uids.
+const DEFAULT_NOBODY_SHARES: &str = "/mnt/user/data,/mnt/user/downloads";
+/// Env override for the managed data-share roots.
+const NOBODY_SHARES_ENV: &str = "UNRAID_NOBODY_SHARES";
+
+/// Cap on sample paths surfaced in the `share-ownership` finding (the walk still
+/// counts every drifted entry — this only bounds the detail string).
+const OWNERSHIP_SAMPLE_CAP: usize = 8;
 
 // ── diagnose ─────────────────────────────────────────────────────────────────
 
@@ -88,6 +117,7 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         check_docker_vm_autostart(),
         check_unclean_shutdown(),
         check_samba_account_mapping(FLASH_SMBPASSWD, RUNTIME_SMBPASSWD),
+        check_share_ownership(),
     ]
     .into_iter()
     .flatten()
@@ -446,6 +476,7 @@ pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
         "syslog-mirror" => repair_syslog_mirror(RSYSLOG_CFG),
         "samba-account-mapping" => repair_samba_account_mapping(RUNTIME_SMBPASSWD),
         "samba-passdb-flash" => repair_samba_passdb_flash(RUNTIME_SMBPASSWD, FLASH_SMBPASSWD),
+        "share-ownership" => repair_share_ownership(),
         other => (false, format!("unraid has no repair '{other}'")),
     };
     RepairOutcome {
@@ -885,6 +916,213 @@ fn write_if_changed(
     }
     fs::write(path, out).map_err(|e| format!("write {path}: {e}"))?;
     Ok(true)
+}
+
+// ── share ownership convergence ──────────────────────────────────────────────
+
+/// The managed data-share roots — from `UNRAID_NOBODY_SHARES` or the default —
+/// filtered to those that actually exist as directories on this host. Empty ⇒
+/// not an Unraid data host (or nothing configured), so the check/repair no-op.
+fn nobody_shares() -> Vec<String> {
+    std::env::var(NOBODY_SHARES_ENV)
+        .unwrap_or_else(|_| DEFAULT_NOBODY_SHARES.to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Accumulated result of one ownership walk.
+#[derive(Default)]
+struct OwnershipScan {
+    scanned: u64,
+    /// Entries whose uid≠99 or gid≠100.
+    own_drift: u64,
+    /// Dirs/regular files that are not group-writable.
+    perm_drift: u64,
+    /// Individual chown/chmod operations that succeeded (`fix` runs only).
+    fixed: u64,
+    samples: Vec<String>,
+    errors: Vec<String>,
+}
+
+impl OwnershipScan {
+    fn sample(&mut self, path: &Path) {
+        if self.samples.len() < OWNERSHIP_SAMPLE_CAP {
+            let p = path.display().to_string();
+            if !self.samples.contains(&p) {
+                self.samples.push(p);
+            }
+        }
+    }
+}
+
+/// Walk every managed share root, classifying (and, when `fix`, converging) each
+/// entry. Ownership drift = uid≠[`NOBODY_UID`] or gid≠[`USERS_GID`]; perm drift =
+/// a dir or regular file that is not group-writable (imports need the `users`
+/// group to overwrite existing files). Symlinks are re-owned via `lchown` but
+/// never followed. Best-effort: an entry that can't be stat'd/changed records an
+/// error and the walk continues — one unreadable path never aborts the sweep.
+fn scan_ownership(shares: &[String], fix: bool) -> OwnershipScan {
+    let mut r = OwnershipScan::default();
+    let mut stack: Vec<PathBuf> = shares.iter().map(PathBuf::from).collect();
+    while let Some(dir) = stack.pop() {
+        let rd = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                r.errors.push(format!("read_dir {}: {e}", dir.display()));
+                continue;
+            }
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let md = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    r.errors.push(format!("stat {}: {e}", path.display()));
+                    continue;
+                }
+            };
+            r.scanned += 1;
+            let ft = md.file_type();
+
+            if md.uid() != NOBODY_UID || md.gid() != USERS_GID {
+                r.own_drift += 1;
+                r.sample(&path);
+                if fix {
+                    match std::os::unix::fs::lchown(&path, Some(NOBODY_UID), Some(USERS_GID)) {
+                        Ok(()) => r.fixed += 1,
+                        Err(e) => r.errors.push(format!("chown {}: {e}", path.display())),
+                    }
+                }
+            }
+
+            // Perms only apply to dirs / regular files; a symlink's own mode is
+            // never consulted by the kernel, and std has no `lchmod`.
+            if ft.is_dir() || ft.is_file() {
+                let mode = md.mode() & 0o7777;
+                if mode & 0o020 == 0 {
+                    r.perm_drift += 1;
+                    r.sample(&path);
+                    if fix {
+                        // Restore group write; a directory also needs group
+                        // execute (traverse) to be usable.
+                        let want = mode | 0o020 | if ft.is_dir() { 0o010 } else { 0 };
+                        match fs::set_permissions(&path, fs::Permissions::from_mode(want)) {
+                            Ok(()) => r.fixed += 1,
+                            Err(e) => r.errors.push(format!("chmod {}: {e}", path.display())),
+                        }
+                    }
+                }
+            }
+
+            if ft.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    r
+}
+
+/// Data-share ownership convergence. Every entry under the managed shares must be
+/// `nobody:users` and group-writable, or app imports over SMB/NFS collide with
+/// the nobody-owned tree and fail (the willow Sonarr-import root cause). Reports
+/// drift; the `share-ownership` repair converges it. `None` when no managed share
+/// exists here (not a data host) so non-storage peers stay silent.
+fn check_share_ownership() -> Option<Finding> {
+    let shares = nobody_shares();
+    if shares.is_empty() {
+        return None;
+    }
+    let r = scan_ownership(&shares, false);
+    if r.own_drift == 0 && r.perm_drift == 0 {
+        return Some(finding(
+            "share-ownership",
+            Severity::Ok,
+            "Data shares are nobody-owned and group-writable",
+            format!(
+                "scanned {} entries under {}; all {NOBODY_UID}:{USERS_GID} and group-writable",
+                r.scanned,
+                shares.join(", ")
+            ),
+            None,
+        ));
+    }
+    let repair = Some(RepairSpec {
+        id: "share-ownership".to_string(),
+        description: format!(
+            "Converge {} to {NOBODY_UID}:{USERS_GID} + group-writable (chown/chmod only the drift)",
+            shares.join(", ")
+        ),
+        automatic: false,
+        privileged: true,
+        delegate: None,
+    });
+    let mut detail = format!(
+        "{} entrie(s) not {NOBODY_UID}:{USERS_GID}, {} dir/file(s) not group-writable under {} \
+         (of {} scanned). Non-nobody or non-group-writable entries block app imports over SMB/NFS.",
+        r.own_drift,
+        r.perm_drift,
+        shares.join(", "),
+        r.scanned,
+    );
+    if !r.samples.is_empty() {
+        detail.push_str(&format!(" e.g. {}", r.samples.join("; ")));
+    }
+    Some(finding(
+        "share-ownership",
+        Severity::Warn,
+        "Data-share ownership has drifted from nobody:users",
+        detail,
+        repair,
+    ))
+}
+
+/// Converge every managed share to `nobody:users` + group-writable, touching only
+/// drifted entries (so a clean tree is a fast no-op). Idempotent. Reports the
+/// number of operations applied; per-entry failures are surfaced and flip the
+/// outcome to not-ok so the operator sees them.
+fn repair_share_ownership() -> (bool, String) {
+    let shares = nobody_shares();
+    if shares.is_empty() {
+        return (
+            false,
+            "no managed data shares present on this host".to_string(),
+        );
+    }
+    let r = scan_ownership(&shares, true);
+    let base = if r.own_drift == 0 && r.perm_drift == 0 {
+        format!(
+            "{} entries under {} already {NOBODY_UID}:{USERS_GID} + group-writable (no change)",
+            r.scanned,
+            shares.join(", ")
+        )
+    } else {
+        format!(
+            "converged {} of {} drifted entrie(s) to {NOBODY_UID}:{USERS_GID}/group-writable \
+             ({} ownership, {} perms) under {}",
+            r.fixed,
+            r.own_drift + r.perm_drift,
+            r.own_drift,
+            r.perm_drift,
+            shares.join(", ")
+        )
+    };
+    if r.errors.is_empty() {
+        return (true, base);
+    }
+    let shown = r
+        .errors
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    (
+        false,
+        format!("{base}; {} error(s): {shown}", r.errors.len()),
+    )
 }
 
 // ── GraphQL state ────────────────────────────────────────────────────────────
@@ -1451,5 +1689,94 @@ mod tests {
         fs::remove_file(rt).ok();
         fs::remove_file(flash).ok();
         fs::remove_file(bak).ok();
+    }
+
+    // ── share ownership ──────────────────────────────────────────────────────
+
+    /// Build a unique temp dir tree with two group-writable-clean entries and
+    /// two that lack group write. Returns (root, perm_drift_count).
+    fn build_perm_tree(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("unraid-own-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let sub = root.join("sub"); // will be 0700 → drift (dir, no g+w)
+        fs::create_dir_all(&sub).unwrap();
+        let inner = sub.join("inner.txt"); // 0600 → drift (file, no g+w)
+        fs::write(&inner, b"x").unwrap();
+        let good_dir = root.join("gooddir"); // 0770 → clean
+        fs::create_dir_all(&good_dir).unwrap();
+        let good_file = root.join("good.txt"); // 0664 → clean
+        fs::write(&good_file, b"y").unwrap();
+        fs::set_permissions(&inner, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&good_file, fs::Permissions::from_mode(0o664)).unwrap();
+        fs::set_permissions(&good_dir, fs::Permissions::from_mode(0o770)).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    #[test]
+    fn scan_detects_non_group_writable_entries() {
+        let root = build_perm_tree("detect");
+        let shares = vec![root.to_string_lossy().into_owned()];
+        let r = scan_ownership(&shares, false);
+        // sub (0700 dir) + inner.txt (0600 file) lack group write.
+        assert_eq!(r.perm_drift, 2, "expected the 0700 dir and 0600 file");
+        assert!(r.scanned >= 4);
+        assert!(!r.samples.is_empty());
+        // Detection must not mutate anything.
+        assert_eq!(r.fixed, 0);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repair_restores_group_write_idempotently() {
+        let root = build_perm_tree("repair");
+        let shares = vec![root.to_string_lossy().into_owned()];
+        // First pass fixes the two non-group-writable entries.
+        let r1 = scan_ownership(&shares, true);
+        assert_eq!(r1.perm_drift, 2);
+        // A re-scan sees no perm drift left (chmod always succeeds on own files,
+        // regardless of whether the test runs as root).
+        let r2 = scan_ownership(&shares, false);
+        assert_eq!(r2.perm_drift, 0, "group write should be restored");
+        // The repaired dir gained group write + execute; the file gained group write.
+        let sub_mode = fs::symlink_metadata(root.join("sub")).unwrap().mode() & 0o7777;
+        assert_eq!(sub_mode & 0o030, 0o030, "dir needs g+rwx traverse+write");
+        let inner_mode = fs::symlink_metadata(root.join("sub/inner.txt"))
+            .unwrap()
+            .mode()
+            & 0o7777;
+        assert_eq!(inner_mode & 0o020, 0o020, "file needs g+w");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn nobody_shares_parsing_and_off_host_none() {
+        // Serialize all env touches for this var in one test to avoid races.
+        unsafe {
+            std::env::remove_var(NOBODY_SHARES_ENV);
+        }
+        // Default targets (/mnt/user/data,...) do not exist in CI → no managed
+        // shares → the check stays silent on non-storage hosts.
+        assert!(
+            nobody_shares().is_empty(),
+            "CI has no /mnt/user data shares"
+        );
+        assert!(check_share_ownership().is_none());
+
+        // Env override: keep only paths that exist as directories.
+        let real = std::env::temp_dir().join(format!("unraid-shares-{}", std::process::id()));
+        fs::create_dir_all(&real).unwrap();
+        unsafe {
+            std::env::set_var(
+                NOBODY_SHARES_ENV,
+                format!("{}, /nonexistent/xyz", real.display()),
+            );
+        }
+        let got = nobody_shares();
+        assert_eq!(got, vec![real.to_string_lossy().into_owned()]);
+        unsafe {
+            std::env::remove_var(NOBODY_SHARES_ENV);
+        }
+        fs::remove_dir_all(&real).ok();
     }
 }
