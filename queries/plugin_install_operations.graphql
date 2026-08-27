@@ -1,0 +1,15 @@
+# In-flight and recent plugin install/update operations. `installPlugin`
+# returns immediately with an operation id; this query tracks each one's
+# status (QUEUED / RUNNING / SUCCEEDED / FAILED) so orca can report progress
+# and confirm a self-update actually landed before declaring success.
+query PluginInstallOperations {
+  pluginInstallOperations {
+    id
+    url
+    name
+    status
+    createdAt
+    updatedAt
+    finishedAt
+  }
+}

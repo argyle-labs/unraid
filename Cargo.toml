@@ -11,15 +11,14 @@ category = "infra"
 [lib]
 name = "unraid"
 path = "src/lib.rs"
-# Dynamic (subprocess) plugin: orca spawns the `[[bin]]` and drives it over the
-# orca socket, so no `cdylib` artifact is emitted. `rlib` retains the in-crate
-# `#[cfg(test)]` harness + lets the `[[bin]]`, the codegen build, and the
-# workspace use it as a normal Rust lib.
+# This is a subprocess plugin: orca spawns the `[[bin]]` and talks to it over its
+# Unix socket. `rlib` retains the in-crate `#[cfg(test)]` harness + lets the
+# `[[bin]]`, the codegen build, and the workspace use it as a normal Rust lib.
 crate-type = ["rlib"]
 
 # The orca plugin entrypoint orca spawns and drives over the socket. `main.rs`
 # is the toolkit's `serve_tool_plugin!` hybrid arm (tool surface + topology
-# backend), replacing the retired cdylib `export_tool_plugin!` FFI export.
+# backend).
 [[bin]]
 name = "unraid"
 path = "src/main.rs"
@@ -38,10 +37,8 @@ path = "src/main.rs"
 # reached through `plugin_toolkit::*` / its prelude, injected by
 # `#[plugin_struct]` / `#[orca_tool]`, or rewritten into the generated GraphQL
 # module by the build-time codegen. The plugin source names no external crate.
-# The dynamic (subprocess) plugin names no external crate at all: retiring the
-# cdylib dropped the lone `abi_stable` FFI dep, since `serve_tool_plugin!`
-# reaches orca over the socket rather than across a `#[export_root_module]`
-# ABI boundary.
+# This is a subprocess `[[bin]]` plugin that talks to the orca daemon over its
+# Unix socket via `serve_tool_plugin!` from plugin-toolkit — no FFI/cdylib.
 #
 # Pinned to the orca rc tag that carries the plugin-toolkit surface. REQUIRES an
 # rc >= the one containing the codegen path-rewrite + `plugin_toolkit::hash` +

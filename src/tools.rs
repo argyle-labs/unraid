@@ -56,7 +56,7 @@ pub(crate) async fn surface_client(
     ))
 }
 
-#[plugin_struct(args)]
+#[orca_struct(args)]
 pub struct UnraidSchemaArgs {
     /// Base URL of a live Unraid host (e.g. `https://tower.local`).
     /// Required to do anything other than list embedded versions.
@@ -83,7 +83,7 @@ pub struct UnraidSchemaArgs {
     pub dir: Option<PathBuf>,
 }
 
-#[plugin_struct]
+#[orca_struct]
 #[derive(Debug)]
 pub struct PulledSchema {
     pub version: String,
@@ -92,7 +92,7 @@ pub struct PulledSchema {
     pub bytes: u64,
 }
 
-#[plugin_struct]
+#[orca_struct]
 #[derive(Debug)]
 pub struct DriftReport {
     pub probed_version: String,
@@ -103,7 +103,7 @@ pub struct DriftReport {
     pub identical: bool,
 }
 
-#[plugin_struct]
+#[orca_struct]
 #[derive(Debug)]
 pub struct UnraidSchemaOutput {
     /// Versions with a committed introspection JSON inside the
