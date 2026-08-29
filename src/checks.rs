@@ -48,6 +48,29 @@ const DEFAULT_REMOTE_SYSLOG: &str = "remote-syslog-host";
 /// Env override for the remote-syslog target the `syslog-mirror` repair sets.
 const REMOTE_SYSLOG_ENV: &str = "UNRAID_REMOTE_SYSLOG";
 
+/// Unraid persists its Samba passdb to flash here; the live daemon reads/writes
+/// [`RUNTIME_SMBPASSWD`] instead, so this is the copy a reboot restores. Its
+/// presence is also the tell-tale that we are running on an Unraid host.
+const FLASH_SMBPASSWD: &str = "/boot/config/smbpasswd";
+/// The passdb smbd actually serves from at runtime. A plain `smbpasswd` writes
+/// here only — it is never propagated back to [`FLASH_SMBPASSWD`].
+const RUNTIME_SMBPASSWD: &str = "/var/lib/samba/private/smbpasswd";
+/// Unix account database, read for the passdb→unix mapping check and written
+/// (in place) by the Mode-1 heal.
+const PASSWD_FILE: &str = "/etc/passwd";
+/// Unix group database the managed SMB user's membership is converged in.
+const GROUP_FILE: &str = "/etc/group";
+/// Group the managed SMB user must belong to (the willow incident: `orca` was
+/// absent from `users`/gid 100 despite `/boot/config/go` claiming otherwise).
+const EXPECTED_GROUP: &str = "users";
+/// Primary gid written when (re)creating a managed SMB unix user.
+const EXPECTED_GID: u32 = 100;
+/// Samba control script; a `restart` rebuilds smbd's passdb→unix mapping cache.
+const RC_SAMBA: &str = "/etc/rc.d/rc.samba";
+/// Optional override for the managed-user list (comma/space separated). The
+/// primary source is the account list parsed from [`FLASH_SMBPASSWD`].
+const SMB_USERS_ENV: &str = "UNRAID_SMB_USERS";
+
 // ── diagnose ─────────────────────────────────────────────────────────────────
 
 /// Run every check and return the findings as JSON (`Vec<Finding>`). The
@@ -64,6 +87,7 @@ pub fn diagnose(args_json: &str) -> Result<String, String> {
         check_array_unmount_blockers("/proc"),
         check_docker_vm_autostart(),
         check_unclean_shutdown(),
+        check_samba_account_mapping(FLASH_SMBPASSWD, RUNTIME_SMBPASSWD),
     ]
     .into_iter()
     .flatten()
@@ -335,6 +359,8 @@ pub fn repair(args_json: &str) -> Result<String, String> {
     let (ok, message) = match args.repair_id.as_str() {
         "shutdown-timeout" => repair_shutdown_timeout(DISK_CFG),
         "syslog-mirror" => repair_syslog_mirror(RSYSLOG_CFG),
+        "samba-account-mapping" => repair_samba_account_mapping(RUNTIME_SMBPASSWD),
+        "samba-passdb-flash" => repair_samba_passdb_flash(RUNTIME_SMBPASSWD, FLASH_SMBPASSWD),
         other => (false, format!("unraid has no repair '{other}'")),
     };
     let outcome = RepairOutcome {
@@ -377,6 +403,396 @@ fn repair_syslog_mirror(path: &str) -> (bool, String) {
         ),
         Err(e) => (false, e),
     }
+}
+
+// ── samba passdb→unix mapping ──────────────────────────────
+
+/// One account row from an Unraid/Samba `smbpasswd` file: the uid the passdb
+/// believes the user maps to and the NT hash it authenticates against.
+#[derive(Debug, PartialEq, Eq)]
+struct SmbEntry {
+    user: String,
+    uid: u32,
+    nt_hash: String,
+}
+
+/// Parse an `smbpasswd` file (`user:uid:LM:NT:flags:LCT:` per line). Blank/`#`
+/// lines and malformed rows are skipped; NT hashes are upper-cased so later
+/// comparisons are case-stable.
+fn parse_smbpasswd(text: &str) -> Vec<SmbEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut f = line.split(':');
+        let (Some(user), Some(uid), Some(_lm), Some(nt)) = (f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        let Ok(uid) = uid.parse::<u32>() else {
+            continue;
+        };
+        out.push(SmbEntry {
+            user: user.to_string(),
+            uid,
+            nt_hash: nt.trim().to_ascii_uppercase(),
+        });
+    }
+    out
+}
+
+/// The passdb uid recorded for `user`, if present.
+fn smb_uid(entries: &[SmbEntry], user: &str) -> Option<u32> {
+    entries.iter().find(|e| e.user == user).map(|e| e.uid)
+}
+
+/// The NT hash recorded for `user`, if present.
+fn smb_nt_hash<'a>(entries: &'a [SmbEntry], user: &str) -> Option<&'a str> {
+    entries
+        .iter()
+        .find(|e| e.user == user)
+        .map(|e| e.nt_hash.as_str())
+}
+
+/// Managed SMB users: the `UNRAID_SMB_USERS` override (comma/space separated)
+/// when set and non-empty, else every account in the flash passdb.
+fn managed_users(flash_text: &str, env_override: Option<String>) -> Vec<String> {
+    if let Some(raw) = env_override {
+        let users: Vec<String> = raw
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !users.is_empty() {
+            return users;
+        }
+    }
+    parse_smbpasswd(flash_text)
+        .into_iter()
+        .map(|e| e.user)
+        .collect()
+}
+
+/// Per-user verdict for the passdb→unix mapping check. `Ok` = passdb uid,
+/// getent uid, and NT hashes all agree.
+#[derive(Debug, PartialEq, Eq)]
+enum MappingVerdict {
+    Ok,
+    /// Mode 1: the passdb maps `user` to `passdb_uid` but the unix account is
+    /// missing (`getent` = None) or maps to a different uid — smbd caches the
+    /// broken mapping and every fresh tree-connect is denied (`rc=-13`).
+    Corrupt {
+        passdb_uid: u32,
+        getent: Option<u32>,
+    },
+    /// Mode 2: the user's NT hash on flash differs from the running passdb, so a
+    /// reboot restores the stale flash copy and re-breaks auth.
+    FlashDivergence,
+}
+
+/// Classify one managed user. Mode-1 corruption outranks Mode-2 divergence: a
+/// broken mapping denies auth *now*; the flash revert only bites on reboot.
+fn classify_user(
+    passdb_uid: Option<u32>,
+    getent_uid: Option<u32>,
+    runtime_hash: Option<&str>,
+    flash_hash: Option<&str>,
+) -> MappingVerdict {
+    if let Some(uid) = passdb_uid
+        && getent_uid != Some(uid)
+    {
+        return MappingVerdict::Corrupt {
+            passdb_uid: uid,
+            getent: getent_uid,
+        };
+    }
+    if let (Some(r), Some(f)) = (runtime_hash, flash_hash)
+        && !r.eq_ignore_ascii_case(f)
+    {
+        return MappingVerdict::FlashDivergence;
+    }
+    MappingVerdict::Ok
+}
+
+/// Detect the two faults behind `mount error(13)` / `reconnect tcon failed
+/// rc=-13`: a corrupt passdb→unix mapping (Mode 1, Crit) and an NT hash that
+/// diverges between the running passdb and flash (Mode 2, Warn). Off-box (no
+/// flash passdb) this is a no-op.
+fn check_samba_account_mapping(flash_path: &str, runtime_path: &str) -> Option<Finding> {
+    // Gate: no flash passdb → not an Unraid host / not on the peer.
+    let flash_text = fs::read_to_string(flash_path).ok()?;
+    let runtime_text = fs::read_to_string(runtime_path).unwrap_or_default();
+    let flash = parse_smbpasswd(&flash_text);
+    let runtime = parse_smbpasswd(&runtime_text);
+    let users = managed_users(&flash_text, std::env::var(SMB_USERS_ENV).ok());
+
+    let mut corrupt = Vec::new();
+    let mut diverged = Vec::new();
+    for user in &users {
+        match classify_user(
+            smb_uid(&runtime, user),
+            getent_uid(user),
+            smb_nt_hash(&runtime, user),
+            smb_nt_hash(&flash, user),
+        ) {
+            MappingVerdict::Corrupt { passdb_uid, getent } => corrupt.push(match getent {
+                Some(u) => format!("{user} (passdb uid {passdb_uid} ≠ unix uid {u})"),
+                None => format!("{user} (passdb uid {passdb_uid}, no unix account)"),
+            }),
+            MappingVerdict::FlashDivergence => diverged.push(user.clone()),
+            MappingVerdict::Ok => {}
+        }
+    }
+
+    if !corrupt.is_empty() {
+        return Some(finding(
+            "samba-account-mapping",
+            Severity::Crit,
+            "Samba passdb→unix mapping is corrupt",
+            format!(
+                "smbd caches a broken passdb→unix mapping for {} — every fresh SMB tree-connect \
+                 is denied (mount error(13) / reconnect tcon failed rc=-13). The unix user must be \
+                 (re)created at its passdb uid and samba restarted once.",
+                corrupt.join(", ")
+            ),
+            Some(config_repair(
+                "samba-account-mapping",
+                "Ensure the managed SMB unix user exists at its passdb uid + group, then restart \
+                 samba once (briefly drops SMB serving)",
+            )),
+        ));
+    }
+    if !diverged.is_empty() {
+        return Some(finding(
+            "samba-account-mapping",
+            Severity::Warn,
+            "Samba passdb differs from the flash copy",
+            format!(
+                "the NT hash for {} differs between {runtime_path} and {flash_path}; a runtime \
+                 smbpasswd change was never propagated to flash, so a reboot restores the stale \
+                 copy and re-breaks SMB auth.",
+                diverged.join(", ")
+            ),
+            Some(config_repair(
+                "samba-passdb-flash",
+                &format!(
+                    "Propagate the running passdb to flash ({flash_path}) so it survives a reboot"
+                ),
+            )),
+        ));
+    }
+    Some(finding(
+        "samba-account-mapping",
+        Severity::Ok,
+        "Samba passdb→unix mapping is consistent",
+        format!(
+            "passdb uid, unix uid, group, and NT hashes agree for {} managed SMB user(s)",
+            users.len()
+        ),
+        None,
+    ))
+}
+
+/// Look up the unix uid for `user` via `getent passwd`. `None` when the account
+/// is absent (or getent is unavailable, e.g. off-box under test).
+fn getent_uid(user: &str) -> Option<u32> {
+    let out = std::process::Command::new("getent")
+        .arg("passwd")
+        .arg(user)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_getent_uid(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse the uid (3rd colon field) from a `getent passwd` line.
+fn parse_getent_uid(line: &str) -> Option<u32> {
+    line.trim().split(':').nth(2)?.parse().ok()
+}
+
+/// Mode-1 heal: ensure each managed SMB unix user exists at its passdb uid and
+/// is in the expected group, then restart samba once so smbd rebuilds the
+/// mapping. The account is (re)written in place at the passdb uid — never a
+/// freshly allocated uid — and no password is touched. A no-op (still `ok`)
+/// when the unix accounts already match.
+fn repair_samba_account_mapping(runtime_path: &str) -> (bool, String) {
+    let runtime_text = match fs::read_to_string(runtime_path) {
+        Ok(t) => t,
+        Err(e) => return (false, format!("read {runtime_path}: {e}")),
+    };
+    let flash_text = fs::read_to_string(FLASH_SMBPASSWD).unwrap_or_default();
+    let runtime = parse_smbpasswd(&runtime_text);
+    let users = managed_users(&flash_text, std::env::var(SMB_USERS_ENV).ok());
+
+    let mut actions = Vec::new();
+    for user in &users {
+        let Some(uid) = smb_uid(&runtime, user) else {
+            continue;
+        };
+        if getent_uid(user) != Some(uid) {
+            match ensure_passwd_user(PASSWD_FILE, user, uid, EXPECTED_GID) {
+                Ok(true) => actions.push(format!("set unix user {user} to uid {uid}")),
+                Ok(false) => {}
+                Err(e) => return (false, e),
+            }
+        }
+        match ensure_group_member(GROUP_FILE, EXPECTED_GROUP, user) {
+            Ok(true) => actions.push(format!("added {user} to group {EXPECTED_GROUP}")),
+            Ok(false) => {}
+            Err(e) => return (false, e),
+        }
+    }
+
+    if actions.is_empty() {
+        return (
+            true,
+            "unix accounts already match the passdb; no change".to_string(),
+        );
+    }
+    if let Err(e) = restart_samba() {
+        return (false, format!("{}; but {e}", actions.join("; ")));
+    }
+    (true, format!("{}; restarted samba", actions.join("; ")))
+}
+
+/// Mode-2 heal: propagate the running passdb to flash so it survives a reboot.
+/// Backs the flash copy up to `.bak`, copies runtime→flash, then verifies the
+/// managed users' NT hashes now agree. A no-op (still `ok`) when they already
+/// match.
+fn repair_samba_passdb_flash(runtime_path: &str, flash_path: &str) -> (bool, String) {
+    let runtime_text = match fs::read_to_string(runtime_path) {
+        Ok(t) => t,
+        Err(e) => return (false, format!("read {runtime_path}: {e}")),
+    };
+    let flash_text = match fs::read_to_string(flash_path) {
+        Ok(t) => t,
+        Err(e) => return (false, format!("read {flash_path}: {e}")),
+    };
+    let users = managed_users(&flash_text, std::env::var(SMB_USERS_ENV).ok());
+    if !passdb_diverges(&runtime_text, &flash_text, &users) {
+        return (
+            true,
+            format!("flash passdb {flash_path} already matches runtime; no change"),
+        );
+    }
+    let bak = format!("{flash_path}.bak");
+    if let Err(e) = fs::copy(flash_path, &bak) {
+        return (false, format!("back up {flash_path} → {bak}: {e}"));
+    }
+    if let Err(e) = fs::copy(runtime_path, flash_path) {
+        return (false, format!("copy {runtime_path} → {flash_path}: {e}"));
+    }
+    let flash_after = fs::read_to_string(flash_path).unwrap_or_default();
+    if passdb_diverges(&runtime_text, &flash_after, &users) {
+        return (
+            false,
+            format!("copied {runtime_path} → {flash_path} but hashes still diverge"),
+        );
+    }
+    (
+        true,
+        format!("propagated running passdb to {flash_path} (backup at {bak})"),
+    )
+}
+
+/// Whether any managed user's NT hash differs between the two passdb texts.
+fn passdb_diverges(runtime_text: &str, flash_text: &str, users: &[String]) -> bool {
+    let runtime = parse_smbpasswd(runtime_text);
+    let flash = parse_smbpasswd(flash_text);
+    users.iter().any(
+        |u| match (smb_nt_hash(&runtime, u), smb_nt_hash(&flash, u)) {
+            (Some(r), Some(f)) => !r.eq_ignore_ascii_case(f),
+            _ => false,
+        },
+    )
+}
+
+/// Restart samba via its rc script so smbd rebuilds the passdb→unix mapping.
+fn restart_samba() -> Result<(), String> {
+    let status = std::process::Command::new(RC_SAMBA)
+        .arg("restart")
+        .status()
+        .map_err(|e| format!("spawn {RC_SAMBA}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{RC_SAMBA} restart exit {:?}", status.code()))
+    }
+}
+
+/// Ensure `/etc/passwd` has `user` at `uid`/`gid`: append when absent, rewrite
+/// the uid/gid fields in place when present but mismatched, no-op when correct.
+/// Returns the new text and whether it changed.
+fn apply_passwd_user(text: &str, user: &str, uid: u32, gid: u32) -> (String, bool) {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut changed = false;
+    if let Some(line) = lines.iter_mut().find(|l| l.split(':').next() == Some(user)) {
+        let f: Vec<String> = line.split(':').map(str::to_string).collect();
+        if f.len() >= 4 && (f[2] != uid.to_string() || f[3] != gid.to_string()) {
+            let mut nf = f;
+            nf[2] = uid.to_string();
+            nf[3] = gid.to_string();
+            *line = nf.join(":");
+            changed = true;
+        }
+    } else {
+        lines.push(format!("{user}:x:{uid}:{gid}::/:/bin/false"));
+        changed = true;
+    }
+    (lines.join("\n"), changed)
+}
+
+/// Add `user` to `group`'s member list in `/etc/group` text if the group exists
+/// and the user is absent. Returns the new text and whether it changed.
+fn apply_group_member(text: &str, group: &str, user: &str) -> (String, bool) {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut changed = false;
+    for line in lines.iter_mut() {
+        let f: Vec<String> = line.split(':').map(str::to_string).collect();
+        if f.len() >= 4 && f[0] == group {
+            let mut members: Vec<&str> = f[3].split(',').filter(|m| !m.is_empty()).collect();
+            if !members.contains(&user) {
+                members.push(user);
+                *line = format!("{}:{}:{}:{}", f[0], f[1], f[2], members.join(","));
+                changed = true;
+            }
+            break;
+        }
+    }
+    (lines.join("\n"), changed)
+}
+
+/// [`apply_passwd_user`] applied to a file, preserving a trailing newline.
+fn ensure_passwd_user(path: &str, user: &str, uid: u32, gid: u32) -> Result<bool, String> {
+    write_if_changed(path, |text| apply_passwd_user(text, user, uid, gid))
+}
+
+/// [`apply_group_member`] applied to a file, preserving a trailing newline.
+fn ensure_group_member(path: &str, group: &str, user: &str) -> Result<bool, String> {
+    write_if_changed(path, |text| apply_group_member(text, group, user))
+}
+
+/// Read `path`, apply a pure `(text) -> (new_text, changed)` transform, and
+/// write back only when it changed, preserving any trailing newline.
+fn write_if_changed(
+    path: &str,
+    transform: impl FnOnce(&str) -> (String, bool),
+) -> Result<bool, String> {
+    let original = fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    let (mut out, changed) = transform(&original);
+    if !changed {
+        return Ok(false);
+    }
+    if original.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    fs::write(path, out).map_err(|e| format!("write {path}: {e}"))?;
+    Ok(true)
 }
 
 // ── GraphQL state ────────────────────────────────────────────────────────────
@@ -762,5 +1178,178 @@ mod tests {
         let o: RepairOutcome = serde_json::from_str(&out).unwrap();
         assert!(!o.ok);
         assert!(o.message.contains("no repair"));
+    }
+
+    // ── samba passdb→unix mapping ──────────────────────────
+
+    const SMB_LINE: &str = "orca:999:XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX:31D6CFE0D16AE931B73C59D7E0C089C0:[U          ]:LCT-00000000:";
+
+    #[test]
+    fn parse_smbpasswd_reads_user_uid_hash() {
+        let e = parse_smbpasswd(&format!("# comment\n\n{SMB_LINE}\n"));
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].user, "orca");
+        assert_eq!(e[0].uid, 999);
+        assert_eq!(e[0].nt_hash, "31D6CFE0D16AE931B73C59D7E0C089C0");
+        // Malformed rows are dropped.
+        assert!(parse_smbpasswd("garbage\norca:notanint:a:b:c:d:").is_empty());
+    }
+
+    #[test]
+    fn managed_users_prefers_env_override() {
+        let flash = format!("{SMB_LINE}\n");
+        assert_eq!(managed_users(&flash, None), vec!["orca".to_string()]);
+        assert_eq!(
+            managed_users(&flash, Some("alice, bob".to_string())),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        // Empty override falls back to the flash list.
+        assert_eq!(
+            managed_users(&flash, Some("  ".to_string())),
+            vec!["orca".to_string()]
+        );
+    }
+
+    #[test]
+    fn classify_flags_uid_mismatch_and_missing_account() {
+        // Mode 1: unix account missing.
+        assert_eq!(
+            classify_user(Some(999), None, Some("A"), Some("A")),
+            MappingVerdict::Corrupt {
+                passdb_uid: 999,
+                getent: None
+            }
+        );
+        // Mode 1: uid mismatch (outranks a concurrent hash divergence).
+        assert_eq!(
+            classify_user(Some(999), Some(1000), Some("A"), Some("B")),
+            MappingVerdict::Corrupt {
+                passdb_uid: 999,
+                getent: Some(1000)
+            }
+        );
+    }
+
+    #[test]
+    fn classify_flags_nt_hash_divergence() {
+        assert_eq!(
+            classify_user(Some(999), Some(999), Some("aaaa"), Some("bbbb")),
+            MappingVerdict::FlashDivergence
+        );
+    }
+
+    #[test]
+    fn classify_ok_when_everything_agrees() {
+        // Hashes compared case-insensitively.
+        assert_eq!(
+            classify_user(Some(999), Some(999), Some("abcd"), Some("ABCD")),
+            MappingVerdict::Ok
+        );
+        // No passdb entry and no runtime hash → nothing to flag.
+        assert_eq!(
+            classify_user(None, None, None, Some("ABCD")),
+            MappingVerdict::Ok
+        );
+    }
+
+    #[test]
+    fn check_mapping_off_box_is_none() {
+        assert!(check_samba_account_mapping("/nonexistent/smbpasswd", "/nonexistent/rt").is_none());
+    }
+
+    #[test]
+    fn passdb_diverges_detects_hash_drift() {
+        let rt = "orca:999:X:AAAA:[U]:LCT-0:\n";
+        let flash = "orca:999:X:BBBB:[U]:LCT-0:\n";
+        assert!(passdb_diverges(rt, flash, &["orca".to_string()]));
+        assert!(!passdb_diverges(rt, rt, &["orca".to_string()]));
+        // Unknown managed user → no divergence.
+        assert!(!passdb_diverges(rt, flash, &["nobody".to_string()]));
+    }
+
+    #[test]
+    fn parse_getent_uid_reads_third_field() {
+        assert_eq!(parse_getent_uid("orca:x:999:100::/:/bin/false"), Some(999));
+        assert_eq!(parse_getent_uid(""), None);
+    }
+
+    #[test]
+    fn apply_passwd_user_appends_when_absent() {
+        let (out, changed) = apply_passwd_user("root:x:0:0::/root:/bin/bash\n", "orca", 999, 100);
+        assert!(changed);
+        assert!(out.contains("orca:x:999:100::/:/bin/false"));
+        // Idempotent: correct entry present → no change.
+        let (_, changed2) = apply_passwd_user(&out, "orca", 999, 100);
+        assert!(!changed2);
+    }
+
+    #[test]
+    fn apply_passwd_user_rewrites_uid_in_place() {
+        let (out, changed) = apply_passwd_user("orca:x:1000:100::/:/bin/false", "orca", 999, 100);
+        assert!(changed);
+        assert_eq!(out, "orca:x:999:100::/:/bin/false");
+        // Only one entry — no duplicate appended.
+        assert_eq!(out.lines().filter(|l| l.starts_with("orca:")).count(), 1);
+    }
+
+    #[test]
+    fn apply_group_member_adds_once() {
+        let (out, changed) = apply_group_member("users:x:100:bob\nwheel:x:10:\n", "users", "orca");
+        assert!(changed);
+        assert_eq!(out.lines().next().unwrap(), "users:x:100:bob,orca");
+        // Idempotent.
+        let (_, changed2) = apply_group_member(&out, "users", "orca");
+        assert!(!changed2);
+        // Missing group → no change.
+        let (_, changed3) = apply_group_member("wheel:x:10:\n", "users", "orca");
+        assert!(!changed3);
+    }
+
+    #[test]
+    fn samba_repairs_are_privileged_suggest_only() {
+        for id in ["samba-account-mapping", "samba-passdb-flash"] {
+            let r = config_repair(id, "x");
+            assert!(
+                !r.automatic,
+                "{id} must never auto-run (rc.samba restart drops SMB)"
+            );
+            assert!(r.privileged, "{id} must be privileged");
+        }
+    }
+
+    #[test]
+    fn passdb_flash_repair_is_noop_when_equal() {
+        let rt = write_tmp("pdb-rt-eq", "orca:999:X:AAAA:[U]:LCT-0:\n");
+        let flash = write_tmp("pdb-flash-eq", "orca:999:X:AAAA:[U]:LCT-0:\n");
+        unsafe {
+            std::env::remove_var(SMB_USERS_ENV);
+        }
+        let (ok, msg) = repair_samba_passdb_flash(rt.to_str().unwrap(), flash.to_str().unwrap());
+        assert!(ok, "{msg}");
+        assert!(msg.contains("no change"), "{msg}");
+        assert!(!fs::exists(format!("{}.bak", flash.to_str().unwrap())).unwrap_or(false));
+        fs::remove_file(rt).ok();
+        fs::remove_file(flash).ok();
+    }
+
+    #[test]
+    fn passdb_flash_repair_propagates_and_backs_up() {
+        let rt = write_tmp("pdb-rt-div", "orca:999:X:AAAA:[U]:LCT-0:\n");
+        let flash = write_tmp("pdb-flash-div", "orca:999:X:BBBB:[U]:LCT-0:\n");
+        unsafe {
+            std::env::remove_var(SMB_USERS_ENV);
+        }
+        let (ok, msg) = repair_samba_passdb_flash(rt.to_str().unwrap(), flash.to_str().unwrap());
+        assert!(ok, "{msg}");
+        // Backup captured the stale copy; flash now matches runtime.
+        let bak = format!("{}.bak", flash.to_str().unwrap());
+        assert!(fs::read_to_string(&bak).unwrap().contains("BBBB"));
+        assert!(fs::read_to_string(&flash).unwrap().contains("AAAA"));
+        // Second run is a no-op.
+        let (ok2, msg2) = repair_samba_passdb_flash(rt.to_str().unwrap(), flash.to_str().unwrap());
+        assert!(ok2 && msg2.contains("no change"), "{msg2}");
+        fs::remove_file(rt).ok();
+        fs::remove_file(flash).ok();
+        fs::remove_file(bak).ok();
     }
 }
