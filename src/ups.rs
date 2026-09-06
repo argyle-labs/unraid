@@ -8,8 +8,6 @@
 //! the nut provider — one capability, different pathways.
 
 use plugin_toolkit::contract::ups::{UpsConfig, UpsConfigOutcome, UpsQueryArgs, UpsState};
-use plugin_toolkit::reactor;
-use plugin_toolkit::serde_json;
 
 use crate::endpoint::endpoint_db;
 use crate::generated::v7_3_1::configure_ups::{UPSConfigInput, UPSKillPower};
@@ -23,21 +21,14 @@ fn first_client() -> Option<Client> {
     Some(Client::new(cfg))
 }
 
-fn parse_query(args_json: &str) -> UpsQueryArgs {
-    if args_json.trim().is_empty() {
-        UpsQueryArgs::default()
-    } else {
-        serde_json::from_str(args_json).unwrap_or_default()
-    }
-}
-
 /// `state` op — live UPS readings via `upsDevices`.
-pub fn state(args_json: &str) -> Result<String, String> {
-    let args = parse_query(args_json);
+pub async fn state_typed(args: UpsQueryArgs) -> Result<Vec<UpsState>, String> {
     let Some(client) = first_client() else {
-        return serde_json::to_string(&Vec::<UpsState>::new()).map_err(|e| e.to_string());
+        return Ok(Vec::new());
     };
-    let states: Vec<UpsState> = reactor::block_on(async move { client.ups_devices().await })
+    let states: Vec<UpsState> = client
+        .ups_devices()
+        .await
         .map_err(|e| format!("upsDevices query failed: {e}"))?
         .ups_devices
         .into_iter()
@@ -64,16 +55,17 @@ pub fn state(args_json: &str) -> Result<String, String> {
         })
         .filter(|s| args.id.as_ref().is_none_or(|id| &s.id == id))
         .collect();
-    serde_json::to_string(&states).map_err(|e| format!("encode ups state: {e}"))
+    Ok(states)
 }
 
 /// `config_get` op — apcupsd thresholds + kill-power via `upsConfiguration`.
-pub fn config_get(args_json: &str) -> Result<String, String> {
-    let args = parse_query(args_json);
+pub async fn config_get_typed(args: UpsQueryArgs) -> Result<Vec<UpsConfig>, String> {
     let Some(client) = first_client() else {
-        return serde_json::to_string(&Vec::<UpsConfig>::new()).map_err(|e| e.to_string());
+        return Ok(Vec::new());
     };
-    let c = reactor::block_on(async move { client.ups_configuration().await })
+    let c = client
+        .ups_configuration()
+        .await
         .map_err(|e| format!("upsConfiguration query failed: {e}"))?
         .ups_configuration;
     let cfg = UpsConfig {
@@ -89,15 +81,13 @@ pub fn config_get(args_json: &str) -> Result<String, String> {
         kill_power: c.kill_ups.map(|k| k.eq_ignore_ascii_case("yes")),
         shutdown_cmd: None,
     };
-    serde_json::to_string(&vec![cfg]).map_err(|e| format!("encode ups config: {e}"))
+    Ok(vec![cfg])
 }
 
 /// `config_set` op — apply thresholds / kill-power via the `configureUps`
 /// mutation. Only the fields present in the incoming config are sent; the rest
 /// are left `None` so Unraid preserves them.
-pub fn config_set(args_json: &str) -> Result<String, String> {
-    let cfg: UpsConfig =
-        serde_json::from_str(args_json).map_err(|e| format!("invalid ups config: {e}"))?;
+pub async fn config_set_typed(cfg: UpsConfig) -> Result<UpsConfigOutcome, String> {
     let Some(client) = first_client() else {
         return Err("no Unraid endpoint registered (not on the peer?)".to_string());
     };
@@ -122,10 +112,12 @@ pub fn config_set(args_json: &str) -> Result<String, String> {
             }
         }),
     };
-    let ok = reactor::block_on(async move { client.configure_ups(input).await })
+    let ok = client
+        .configure_ups(input)
+        .await
         .map_err(|e| format!("configureUps mutation failed: {e}"))?
         .configure_ups;
-    let outcome = UpsConfigOutcome {
+    Ok(UpsConfigOutcome {
         id: cfg.id,
         provider: PROVIDER.to_string(),
         ok,
@@ -135,6 +127,5 @@ pub fn config_set(args_json: &str) -> Result<String, String> {
             "configureUps returned false".to_string()
         },
         restart_required: false,
-    };
-    serde_json::to_string(&outcome).map_err(|e| format!("encode ups outcome: {e}"))
+    })
 }

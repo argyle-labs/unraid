@@ -21,8 +21,25 @@ use crate::generated::v7_3_1::docker_containers::{
 };
 use crate::{Client, Config};
 use plugin_toolkit::contract::TopologyClaim;
+use plugin_toolkit::contract::topology::TopologyCollector;
 use plugin_toolkit::prelude::*;
 use std::collections::BTreeMap;
+
+/// Typed topology facet: registered on the `Plugin` builder, which drives it
+/// over the wire via `contract::topology::dispatch_op` — no hand-written op
+/// routing. Wraps the free [`collect_claims`] fn.
+pub struct UnraidTopology;
+
+#[plugin_toolkit::async_trait::async_trait]
+impl TopologyCollector for UnraidTopology {
+    fn name(&self) -> &str {
+        crate::PROVIDER
+    }
+
+    async fn collect_claims(&self) -> Result<Vec<TopologyClaim>> {
+        collect_claims().await
+    }
+}
 
 /// Label keys the Unraid facet rides on until `TopologyClaim` grows first-class
 /// `icon_url`/`web_ui_url` fields (tracked separately). Consumers read these to
