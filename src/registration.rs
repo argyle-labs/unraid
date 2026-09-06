@@ -1,117 +1,108 @@
-//! Domain-backend registration for the hybrid export.
+//! Typed capability providers for the hybrid export.
 //!
-//! unraid contributes one backend to orca's `contract` registries, routed back
-//! through the FFI `invoke` under a distinct prefix:
+//! Besides its `unraid.` tool surface and the [`crate::topology::UnraidTopology`]
+//! collector, unraid contributes two more typed domain facets plus one
+//! escape-hatch backend, all composed on the toolkit's `Plugin` builder (which
+//! emits the merged `backends()` payload and the single wire dispatch):
 //!
-//! - `topology` (`unraid.__topo.collect_claims`) — one [`TopologyClaim`] per
-//!   docker container per enabled endpoint, so the fleet inventory records which
-//!   Unraid host runs which workload (see [`crate::topology`]). The GraphQL API
-//!   is the supported read path because Unraid's docker socket is
-//!   `root:docker`-only.
+//! - a `diagnostics` provider ([`UnraidDiagnostics`]) — the power-loss
+//!   shutdown/logging checks, delegating to [`crate::checks`];
+//! - a `ups` provider ([`UnraidUps`]) — the host's apcupsd managed through the
+//!   GraphQL API, delegating to [`crate::ups`];
+//! - a `backup_kind` backend (`unraid-config`) — the host's flash config
+//!   capture/restore ([`crate::backup`]). There is no single-instance typed
+//!   builder facet for backup, so it rides the builder's `.backend(def,
+//!   dispatcher)` escape hatch via [`backup_backend_def`] + [`backup_dispatcher`].
 //!
-//! A `unit` provider (array / shares / plugins as managed units) and a
-//! `container_runtime`/deploy-target registration remain follow-ups: they need
-//! typed lifecycle surfaces and dynamic per-endpoint (re)registration, so they
-//! land separately from this static-descriptor topology wiring — the same
-//! staging dockge used.
-//!
-//! [`backend_dispatch`] answers `unraid.__topo.*`; the toolkit's hybrid `invoke`
-//! routes everything else (`unraid.schema`, the `unraid.{list,detail,create,
-//! update,delete}` endpoint registry) to the tool surface.
+//! No hand-rolled op-string dispatch or merged-backends JSON here anymore.
 
 use plugin_toolkit::abi::BackendDef;
-use plugin_toolkit::backend_def::{backup_kind_backend_def, topology_backend_def};
-use plugin_toolkit::reactor;
-use plugin_toolkit::serde_json;
+use plugin_toolkit::anyhow::Result;
+use plugin_toolkit::backend_def::backup_kind_backend_def;
+use plugin_toolkit::contract::BoxFuture;
+use plugin_toolkit::contract::diagnostics::{
+    DiagnoseArgs, DiagnosticsProvider, Finding, RepairArgs, RepairOutcome,
+};
+use plugin_toolkit::contract::ups::{
+    UpsConfig, UpsConfigOutcome, UpsProvider, UpsQueryArgs, UpsState,
+};
+use plugin_toolkit::serde_json::Value;
 
-const TOPO_PREFIX: &str = "unraid.__topo";
-const DIAG_PREFIX: &str = "unraid.__diag";
-const UPS_PREFIX: &str = "unraid.__ups";
+/// Bridge invoke-prefix for the `unraid-config` backup KIND.
 const BACKUP_PREFIX: &str = "unraid.__backup";
-
 /// The backup KIND this plugin contributes: an Unraid host's persistent
 /// configuration (`/boot/config` and its disk-based equivalents).
 const BACKUP_KIND: &str = "unraid-config";
 
-/// Backend descriptors this plugin advertises:
-/// - a `topology` collector (`unraid.__topo.collect_claims`), derived from the
-///   live surface via the toolkit's export helper;
-/// - a `diagnostics` provider (`unraid.__diag.{diagnose,repair}`) surfacing the
-///   power-loss shutdown/logging checks (see [`crate::checks`]). Built by hand
-///   like raccoon's, since the toolkit has no `diagnostics_backend_def` helper.
-/// - a `ups` provider (`unraid.__ups.*`) managing the host's apcupsd through the
-///   GraphQL API (see [`crate::ups`]);
-/// - a `backup_kind` provider (`unraid.__backup.*`) contributing the
-///   `unraid-config` KIND that captures/restores the host's flash config (see
-///   [`crate::backup`]).
-pub fn backends_json() -> String {
-    let defs: Vec<BackendDef> = vec![
-        topology_backend_def("unraid", TOPO_PREFIX),
-        BackendDef {
-            domain: "diagnostics".to_string(),
-            name: crate::PROVIDER.to_string(),
-            invoke_prefix: DIAG_PREFIX.to_string(),
-            ..Default::default()
-        },
-        BackendDef {
-            domain: "ups".to_string(),
-            name: crate::PROVIDER.to_string(),
-            invoke_prefix: UPS_PREFIX.to_string(),
-            ..Default::default()
-        },
-        backup_kind_backend_def(BACKUP_KIND, BACKUP_PREFIX),
-    ];
-    serde_json::to_string(&defs).unwrap_or_else(|_| "[]".to_string())
+/// The `diagnostics` provider unraid advertises (`diagnose` + `repair`).
+pub struct UnraidDiagnostics;
+
+impl DiagnosticsProvider for UnraidDiagnostics {
+    fn name(&self) -> &str {
+        crate::PROVIDER
+    }
+
+    fn diagnose(&self, args: DiagnoseArgs) -> BoxFuture<'_, Result<Vec<Finding>>> {
+        Box::pin(async move { Ok(crate::checks::diagnose_typed(args).await) })
+    }
+
+    fn repair(&self, args: RepairArgs) -> BoxFuture<'_, Result<RepairOutcome>> {
+        Box::pin(async move { Ok(crate::checks::repair_typed(args)) })
+    }
 }
 
-/// Handle the loader's `unraid.__topo.*` / `unraid.__diag.*` backend calls.
-/// Returns `None` for anything else so the toolkit falls through to the
-/// `unraid.` tool surface. Async work runs on the toolkit's shared runtime
-/// behind the synchronous FFI boundary.
-pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
-    if let Some(op) = name
-        .strip_prefix(TOPO_PREFIX)
-        .and_then(|s| s.strip_prefix('.'))
-    {
-        return Some(dispatch_topology(op));
+/// The `ups` provider unraid advertises (`state` + `config_get` + `config_set`).
+pub struct UnraidUps;
+
+impl UpsProvider for UnraidUps {
+    fn name(&self) -> &str {
+        crate::PROVIDER
     }
-    if let Some(op) = name
-        .strip_prefix(DIAG_PREFIX)
-        .and_then(|s| s.strip_prefix('.'))
-    {
-        return Some(match op {
-            "diagnose" => crate::checks::diagnose(args_json),
-            "repair" => crate::checks::repair(args_json),
-            other => Err(format!("unknown diagnostics op: {other}")),
-        });
+
+    fn state(&self, args: UpsQueryArgs) -> BoxFuture<'_, Result<Vec<UpsState>>> {
+        Box::pin(async move {
+            crate::ups::state_typed(args)
+                .await
+                .map_err(|e| plugin_toolkit::anyhow::anyhow!(e))
+        })
     }
-    if let Some(op) = name
-        .strip_prefix(UPS_PREFIX)
-        .and_then(|s| s.strip_prefix('.'))
-    {
-        return Some(match op {
-            "state" => crate::ups::state(args_json),
-            "config_get" => crate::ups::config_get(args_json),
-            "config_set" => crate::ups::config_set(args_json),
-            other => Err(format!("unknown ups op: {other}")),
-        });
+
+    fn config_get(&self, args: UpsQueryArgs) -> BoxFuture<'_, Result<Vec<UpsConfig>>> {
+        Box::pin(async move {
+            crate::ups::config_get_typed(args)
+                .await
+                .map_err(|e| plugin_toolkit::anyhow::anyhow!(e))
+        })
     }
-    if let Some(op) = name
+
+    fn config_set(&self, config: UpsConfig) -> BoxFuture<'_, Result<UpsConfigOutcome>> {
+        Box::pin(async move {
+            crate::ups::config_set_typed(config)
+                .await
+                .map_err(|e| plugin_toolkit::anyhow::anyhow!(e))
+        })
+    }
+}
+
+/// Backend descriptor for the `unraid-config` backup KIND. Registered on the
+/// `Plugin` builder via `.backend(backup_backend_def(), backup_dispatcher)`.
+pub fn backup_backend_def() -> BackendDef {
+    backup_kind_backend_def(BACKUP_KIND, BACKUP_PREFIX)
+}
+
+/// Escape-hatch dispatcher for the `unraid.__backup.*` bridge calls. Strips its
+/// own invoke-prefix and answers the bare op via [`crate::backup::dispatch`];
+/// returns `None` for anything else so the builder falls through to the next
+/// dispatcher (and ultimately the `#[orca_tool]` surface). The backup ops are
+/// synchronous file/tar work, so no reactor re-entry occurs here.
+pub fn backup_dispatcher(tool: &str, args: Value) -> Option<std::result::Result<Value, Value>> {
+    let op = tool
         .strip_prefix(BACKUP_PREFIX)
-        .and_then(|s| s.strip_prefix('.'))
-    {
-        return Some(crate::backup::dispatch(op, args_json));
-    }
-    None
-}
-
-fn dispatch_topology(op: &str) -> Result<String, String> {
-    match op {
-        "collect_claims" => {
-            let claims =
-                reactor::block_on(crate::topology::collect_claims()).map_err(|e| e.to_string())?;
-            serde_json::to_string(&claims).map_err(|e| e.to_string())
-        }
-        other => Err(format!("unknown topology op: {other}")),
-    }
+        .and_then(|s| s.strip_prefix('.'))?;
+    let args_json = args.to_string();
+    Some(
+        crate::backup::dispatch(op, &args_json)
+            .map(|s| plugin_toolkit::serde_json::from_str(&s).unwrap_or(Value::String(s)))
+            .map_err(Value::String),
+    )
 }

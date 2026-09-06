@@ -75,13 +75,13 @@ const SMB_USERS_ENV: &str = "UNRAID_SMB_USERS";
 
 /// Run every check and return the findings as JSON (`Vec<Finding>`). The
 /// `provider` filter is applied core-side, so args are only validated here.
-pub fn diagnose(args_json: &str) -> Result<String, String> {
-    let _: DiagnoseArgs = if args_json.trim().is_empty() {
-        DiagnoseArgs::default()
-    } else {
-        serde_json::from_str(args_json).unwrap_or_default()
-    };
-    let findings: Vec<Finding> = [
+/// Typed `diagnostics.diagnose` for the [`DiagnosticsProvider`] facet: run every
+/// power-loss / logging / samba-mapping check and return the findings. Async to
+/// match the trait; the checks themselves are synchronous flash-config reads.
+///
+/// [`DiagnosticsProvider`]: plugin_toolkit::contract::diagnostics::DiagnosticsProvider
+pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
+    [
         check_shutdown_timeout(DISK_CFG),
         check_syslog_mirror(RSYSLOG_CFG),
         check_array_unmount_blockers("/proc"),
@@ -91,7 +91,18 @@ pub fn diagnose(args_json: &str) -> Result<String, String> {
     ]
     .into_iter()
     .flatten()
-    .collect();
+    .collect()
+}
+
+/// JSON-string wrapper over [`diagnose_typed`], retained for tests / any direct
+/// callers. The facet uses the typed path.
+pub fn diagnose(args_json: &str) -> Result<String, String> {
+    let args: DiagnoseArgs = if args_json.trim().is_empty() {
+        DiagnoseArgs::default()
+    } else {
+        serde_json::from_str(args_json).unwrap_or_default()
+    };
+    let findings = reactor::block_on(diagnose_typed(args));
     serde_json::to_string(&findings).map_err(|e| format!("encode findings: {e}"))
 }
 
@@ -353,9 +364,12 @@ fn check_unclean_shutdown() -> Option<Finding> {
 // ── repair ───────────────────────────────────────────────────────────────────
 
 /// Run one repair by id and return a [`RepairOutcome`] as JSON.
-pub fn repair(args_json: &str) -> Result<String, String> {
-    let args: RepairArgs =
-        serde_json::from_str(args_json).map_err(|e| format!("invalid repair args: {e}"))?;
+/// Typed `diagnostics.repair` for the [`DiagnosticsProvider`] facet: run the
+/// requested in-place flash-config repair and report the outcome. Synchronous
+/// (file writes), idempotent, and non-automatic (suggest-then-confirm upstream).
+///
+/// [`DiagnosticsProvider`]: plugin_toolkit::contract::diagnostics::DiagnosticsProvider
+pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
     let (ok, message) = match args.repair_id.as_str() {
         "shutdown-timeout" => repair_shutdown_timeout(DISK_CFG),
         "syslog-mirror" => repair_syslog_mirror(RSYSLOG_CFG),
@@ -363,13 +377,20 @@ pub fn repair(args_json: &str) -> Result<String, String> {
         "samba-passdb-flash" => repair_samba_passdb_flash(RUNTIME_SMBPASSWD, FLASH_SMBPASSWD),
         other => (false, format!("unraid has no repair '{other}'")),
     };
-    let outcome = RepairOutcome {
+    RepairOutcome {
         id: args.repair_id,
         provider: crate::PROVIDER.to_string(),
         ok,
         message,
-    };
-    serde_json::to_string(&outcome).map_err(|e| format!("encode outcome: {e}"))
+    }
+}
+
+/// JSON-string wrapper over [`repair_typed`], retained for tests / any direct
+/// callers. The facet uses the typed path.
+pub fn repair(args_json: &str) -> Result<String, String> {
+    let args: RepairArgs =
+        serde_json::from_str(args_json).map_err(|e| format!("invalid repair args: {e}"))?;
+    serde_json::to_string(&repair_typed(args)).map_err(|e| format!("encode outcome: {e}"))
 }
 
 /// Set `shutdownTimeout=SHUTDOWN_TIMEOUT_MAX` in `disk.cfg`. Idempotent: rewrites
