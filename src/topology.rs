@@ -200,7 +200,7 @@ mod tests {
             "lscr.io/linuxserver/syncthing",
             ContainerState::RUNNING,
             Some("/state/plugins/dockerMan/images/syncthing-icon.png"),
-            Some("http://10.10.10.10:8384"),
+            Some("http://10.0.0.10:8384"),
             Some(true),
         );
         let claim = claim_from_container(c, "willow");
@@ -219,7 +219,7 @@ mod tests {
         );
         assert_eq!(
             claim.labels.get(WEBUI_LABEL).map(String::as_str),
-            Some("http://10.10.10.10:8384")
+            Some("http://10.0.0.10:8384")
         );
         assert_eq!(
             claim.labels.get(UPDATE_LABEL).map(String::as_str),
