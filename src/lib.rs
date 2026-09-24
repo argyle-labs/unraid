@@ -616,8 +616,8 @@ mod tests {
     fn endpoint_honors_explicit_base_url() {
         // A real base_url (e.g. a remote `from` probe) is used as-is.
         assert_eq!(
-            Config::new("http://10.10.10.10", "tok").endpoint(),
-            "http://10.10.10.10/graphql"
+            Config::new("http://10.0.0.10", "tok").endpoint(),
+            "http://10.0.0.10/graphql"
         );
     }
 }
