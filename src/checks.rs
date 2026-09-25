@@ -91,7 +91,78 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
     ]
     .into_iter()
     .flatten()
+    .chain(check_vm_manager().await)
     .collect()
+}
+
+/// Report each endpoint's VM Manager state.
+///
+/// Exists because "VMs are disabled" and "the VM query broke" are indistinguishable
+/// on the wire (both arrive as `INTERNAL_SERVER_ERROR`), and conflating them is
+/// wrong in both directions: a deliberately VM-less host reads as permanently
+/// broken, and a genuinely broken one can hide behind a reassuring "disabled".
+///
+/// Severity follows intent, not the wire shape:
+/// - Enabled  -> `Ok`
+/// - Disabled -> `Info` plus activation instructions. NOT a defect: an operator
+///   chose this, and a host that is itself a VM often cannot do otherwise.
+/// - Unavailable -> `Warn`. The query genuinely failed and something is wrong.
+async fn check_vm_manager() -> Vec<Finding> {
+    let rows = match endpoint_db::list() {
+        Ok(r) => r.into_iter().filter(|e| e.enabled).collect::<Vec<_>>(),
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for ep in rows {
+        let cfg = Config::new(ep.base_url.clone(), ep.api_key.clone()).insecure(ep.insecure);
+        let client = Client::new(cfg);
+        let result = client.vms().await;
+        let state = crate::vm_manager::classify(&result);
+        let err = result.as_ref().err().map(|e| e.to_string());
+        out.push(finding_vm_manager(&ep.name, state, err.as_deref()));
+    }
+    out
+}
+
+fn finding_vm_manager(
+    endpoint: &str,
+    state: crate::vm_manager::VmManager,
+    err: Option<&str>,
+) -> Finding {
+    use crate::vm_manager::{VmManager, activation_instructions};
+    let id = format!("vm-manager::{endpoint}");
+    match state {
+        VmManager::Enabled => finding(
+            &id,
+            Severity::Ok,
+            "VM Manager is enabled",
+            format!("VM Manager is enabled and answering on '{endpoint}'."),
+            None,
+        ),
+        VmManager::Disabled => finding(
+            &id,
+            Severity::Info,
+            "VM Manager is disabled",
+            format!(
+                "VM Manager is switched off on '{endpoint}'. This is a configuration state, not \
+                 a fault — no VMs can be created or managed here until it is enabled, and \
+                 nothing needs fixing if that is intended. {}",
+                activation_instructions()
+            ),
+            None,
+        ),
+        VmManager::Unavailable => finding(
+            &id,
+            Severity::Warn,
+            "VM Manager state could not be determined",
+            format!(
+                "The VM query against '{endpoint}' failed for a reason other than VM Manager \
+                 being disabled, so VM state is unknown rather than known-absent: {}",
+                err.unwrap_or("no error text")
+            ),
+            None,
+        ),
+    }
 }
 
 /// JSON-string wrapper over [`diagnose_typed`], retained for tests / any direct
@@ -855,7 +926,15 @@ async fn collect_autostart(rows: &[EndpointRow]) -> (Vec<String>, Vec<String>) {
                     ));
                 }
             }
-            Err(e) => errors.push(format!("{}: vms: {e}", ep.name)),
+            // A host with VM Manager switched off answers this query with an
+            // INTERNAL_SERVER_ERROR, which previously landed in `errors` and made
+            // the whole check report "autostart state could not be read" forever.
+            // A deliberately VM-less host has no autostart VMs to report, so it is
+            // a clean result — see `crate::vm_manager`.
+            Err(e) => match crate::vm_manager::classify_error(&e.to_string()) {
+                crate::vm_manager::VmManager::Disabled => {}
+                _ => errors.push(format!("{}: vms: {e}", ep.name)),
+            },
         }
     }
     (offenders, errors)
