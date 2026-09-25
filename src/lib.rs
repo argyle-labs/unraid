@@ -28,6 +28,7 @@ pub mod surface {
 pub mod backup;
 pub mod checks;
 pub mod endpoint;
+pub mod exports;
 pub mod permissions;
 pub mod registration;
 pub mod schema_pull;
