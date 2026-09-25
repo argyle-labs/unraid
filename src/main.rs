@@ -31,6 +31,7 @@ fn main() -> plugin_toolkit::anyhow::Result<()> {
         .diagnostics(unraid::registration::UnraidDiagnostics)
         .ups(unraid::registration::UnraidUps)
         .permissions(unraid::permissions::UnraidPermissions)
+        .storage(unraid::exports::UnraidExports)
         .backend(
             unraid::registration::backup_backend_def(),
             Box::new(unraid::registration::backup_dispatcher),
