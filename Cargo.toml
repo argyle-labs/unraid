@@ -45,7 +45,7 @@ path = "src/main.rs"
 # `graphql::GraphQLQuery` re-export (the single-dep toolkit slice). Until that rc
 # is cut, the committed `[patch]` in `.cargo/config.toml` resolves these to the
 # local in-tree toolkit at ../orca.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.2.1-rc.4" }
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -54,7 +54,7 @@ tempfile = "3"
 rustls   = "0.23"
 
 [build-dependencies]
-plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", tag = "v0.2.1-rc.4" }
 
 # Prototype GraphQL→orca-surface generator (build/surface.rs). Walks the emitted
 # query modules, pairs each operation via its `OPERATION_NAME`/`QUERY` consts,
