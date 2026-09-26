@@ -45,7 +45,13 @@ path = "src/main.rs"
 # `graphql::GraphQLQuery` re-export (the single-dep toolkit slice). Until that rc
 # is cut, the committed `[patch]` in `.cargo/config.toml` resolves these to the
 # local in-tree toolkit at ../orca.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.2.1-rc.5" }
+# `default-features = false`: the toolkit's default is `full`, which is the
+# DAEMON profile (in-process host-side proxies, db, notify, containers, openapi,
+# jemalloc-stats). A subprocess plugin needs none of that, and taking it linked
+# bollard, git2, toml and roxmltree into this binary. Only the four features
+# below are used: `db` because `plugin_toolkit::runtime` is gated on it, `http`
+# because this plugin makes real outbound calls, `graphql` for the Unraid API.
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.2.1-rc.5", default-features = false, features = ["tools", "db", "graphql", "http", "delegated-http"] }
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
