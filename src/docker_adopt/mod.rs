@@ -23,6 +23,7 @@ pub mod inspect;
 pub mod orphans;
 pub mod privileged;
 pub mod redact;
+pub mod safefs;
 pub mod spec;
 pub mod template;
 
@@ -31,7 +32,6 @@ use std::path::{Path, PathBuf};
 
 use plugin_toolkit::contract::CallerIdentity;
 use plugin_toolkit::contract::plan::{ExecutionPlan, PlannedChange};
-use plugin_toolkit::lifecycle;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::{self, Value};
 
@@ -40,9 +40,9 @@ use inspect::{
     ContainerInspect, ICON_LABEL, ImageInspect, MANAGED_LABEL, VolumeInspect, live_spec,
 };
 use orphans::ComposeLeftovers;
-use privileged::PrivilegedOp;
+use privileged::{PrivilegedOp, PrivilegedRunner};
 use redact::Redactor;
-use spec::{Delta, MountKind, MountSpec, RunSpec};
+use spec::{Delta, DiffMode, MountKind, MountSpec, RunSpec};
 use template::Template;
 
 /// Value of [`MANAGED_LABEL`] on a dockerMan-rendered container.
@@ -86,10 +86,6 @@ pub fn authorize_execute(tool: &str, caller: Option<&CallerIdentity>) -> Result<
     }
 }
 
-fn today() -> String {
-    lifecycle::timestamp().chars().take(8).collect()
-}
-
 // ── steps ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +116,7 @@ pub enum Step {
         icon: Option<String>,
         image_id: String,
         expect: Box<RunSpec>,
+        mode: DiffMode,
     },
     ClearIconCache,
     RefreshIcons,
@@ -129,8 +126,9 @@ pub enum Step {
     RemoveOwnAnonymousVolumes {
         candidates: Vec<String>,
     },
-    RemoveOldImage {
-        id: String,
+    /// Accept a verified copy so it can no longer be rolled back.
+    CommitCopy {
+        suffix: String,
     },
     RemoveNetwork {
         network: String,
@@ -158,13 +156,13 @@ impl Step {
             Step::RefreshIcons => "refresh-icons",
             Step::RemoveVolume { .. } => "remove-volume",
             Step::RemoveOwnAnonymousVolumes { .. } => "remove-own-anonymous-volumes",
-            Step::RemoveOldImage { .. } => "remove-old-image",
+            Step::CommitCopy { .. } => "commit-copy",
             Step::RemoveNetwork { .. } => "remove-network",
             Step::RetireStack { .. } => "retire-stack",
         }
     }
 
-    fn change(&self, name: &str, date: &str) -> PlannedChange {
+    fn change(&self, name: &str, run_id: &str) -> PlannedChange {
         let (target, detail) = match self {
             Step::Probe => ("root".to_string(), None),
             Step::Stop => (name.to_string(), None),
@@ -174,12 +172,12 @@ impl Step {
                     "cp -a into {to}; verify entries, bytes and manifest digest"
                 )),
             ),
-            Step::SaveInspect { .. } => (template::inspect_backup_path(name, date), None),
+            Step::SaveInspect { .. } => (template::inspect_backup_path(name, run_id), None),
             Step::WriteTemplate { .. } => (
                 template::template_path(name),
                 Some(format!(
                     "an existing template is first copied to {}",
-                    template::backup_path(name, date)
+                    template::backup_path(name, run_id)
                 )),
             ),
             Step::SetAutostart { on } => (
@@ -219,9 +217,9 @@ impl Step {
                 format!("[{}]", candidates.join(", ")),
                 Some("only those no container mounts after the rebuild".to_string()),
             ),
-            Step::RemoveOldImage { id } => (
-                id.clone(),
-                Some("only if untagged and unused after the rebuild".to_string()),
+            Step::CommitCopy { suffix } => (
+                format!("{}/{name}/{suffix}", host::APPDATA),
+                Some("drop this run's copy marker".to_string()),
             ),
             Step::RemoveNetwork { network } => (
                 network.clone(),
@@ -248,8 +246,9 @@ pub struct StepOutcome {
     pub detail: Option<String>,
 }
 
-async fn run_step(ops: &dyn HostOps, step: &Step, name: &str) -> Result<String> {
-    let name_s = name.to_string();
+async fn run_step(ops: &dyn HostOps, step: &Step, cx: &ApplyCtx) -> Result<String> {
+    let name = cx.name.as_str();
+    let name_s = cx.name.clone();
     match step {
         Step::Probe => ops.privileged(&PrivilegedOp::Ping).await,
         Step::Stop => ops.docker(&["stop", name]).await.map(|_| "stopped".into()),
@@ -258,6 +257,15 @@ async fn run_step(ops: &dyn HostOps, step: &Step, name: &str) -> Result<String> 
                 name: name_s,
                 volume: volume.clone(),
                 dest_suffix: suffix.clone(),
+                nonce: cx.nonce.clone(),
+            })
+            .await
+        }
+        Step::CommitCopy { suffix } => {
+            ops.privileged(&PrivilegedOp::CommitCopy {
+                name: name_s,
+                dest_suffix: suffix.clone(),
+                nonce: cx.nonce.clone(),
             })
             .await
         }
@@ -265,6 +273,7 @@ async fn run_step(ops: &dyn HostOps, step: &Step, name: &str) -> Result<String> 
             ops.privileged(&PrivilegedOp::SaveInspect {
                 name: name_s,
                 json: json.clone(),
+                backup_id: cx.run_id.clone(),
             })
             .await
         }
@@ -272,6 +281,7 @@ async fn run_step(ops: &dyn HostOps, step: &Step, name: &str) -> Result<String> 
             ops.privileged(&PrivilegedOp::WriteTemplate {
                 name: name_s,
                 xml: xml.clone(),
+                backup_id: cx.run_id.clone(),
             })
             .await
         }
@@ -299,6 +309,7 @@ async fn run_step(ops: &dyn HostOps, step: &Step, name: &str) -> Result<String> 
             icon,
             image_id,
             expect,
+            mode,
         } => {
             let c = ops.inspect_container(name).await?;
             let managed = c.label(MANAGED_LABEL).unwrap_or_default();
@@ -319,7 +330,7 @@ async fn run_step(ops: &dyn HostOps, step: &Step, name: &str) -> Result<String> 
             }
             let img = ops.inspect_image(&c.image).await?;
             let (got, _) = live_spec(&c, &img);
-            let d: Vec<String> = spec::diff(expect, &got)
+            let d: Vec<String> = spec::diff(expect, &got, *mode)
                 .into_iter()
                 .filter(|d| !d.intended)
                 .map(|d| d.msg)
@@ -361,20 +372,6 @@ async fn run_step(ops: &dyn HostOps, step: &Step, name: &str) -> Result<String> 
                     .join(", ")
             ))
         }
-        Step::RemoveOldImage { id } => {
-            let Ok(img) = ops.inspect_image(id).await else {
-                return Ok(format!("{id} is already gone"));
-            };
-            if img.repo_tags.as_ref().is_some_and(|t| !t.is_empty()) {
-                return Ok(format!("kept {id}: still tagged"));
-            }
-            if ops.inspect_all().await?.iter().any(|c| &c.image == id) {
-                return Ok(format!("kept {id}: still used"));
-            }
-            ops.docker(&["image", "rm", id])
-                .await
-                .map(|_| format!("removed {id}"))
-        }
         Step::RemoveNetwork { network } => {
             let users = orphans::network_users(network, &ops.inspect_all().await?);
             if !users.is_empty() {
@@ -384,11 +381,13 @@ async fn run_step(ops: &dyn HostOps, step: &Step, name: &str) -> Result<String> 
                 .await
                 .map(|_| format!("removed {network}"))
         }
-        Step::RetireStack { project, dir, .. } => {
+        Step::RetireStack { project, dir, to } => {
             ops.privileged(&PrivilegedOp::RetireStack {
                 name: name_s,
                 project: project.clone(),
                 dir: dir.clone(),
+                to: to.clone(),
+                run_id: cx.run_id.clone(),
             })
             .await
         }
@@ -399,7 +398,10 @@ async fn run_step(ops: &dyn HostOps, step: &Step, name: &str) -> Result<String> 
 pub struct ApplyCtx {
     pub tool: &'static str,
     pub name: String,
-    pub date: String,
+    /// This run's id: names the template backup and saved inspect.
+    pub run_id: String,
+    /// This run's copy-marker nonce.
+    pub nonce: String,
     pub was_running: bool,
     pub autostart_before: bool,
     pub had_template: bool,
@@ -414,12 +416,12 @@ impl ApplyCtx {
         let tpl = template::template_path(name);
         let mut r = format!(
             "The original container config is saved at {}.",
-            template::inspect_backup_path(name, &self.date)
+            template::inspect_backup_path(name, &self.run_id)
         );
         if self.had_template {
             r.push_str(&format!(
                 " To return to the previous template: cp {} {tpl} && {} {name}.",
-                template::backup_path(name, &self.date),
+                template::backup_path(name, &self.run_id),
                 host::REBUILD_SCRIPT
             ));
         }
@@ -444,21 +446,25 @@ pub async fn apply(ops: &dyn HostOps, cx: &ApplyCtx, steps: &[Step]) -> Result<V
     let mut autostart_changed = false;
     let mut copies: Vec<String> = Vec::new();
     for step in steps {
-        let change = step.change(name, &cx.date);
+        let change = step.change(name, &cx.run_id);
         // Marked before running: a failed rebuild leaves the container in an
-        // unknown state, so it is reported with recovery, not rolled back.
+        // unknown state, so it is reported with recovery, not rolled back;
+        // a failed copy may leave a partial one. WriteTemplate replaces the
+        // file by rename, so it is marked only once it succeeded.
         match step {
             Step::CopyVolume { suffix, .. } => copies.push(suffix.clone()),
-            Step::WriteTemplate { .. } => template_written = true,
             Step::SetAutostart { .. } if !rebuilt => autostart_changed = true,
             Step::Rebuild => rebuilt = true,
             _ => {}
         }
-        let res = run_step(ops, step, name).await;
+        let res = run_step(ops, step, cx).await;
         let err = match res {
             Ok(detail) => {
                 if step == &Step::Stop {
                     stopped = true;
+                }
+                if matches!(step, Step::WriteTemplate { .. }) {
+                    template_written = true;
                 }
                 done.push(StepOutcome {
                     action: change.action,
@@ -496,7 +502,10 @@ pub async fn apply(ops: &dyn HostOps, cx: &ApplyCtx, steps: &[Step]) -> Result<V
         };
         if template_written {
             let r = ops
-                .privileged(&PrivilegedOp::RestoreTemplate { name: name.into() })
+                .privileged(&PrivilegedOp::RestoreTemplate {
+                    name: name.into(),
+                    backup_id: cx.run_id.clone(),
+                })
                 .await;
             note("restore template".into(), r);
         }
@@ -514,6 +523,7 @@ pub async fn apply(ops: &dyn HostOps, cx: &ApplyCtx, steps: &[Step]) -> Result<V
                 .privileged(&PrivilegedOp::RemoveCopy {
                     name: name.into(),
                     dest_suffix: suffix.clone(),
+                    nonce: cx.nonce.clone(),
                 })
                 .await;
             note(format!("remove copy {suffix}"), r);
@@ -551,8 +561,10 @@ pub struct Snapshot {
     /// `(file, <Name>)` of every template in templates-user.
     pub templates: Vec<(String, Option<String>)>,
     pub autostart: Vec<String>,
-    /// `YYYYMMDD`, for backup and retire names.
-    pub date: String,
+    /// This run's id (`YYYYMMDD-HHMMSS-<hex>`): backup names, retire date.
+    pub run_id: String,
+    /// This run's copy-marker nonce.
+    pub nonce: String,
     /// Log options the docker daemon applies by default.
     pub daemon_log_opts: BTreeMap<String, String>,
     pub stacks_roots: Vec<PathBuf>,
@@ -671,7 +683,7 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
     let compose = orphans::compose_leftovers(
         c,
         &s.all,
-        &s.date,
+        s.run_id.get(..8).unwrap_or_default(),
         &s.stacks_roots,
         s.compose_file.as_deref(),
     );
@@ -737,6 +749,13 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
                 ));
             }
             let to = format!("{}/{name}/{suffix}", host::APPDATA);
+            let overlapping = orphans::binds_overlapping(Path::new(&to), &s.all);
+            if !overlapping.is_empty() {
+                blockers.push(format!(
+                    "{to} overlaps existing bind mounts [{}]",
+                    overlapping.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
             let old = target
                 .mounts
                 .iter()
@@ -801,6 +820,7 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
         icon: (!icon.is_empty()).then(|| icon.clone()),
         image_id: c.image.clone(),
         expect: Box::new(target.clone()),
+        mode: DiffMode::Adopt,
     });
     if !icon.is_empty() {
         steps.push(Step::ClearIconCache);
@@ -811,6 +831,11 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
             volume: m.volume.clone(),
         });
     }
+    for m in &migrations {
+        steps.push(Step::CommitCopy {
+            suffix: m.suffix.clone(),
+        });
+    }
     let anon: Vec<String> = orphans::own_anonymous_volumes(c, &s.volumes)
         .into_iter()
         .filter(|v| !migrations.iter().any(|m| &m.volume == v))
@@ -818,9 +843,6 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
     if !anon.is_empty() {
         steps.push(Step::RemoveOwnAnonymousVolumes { candidates: anon });
     }
-    steps.push(Step::RemoveOldImage {
-        id: c.image.clone(),
-    });
     if let Some(l) = &compose {
         if let Some(net) = &l.network {
             steps.push(Step::RemoveNetwork {
@@ -878,6 +900,7 @@ pub fn fidelity(
     baked: &BTreeSet<String>,
     daemon_log_opts: &BTreeMap<String, String>,
     rendered: &str,
+    mode: DiffMode,
 ) -> (Option<RunSpec>, Vec<Delta>) {
     let mut out: Vec<Delta> = unsupported
         .iter()
@@ -888,7 +911,7 @@ pub fn fidelity(
         .collect();
     match rendered_spec(rendered, baked, daemon_log_opts) {
         Ok(got) => {
-            out.extend(spec::diff(target, &got));
+            out.extend(spec::diff(target, &got, mode));
             (Some(got), out)
         }
         Err(e) => {
@@ -908,8 +931,16 @@ pub fn mask_command(cmd: &str, r: &Redactor) -> String {
     };
     let mut out = Vec::with_capacity(words.len());
     let mut env_next = false;
+    let mut label_next = false;
     for w in words {
-        let masked = if env_next || w.starts_with("--env=") {
+        let masked = if label_next || w.starts_with("--label=") {
+            let prefix = if label_next { "" } else { "--label=" };
+            let body = w.strip_prefix("--label=").unwrap_or(&w);
+            match body.split_once('=') {
+                Some((k, v)) => format!("{prefix}{k}={}", redact::mask_label(k, v)),
+                None => w.clone(),
+            }
+        } else if env_next || w.starts_with("--env=") {
             let body = w.strip_prefix("--env=").unwrap_or(&w);
             match body.split_once('=') {
                 Some((k, v)) => {
@@ -926,6 +957,7 @@ pub fn mask_command(cmd: &str, r: &Redactor) -> String {
             w.clone()
         };
         env_next = w == "-e" || w == "--env";
+        label_next = w == "-l" || w == "--label";
         out.push(spec::shell_quote(&masked));
     }
     r.text(&out.join(" "))
@@ -937,12 +969,30 @@ fn redactor_for(c: &ContainerInspect, extra: &[&RunSpec]) -> Redactor {
         let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
         r.add(k, v);
     }
+    for (k, v) in c.config.labels.iter().flatten() {
+        r.add_label(k, v);
+    }
+    r.add_cmd(c.config.cmd.as_deref().unwrap_or_default());
     for s in extra {
-        for (k, v) in &s.env {
-            r.add(k, v);
-        }
+        r.add_spec(s);
     }
     r
+}
+
+/// Blocker when the root path cannot be used: none configured, or a
+/// side-effect-free Ping through it fails.
+async fn root_path_blocker(runner: Option<&dyn PrivilegedRunner>) -> Option<String> {
+    let runner = match runner {
+        None => return Some(privileged::missing_runner_blocker()),
+        Some(r) => r,
+    };
+    match runner.run(&PrivilegedOp::Ping).await {
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "root path {} failed a ping (argyle-labs/orca#762 seam): {e:#}",
+            runner.kind()
+        )),
+    }
 }
 
 // ── tools ────────────────────────────────────────────────────────────────────
@@ -1074,14 +1124,14 @@ fn execution_plan<A: Serialize>(
     tool: &str,
     args: &A,
     name: &str,
-    date: &str,
+    run_id: &str,
     summary: String,
     steps: &[Step],
 ) -> Result<ExecutionPlan> {
     let inputs = serde_json::to_value(args)?;
     Ok(ExecutionPlan::generic(tool, inputs.into()).detailed(
         summary,
-        steps.iter().map(|s| s.change(name, date)).collect(),
+        steps.iter().map(|s| s.change(name, run_id)).collect(),
     ))
 }
 
@@ -1119,7 +1169,8 @@ async fn snapshot(name: &str) -> Result<Snapshot> {
         existing_template: std::fs::read_to_string(template::template_path(name)).ok(),
         templates: host::list_templates(),
         autostart: host::read_autostart(),
-        date: today(),
+        run_id: privileged::new_run_id(),
+        nonce: host::random_suffix(),
         daemon_log_opts: std::fs::read_to_string(host::DOCKER_CFG)
             .map(|c| host::daemon_log_opts(&c))
             .unwrap_or_default(),
@@ -1183,6 +1234,7 @@ pub fn set_icon_steps(s: &Snapshot, xml: &str, url: &str, expect: RunSpec) -> Ve
         icon: Some(url.to_string()),
         image_id: c.image.clone(),
         expect: Box::new(expect),
+        mode: DiffMode::SetIcon,
     });
     steps.push(Step::ClearIconCache);
     steps.push(Step::RefreshIcons);
@@ -1238,12 +1290,17 @@ async fn unraid_docker_set_icon(
     let baked = inspect::baked_env(&s.image);
     let mut blockers = set_icon_blockers(&s);
     let runner = privileged::runner();
-    if runner.is_none() {
-        blockers.push(privileged::missing_runner_blocker());
-    }
+    blockers.extend(root_path_blocker(runner.as_deref()).await);
     let (rendered_command, rendered, deltas) = match host::render_command(&xml).await {
         Ok(cmd) => {
-            let (got, d) = fidelity(&live, &unsupported, &baked, &s.daemon_log_opts, &cmd);
+            let (got, d) = fidelity(
+                &live,
+                &unsupported,
+                &baked,
+                &s.daemon_log_opts,
+                &cmd,
+                DiffMode::SetIcon,
+            );
             (Some(cmd), got, d)
         }
         Err(e) => {
@@ -1286,7 +1343,7 @@ async fn unraid_docker_set_icon(
             TOOL,
             &args,
             name,
-            &s.date,
+            &s.run_id,
             format!("set {name}'s icon to {url} and rebuild"),
             &steps,
         )?);
@@ -1301,7 +1358,8 @@ async fn unraid_docker_set_icon(
     let cx = ApplyCtx {
         tool: TOOL,
         name: name.to_string(),
-        date: s.date.clone(),
+        run_id: s.run_id.clone(),
+        nonce: s.nonce.clone(),
         was_running: s.container.state.running,
         autostart_before: s.autostart.iter().any(|n| n == name),
         had_template: true,
@@ -1378,9 +1436,7 @@ async fn unraid_docker_adopt(args: UnraidDockerAdoptArgs, ctx: &ToolCtx) -> Resu
 
     let mut blockers = plan.blockers.clone();
     let runner = privileged::runner();
-    if runner.is_none() {
-        blockers.push(privileged::missing_runner_blocker());
-    }
+    blockers.extend(root_path_blocker(runner.as_deref()).await);
     for m in &plan.migrations {
         if host::is_nonempty_dir(Path::new(&m.to)) {
             blockers.push(format!("{} already has content", m.to));
@@ -1395,6 +1451,7 @@ async fn unraid_docker_adopt(args: UnraidDockerAdoptArgs, ctx: &ToolCtx) -> Resu
                 &plan.baked_env,
                 &s.daemon_log_opts,
                 &cmd,
+                DiffMode::Adopt,
             );
             (Some(cmd), got, d)
         }
@@ -1460,7 +1517,7 @@ async fn unraid_docker_adopt(args: UnraidDockerAdoptArgs, ctx: &ToolCtx) -> Resu
             TOOL,
             &args,
             name,
-            &s.date,
+            &s.run_id,
             summary,
             &plan.steps,
         )?);
@@ -1475,7 +1532,8 @@ async fn unraid_docker_adopt(args: UnraidDockerAdoptArgs, ctx: &ToolCtx) -> Resu
     let cx = ApplyCtx {
         tool: TOOL,
         name: name.to_string(),
-        date: s.date.clone(),
+        run_id: s.run_id.clone(),
+        nonce: s.nonce.clone(),
         was_running: plan.was_running,
         autostart_before: s.autostart.iter().any(|n| n == name),
         had_template: s.existing_template.is_some(),

@@ -453,16 +453,9 @@ fn diff_map(
     what: &str,
     want: &BTreeMap<String, String>,
     got: &BTreeMap<String, String>,
-    mask_values: bool,
+    show: fn(&str, &str) -> String,
     out: &mut Vec<Delta>,
 ) {
-    let show = |k: &str, v: &str| {
-        if mask_values {
-            redact::mask(k, v)
-        } else {
-            v.to_string()
-        }
-    };
     for (k, v) in want {
         match got.get(k) {
             None => out.push(blocking(format!(
@@ -507,9 +500,22 @@ fn diff_value<T: PartialEq + std::fmt::Debug>(what: &str, want: &T, got: &T, out
     }
 }
 
+/// Which verb a diff serves. Only `set_icon` re-renders a template someone
+/// else wrote, where a missing restart policy is the template's existing
+/// state; `adopt` writes the template itself and must keep the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffMode {
+    Adopt,
+    SetIcon,
+}
+
+fn plain(_: &str, v: &str) -> String {
+    v.to_string()
+}
+
 /// Every difference between the spec a container has or should have (`want`)
-/// and the one Unraid would create (`got`). Secret env values are masked.
-pub fn diff(want: &RunSpec, got: &RunSpec) -> Vec<Delta> {
+/// and the one Unraid would create (`got`). Secret values are masked.
+pub fn diff(want: &RunSpec, got: &RunSpec, mode: DiffMode) -> Vec<Delta> {
     let mut out = Vec::new();
     diff_value("name", &want.name, &got.name, &mut out);
     diff_value("image", &want.image, &got.image, &mut out);
@@ -525,7 +531,7 @@ pub fn diff(want: &RunSpec, got: &RunSpec) -> Vec<Delta> {
         (a, b) => out.push(blocking(format!("hostname: live {a:?}, rendered {b:?}"))),
     }
     diff_set("port", &want.ports, &got.ports, &mut out);
-    diff_map("env", &want.env, &got.env, true, &mut out);
+    diff_map("env", &want.env, &got.env, redact::mask, &mut out);
     if want.tz != got.tz {
         out.push(blocking(format!(
             "TZ: live {:?}, rendered {:?}",
@@ -533,13 +539,13 @@ pub fn diff(want: &RunSpec, got: &RunSpec) -> Vec<Delta> {
         )));
     }
     diff_set("mount", &want.mounts, &got.mounts, &mut out);
-    diff_map("tmpfs", &want.tmpfs, &got.tmpfs, false, &mut out);
+    diff_map("tmpfs", &want.tmpfs, &got.tmpfs, plain, &mut out);
     diff_value("log driver", &want.log_driver, &got.log_driver, &mut out);
-    diff_map("log-opt", &want.log_opts, &got.log_opts, false, &mut out);
+    diff_map("log-opt", &want.log_opts, &got.log_opts, plain, &mut out);
     diff_value("gpus", &want.gpus, &got.gpus, &mut out);
     match (&want.restart, &got.restart) {
         (a, b) if a == b => {}
-        (Some(r), None) => out.push(Delta {
+        (Some(r), None) if mode == DiffMode::SetIcon => out.push(Delta {
             msg: format!("restart policy {r} dropped; Unraid autostart starts it with the array"),
             intended: true,
         }),
@@ -553,8 +559,20 @@ pub fn diff(want: &RunSpec, got: &RunSpec) -> Vec<Delta> {
         }),
         (a, b) => out.push(blocking(format!("pids-limit: live {a:?}, rendered {b:?}"))),
     }
-    diff_map("label", &want.labels, &got.labels, false, &mut out);
-    diff_value("command", &want.cmd, &got.cmd, &mut out);
+    diff_map(
+        "label",
+        &want.labels,
+        &got.labels,
+        redact::mask_label,
+        &mut out,
+    );
+    if want.cmd != got.cmd {
+        out.push(blocking(format!(
+            "command: live {:?}, rendered {:?}",
+            redact::mask_cmd(&want.cmd),
+            redact::mask_cmd(&got.cmd)
+        )));
+    }
     for o in &got.other {
         out.push(blocking(format!(
             "unmodelled flag in rendered command: {o}"
@@ -630,10 +648,10 @@ pub fn docker_run_command(spec: &RunSpec) -> String {
         w.push(format!("--pids-limit={n}"));
     }
     for (k, v) in &spec.labels {
-        w.push(format!("--label={k}={v}"));
+        w.push(format!("--label={k}={}", redact::mask_label(k, v)));
     }
     w.push(spec.image.clone());
-    w.extend(spec.cmd.iter().cloned());
+    w.extend(redact::mask_cmd(&spec.cmd));
     w.iter()
         .map(|x| shell_quote(x))
         .collect::<Vec<_>>()
@@ -751,7 +769,7 @@ mod tests {
             ..RunSpec::default()
         };
         assert_eq!(
-            diff(&want, &got),
+            diff(&want, &got, DiffMode::Adopt),
             vec![blocking(
                 "unmodelled flag in rendered command: --cpuset-cpus=1".into()
             )]
@@ -773,7 +791,7 @@ mod tests {
             tz: "America/Denver".into(),
             ..RunSpec::default()
         };
-        let d = diff(&want, &got);
+        let d = diff(&want, &got, DiffMode::Adopt);
         assert_eq!(d.len(), 1);
         assert!(!d[0].msg.contains("abc123"), "{d:?}");
         assert!(d[0].msg.contains("<redacted:"), "{d:?}");
