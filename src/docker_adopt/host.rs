@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::prelude::*;
@@ -190,9 +190,17 @@ pub fn daemon_log_opts(cfg: &str) -> BTreeMap<String, String> {
     out
 }
 
-/// 16 hex chars that differ per call, for temp-file names.
+/// 16 random hex chars (urandom; time/pid/counter as a fallback): temp
+/// names, run ids and copy nonces.
 pub fn random_suffix() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
+    let mut b = [0u8; 8];
+    if fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
+        .is_ok()
+    {
+        return plugin_toolkit::hash::hex_encode(&b);
+    }
     static N: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -205,26 +213,6 @@ pub fn random_suffix() -> String {
         &nanos
     );
     sha256_hex(seed.as_bytes())[..16].to_string()
-}
-
-/// Write `bytes` to a fresh sibling temp file (mode `mode`, never following
-/// an existing path), then rename it over `path`.
-pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let tmp = PathBuf::from(format!("{}.orca-tmp-{}", path.display(), random_suffix()));
-    let res = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&tmp)
-        .and_then(|mut f| {
-            f.write_all(bytes)?;
-            f.sync_all()
-        })
-        .and_then(|_| fs::rename(&tmp, path));
-    if res.is_err() {
-        fs::remove_file(&tmp).ok();
-    }
-    res.with_context(|| format!("write {}", path.display()))
 }
 
 /// The `docker create` command dockerMan would run for `xml`. The candidate is
@@ -256,68 +244,6 @@ pub async fn refresh_icons() -> Result<()> {
     run("php", &[PHP_STDERR_ERRORS, "-r", &code])
         .await
         .map(|_| ())
-}
-
-/// Remove both cached copies of the container's icon.
-pub fn clear_icon_cache(name: &str) -> Result<Vec<String>> {
-    let mut removed = Vec::new();
-    for dir in ICON_CACHES {
-        let p = Path::new(dir).join(format!("{name}-icon.png"));
-        match fs::remove_file(&p) {
-            Ok(()) => removed.push(p.display().to_string()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => bail!("remove {}: {e}", p.display()),
-        }
-    }
-    Ok(removed)
-}
-
-/// A content summary of a tree: entry count, regular-file bytes, and the
-/// sha256 of the sorted `(path, type, size, mode, uid, gid)` list. Symlinks
-/// are not followed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Manifest {
-    pub entries: u64,
-    pub bytes: u64,
-    pub digest: String,
-}
-
-pub fn manifest(root: &Path) -> Result<Manifest> {
-    use std::os::unix::fs::MetadataExt;
-    let mut rows = Vec::new();
-    let mut bytes = 0;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for e in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
-            let e = e?;
-            let md = fs::symlink_metadata(e.path())?;
-            let rel = e.path().strip_prefix(root)?.to_string_lossy().into_owned();
-            let kind = if md.is_dir() {
-                stack.push(e.path());
-                'd'
-            } else if md.is_file() {
-                bytes += md.len();
-                'f'
-            } else if md.file_type().is_symlink() {
-                'l'
-            } else {
-                'o'
-            };
-            let size = if kind == 'f' { md.len() } else { 0 };
-            rows.push(format!(
-                "{rel}\t{kind}\t{size}\t{:o}\t{}\t{}",
-                md.mode() & 0o7777,
-                md.uid(),
-                md.gid()
-            ));
-        }
-    }
-    rows.sort();
-    Ok(Manifest {
-        entries: rows.len() as u64,
-        bytes,
-        digest: sha256_hex(rows.join("\n").as_bytes()),
-    })
 }
 
 pub fn is_nonempty_dir(p: &Path) -> bool {
@@ -425,27 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_detects_content_shape_changes() {
-        let a = tempfile::tempdir().unwrap();
-        fs::create_dir(a.path().join("sub")).unwrap();
-        fs::write(a.path().join("x"), b"12345").unwrap();
-        fs::write(a.path().join("sub/y"), b"123").unwrap();
-        let m = manifest(a.path()).unwrap();
-        assert_eq!((m.entries, m.bytes), (3, 8));
-        fs::rename(a.path().join("x"), a.path().join("z")).unwrap();
-        let m2 = manifest(a.path()).unwrap();
-        assert_eq!((m2.entries, m2.bytes), (3, 8));
-        assert_ne!(m.digest, m2.digest);
-    }
-
-    #[test]
-    fn atomic_write_replaces_and_leaves_no_temp() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("f");
-        fs::write(&p, b"old").unwrap();
-        atomic_write(&p, b"new", 0o600).unwrap();
-        assert_eq!(fs::read(&p).unwrap(), b"new");
-        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1);
+    fn random_suffixes_differ() {
         assert_ne!(random_suffix(), random_suffix());
     }
 }

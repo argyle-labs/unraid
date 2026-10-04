@@ -34,6 +34,8 @@ pub fn stacks_roots() -> Vec<PathBuf> {
 
 /// The `/mnt/user` path for a pool or `user0` path to the same share
 /// (`/mnt/cache/appdata/x` → `/mnt/user/appdata/x`), so binds compare by share.
+/// A bare `/mnt/<x>` is kept: it may be a pool root or any other mount point
+/// (e.g. a remote backup target), and only a share path can be aliased.
 pub fn share_alias(p: &Path) -> PathBuf {
     let mut c = p.components();
     let (Some(Component::RootDir), Some(Component::Normal(mnt)), Some(Component::Normal(pool))) =
@@ -42,7 +44,8 @@ pub fn share_alias(p: &Path) -> PathBuf {
         return p.to_path_buf();
     };
     let pool = pool.to_string_lossy();
-    if mnt != "mnt"
+    if c.as_path().as_os_str().is_empty()
+        || mnt != "mnt"
         || matches!(
             pool.as_ref(),
             "user" | "disks" | "remotes" | "addons" | "rootshare"
@@ -60,6 +63,19 @@ pub fn binds_under(dir: &Path, all: &[ContainerInspect]) -> BTreeSet<String> {
     all.iter()
         .flat_map(|c| c.mounts.iter())
         .filter(|m| m.kind == "bind" && share_alias(Path::new(&m.source)).starts_with(&dir))
+        .map(|m| m.source.clone())
+        .collect()
+}
+
+/// Bind sources of any container that contain `path` or lie inside it.
+pub fn binds_overlapping(path: &Path, all: &[ContainerInspect]) -> BTreeSet<String> {
+    let path = share_alias(path);
+    all.iter()
+        .flat_map(|c| c.mounts.iter())
+        .filter(|m| {
+            let s = share_alias(Path::new(&m.source));
+            m.kind == "bind" && (s.starts_with(&path) || path.starts_with(&s))
+        })
         .map(|m| m.source.clone())
         .collect()
 }
@@ -255,6 +271,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overlap_counts_ancestor_and_descendant_binds() {
+        let c = |src: &str| ContainerInspect {
+            mounts: vec![crate::docker_adopt::inspect::MountPoint {
+                kind: "bind".into(),
+                source: src.into(),
+                destination: "/x".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dest = Path::new("/mnt/user/appdata/pbs/config");
+        for src in [
+            "/mnt/user/appdata/pbs",
+            "/mnt/cache/appdata",
+            "/mnt/user/appdata/pbs/config/sub",
+            "/mnt/user/appdata/pbs/config",
+        ] {
+            assert_eq!(binds_overlapping(dest, &[c(src)]).len(), 1, "{src}");
+        }
+        assert!(binds_overlapping(dest, &[c("/mnt/user/appdata/pbs2")]).is_empty());
+        assert!(binds_overlapping(dest, &[c("/mnt/user/appdata/pbs/logs")]).is_empty());
+        assert!(binds_under(dest, &[c("/mnt/user/appdata/pbs")]).is_empty());
+    }
+
+    #[test]
     fn retire_target_is_a_sibling_of_stacks() {
         assert_eq!(
             retire_target(Path::new("/opt/stacks/dockge"), "dockge", "20261004"),
@@ -296,6 +337,10 @@ mod tests {
             PathBuf::from("/mnt/disks/ssd/x")
         );
         assert_eq!(share_alias(Path::new("/opt/x")), PathBuf::from("/opt/x"));
+        assert_eq!(
+            share_alias(Path::new("/mnt/pbs-remote")),
+            PathBuf::from("/mnt/pbs-remote")
+        );
     }
 
     #[test]

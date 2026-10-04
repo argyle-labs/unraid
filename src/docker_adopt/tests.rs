@@ -99,7 +99,8 @@ fn snapshot(f: &Fx) -> Snapshot {
         tag_image_id: Some(f.c.image.clone()),
         all: vec![f.c.clone()],
         volumes,
-        date: "20261004".to_string(),
+        run_id: RUN_ID.to_string(),
+        nonce: NONCE.to_string(),
         daemon_log_opts: daemon_opts(),
         stacks_roots: orphans::DEFAULT_STACKS_ROOTS
             .iter()
@@ -118,15 +119,29 @@ fn opts(repo: Option<&str>, migrate: bool) -> AdoptOpts {
     }
 }
 
-fn gate(plan: &AdoptPlan, rendered: &str) -> (Vec<String>, Vec<String>) {
+const RUN_ID: &str = "20261004-120000-0123abcd";
+const NONCE: &str = "0123456789abcdef";
+
+fn gate_mode(plan: &AdoptPlan, rendered: &str, mode: DiffMode) -> (Vec<String>, Vec<String>) {
     let (_, d) = fidelity(
         &plan.target,
         &plan.unsupported,
         &plan.baked_env,
         &daemon_opts(),
         rendered,
+        mode,
     );
     split_deltas(d, &Redactor::default())
+}
+
+/// The adopt gate: what dockerMan renders from orca's generated template.
+fn gate(plan: &AdoptPlan, rendered: &str) -> (Vec<String>, Vec<String>) {
+    gate_mode(plan, rendered, DiffMode::Adopt)
+}
+
+/// The set_icon gate: what dockerMan renders from a template someone else wrote.
+fn gate_existing(plan: &AdoptPlan, rendered: &str) -> (Vec<String>, Vec<String>) {
+    gate_mode(plan, rendered, DiffMode::SetIcon)
 }
 
 /// Escape like PHP's `escapeshellarg`, which dockerMan uses for every value.
@@ -190,7 +205,16 @@ fn real_pbs_passes_the_gate() {
     let plan = plan_adopt(&snapshot(&f), &opts(Some("pbs"), false));
     assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
     assert!(plan.unsupported.is_empty(), "{:?}", plan.unsupported);
-    let (blocking, intended) = gate(&plan, f.rendered);
+    let (blocking, intended) = gate(&plan, &simulate_render(&plan.template));
+    assert!(blocking.is_empty(), "{blocking:?}");
+    assert_eq!(
+        intended,
+        vec!["pids-limit unlimited -> 2048 (dockerMan default)"]
+    );
+
+    // The hand-written template on willow omits --restart: fine for
+    // set_icon, which keeps that template's state, but adopt must keep it.
+    let (blocking, intended) = gate_existing(&plan, f.rendered);
     assert!(blocking.is_empty(), "{blocking:?}");
     assert_eq!(
         intended,
@@ -198,6 +222,11 @@ fn real_pbs_passes_the_gate() {
             "restart policy unless-stopped dropped; Unraid autostart starts it with the array",
             "pids-limit unlimited -> 2048 (dockerMan default)",
         ]
+    );
+    let (blocking, _) = gate(&plan, f.rendered);
+    assert_eq!(
+        blocking,
+        vec![r#"restart: live Some("unless-stopped"), rendered None"#]
     );
     // An old-id hostname that is not this container's own id is pinned.
     assert_eq!(plan.live.hostname.as_deref(), Some("62c7f1883665"));
@@ -210,10 +239,18 @@ fn real_whisper_passes_the_gate() {
     let plan = plan_adopt(&snapshot(&f), &opts(Some("whisper-ai"), false));
     assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
     assert!(plan.unsupported.is_empty(), "{:?}", plan.unsupported);
-    let (blocking, intended) = gate(&plan, f.rendered);
+    let (blocking, intended) = gate(&plan, &simulate_render(&plan.template));
+    assert!(blocking.is_empty(), "{blocking:?}");
+    assert_eq!(intended.len(), 1, "{intended:?}");
+    assert!(intended[0].starts_with("pids-limit"));
+
+    let (blocking, intended) = gate_existing(&plan, f.rendered);
     assert!(blocking.is_empty(), "{blocking:?}");
     assert_eq!(intended.len(), 3, "{intended:?}");
     assert!(intended[0].starts_with("hostname bc405da8c18f (docker's default)"));
+    let (blocking, _) = gate(&plan, f.rendered);
+    assert_eq!(blocking.len(), 1, "{blocking:?}");
+    assert!(blocking[0].starts_with("restart:"));
     assert_eq!(plan.live.tz, "America/Denver");
     assert_eq!(plan.live.gpus.as_deref(), Some("all"));
     assert!(!plan.live.env.contains_key("NVIDIA_VISIBLE_DEVICES"));
@@ -241,7 +278,7 @@ fn real_pbs_dropping_tmpfs_blocks() {
     let dropped = f
         .rendered
         .replace("--tmpfs /run/proxmox-backup:rw,nosuid,nodev,mode=0755 ", "");
-    let (blocking, _) = gate(&plan, &dropped);
+    let (blocking, _) = gate_existing(&plan, &dropped);
     assert_eq!(blocking.len(), 1, "{blocking:?}");
     assert!(blocking[0].starts_with("tmpfs /run/proxmox-backup"));
 }
@@ -250,7 +287,7 @@ fn real_pbs_dropping_tmpfs_blocks() {
 fn real_whisper_without_gpus_blocks() {
     let f = whisper();
     let plan = plan_adopt(&snapshot(&f), &opts(None, false));
-    let (blocking, _) = gate(&plan, &f.rendered.replace("--gpus all ", ""));
+    let (blocking, _) = gate_existing(&plan, &f.rendered.replace("--gpus all ", ""));
     assert_eq!(blocking, vec![r#"gpus: live Some("all"), rendered None"#]);
 }
 
@@ -278,6 +315,7 @@ fn real_dockge_is_managed_so_adopt_refuses_and_set_icon_passes() {
         &inspect::baked_env(&f.img),
         &daemon_opts(),
         f.rendered,
+        DiffMode::SetIcon,
     );
     let (blocking, _) = split_deltas(d, &Redactor::default());
     assert!(blocking.is_empty(), "{blocking:?}");
@@ -370,7 +408,7 @@ fn baked_tz_is_written_so_unraid_cannot_blank_it() {
     let plan = plan_adopt(&snapshot(&f), &opts(None, false));
     assert_eq!(plan.target.tz, "UTC");
     assert!(plan.template.configs.iter().any(|c| c.target == "TZ"));
-    let (blocking, _) = gate(&plan, f.rendered);
+    let (blocking, _) = gate_existing(&plan, f.rendered);
     assert_eq!(blocking, vec![r#"TZ: live "UTC", rendered """#]);
     let (blocking, _) = gate(&plan, &simulate_render(&plan.template));
     assert!(blocking.is_empty(), "{blocking:?}");
@@ -384,7 +422,7 @@ fn pids_limit_other_than_unraids_is_carried_or_blocks() {
     assert!(plan.template.extra_params.contains("--pids-limit 500"));
     let (blocking, _) = gate(&plan, &simulate_render(&plan.template));
     assert!(blocking.is_empty(), "{blocking:?}");
-    let (blocking, _) = gate(&plan, f.rendered);
+    let (blocking, _) = gate_existing(&plan, f.rendered);
     assert_eq!(
         blocking,
         vec!["pids-limit: live Some(500), rendered Some(2048)"]
@@ -486,6 +524,20 @@ fn compose_container_moves_to_bridge_and_retires_its_stack() {
 }
 
 #[test]
+fn stacks_under_a_writable_root_are_not_retired() {
+    let mut s = compose_snapshot();
+    s.stacks_root_problems.insert(
+        PathBuf::from("/opt/stacks"),
+        "/opt/stacks is owned by uid 99".into(),
+    );
+    let plan = plan_adopt(&s, &opts(None, false));
+    let l = plan.compose.unwrap();
+    assert!(l.retire.is_none());
+    assert!(l.keep_reason.unwrap().contains("uid 99"));
+    assert!(!plan.steps.iter().any(|st| st.action() == "retire-stack"));
+}
+
+#[test]
 fn compose_network_shared_with_another_container_blocks() {
     let mut s = compose_snapshot();
     let mut other = s.container.clone();
@@ -579,7 +631,8 @@ fn migrate_rewrites_paths_and_orders_steps() {
             "refresh-icons",
             "remove-volume",
             "remove-volume",
-            "remove-old-image",
+            "commit-copy",
+            "commit-copy",
         ]
     );
 }
@@ -697,6 +750,7 @@ fn ampersands_are_double_escaped_for_dockerman() {
 
 struct Mock {
     calls: Mutex<Vec<String>>,
+    ops: Mutex<Vec<PrivilegedOp>>,
     fail_on: Option<&'static str>,
     container: ContainerInspect,
     image: ImageInspect,
@@ -710,6 +764,7 @@ impl Mock {
     ) -> Self {
         Mock {
             calls: Mutex::new(Vec::new()),
+            ops: Mutex::new(Vec::new()),
             fail_on,
             container,
             image,
@@ -748,7 +803,10 @@ impl HostOps for Mock {
         Box::pin(async move { Ok(vec![self.container.clone()]) })
     }
     fn privileged<'a>(&'a self, op: &'a PrivilegedOp) -> BoxFuture<'a, Result<String>> {
-        Box::pin(async move { self.record(format!("priv {}", op_name(op))) })
+        Box::pin(async move {
+            self.ops.lock().unwrap().push(op.clone());
+            self.record(format!("priv {}", op_name(op)))
+        })
     }
 }
 
@@ -756,7 +814,8 @@ fn ctx(plan: &AdoptPlan, f: &Fx) -> ApplyCtx {
     ApplyCtx {
         tool: "unraid.docker.adopt",
         name: f.c.short_name().to_string(),
-        date: "20261004".into(),
+        run_id: RUN_ID.into(),
+        nonce: NONCE.into(),
         was_running: plan.was_running,
         autostart_before: false,
         had_template: false,
@@ -806,6 +865,121 @@ async fn failure_before_rebuild_rolls_back_this_runs_changes() {
         "{err}"
     );
     assert!(!err.contains("hunter2"), "{err}");
+
+    // Every op that names a backup or a copy carries this run's id/nonce.
+    for op in mock.ops.lock().unwrap().iter() {
+        match op {
+            PrivilegedOp::WriteTemplate { backup_id, .. }
+            | PrivilegedOp::SaveInspect { backup_id, .. }
+            | PrivilegedOp::RestoreTemplate { backup_id, .. } => assert_eq!(backup_id, RUN_ID),
+            PrivilegedOp::CopyVolume { nonce, .. } | PrivilegedOp::RemoveCopy { nonce, .. } => {
+                assert_eq!(nonce, NONCE)
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn migrated_copies_are_committed_after_their_volumes_go() {
+    let mut f = pbs();
+    f.c.config.labels = Some(BTreeMap::from([(
+        MANAGED_LABEL.to_string(),
+        MANAGED_BY_DOCKERMAN.to_string(),
+    )]));
+    f.c.state.running = true;
+    f.c.state.status = "running".into();
+    let mut plan = plan_adopt(&snapshot(&f), &opts(None, true));
+    // The mock returns the same container after rebuild; verify against it.
+    let (live, _) = live_spec(&f.c, &f.img);
+    for st in plan.steps.iter_mut() {
+        if let Step::VerifyManaged { expect, .. } = st {
+            **expect = live.clone();
+        }
+    }
+    let mock = Mock::new(f.c.clone(), f.img.clone(), None);
+    apply(&mock, &ctx(&plan, &f), &plan.steps).await.unwrap();
+    let calls = mock.calls();
+    let first_commit = calls.iter().position(|c| c == "priv commit_copy").unwrap();
+    let last_rm = calls
+        .iter()
+        .rposition(|c| c.starts_with("docker volume rm"))
+        .unwrap();
+    assert!(last_rm < first_commit, "{calls:?}");
+    assert_eq!(calls.iter().filter(|c| *c == "priv commit_copy").count(), 2);
+    assert!(
+        mock.ops
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| matches!(o, PrivilegedOp::CommitCopy { nonce, .. } if nonce == NONCE))
+    );
+}
+
+#[tokio::test]
+async fn verify_enforces_restart_for_adopt_but_not_set_icon() {
+    let mut f = dockge();
+    f.c.host_config.restart_policy = Default::default();
+    let (got, _) = live_spec(&f.c, &f.img);
+    let mut want = got.clone();
+    want.restart = Some("unless-stopped".into());
+    let mock = Mock::new(f.c.clone(), f.img.clone(), None);
+    let cx = ApplyCtx {
+        tool: "t",
+        name: "dockge".into(),
+        run_id: RUN_ID.into(),
+        nonce: NONCE.into(),
+        was_running: true,
+        autostart_before: true,
+        had_template: true,
+        original: got.clone(),
+        redactor: Redactor::default(),
+    };
+    let verify = |mode| Step::VerifyManaged {
+        running: false,
+        icon: None,
+        image_id: f.c.image.clone(),
+        expect: Box::new(want.clone()),
+        mode,
+    };
+    assert!(
+        apply(&mock, &cx, &[verify(DiffMode::SetIcon)])
+            .await
+            .is_ok()
+    );
+    let err = apply(&mock, &cx, &[verify(DiffMode::Adopt)])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("restart:"), "{err}");
+}
+
+struct FakeRunner(bool);
+
+impl PrivilegedRunner for FakeRunner {
+    fn kind(&self) -> &'static str {
+        "fake"
+    }
+    fn run<'a>(&'a self, _op: &'a PrivilegedOp) -> BoxFuture<'a, Result<String>> {
+        let ok = self.0;
+        Box::pin(async move {
+            if ok {
+                Ok("root".into())
+            } else {
+                bail!("sudo: a password is required")
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn dry_run_pings_the_root_path() {
+    assert!(root_path_blocker(Some(&FakeRunner(true))).await.is_none());
+    let b = root_path_blocker(Some(&FakeRunner(false))).await.unwrap();
+    assert!(b.contains("failed a ping") && b.contains("orca#762"), "{b}");
+    assert!(b.contains("password is required"), "{b}");
+    let b = root_path_blocker(None).await.unwrap();
+    assert!(b.contains("orca#762"), "{b}");
 }
 
 #[tokio::test]
@@ -853,7 +1027,8 @@ async fn set_icon_applies_end_to_end_on_a_managed_container() {
     let cx = ApplyCtx {
         tool: "unraid.docker.set_icon",
         name: "dockge".into(),
-        date: "20261004".into(),
+        run_id: RUN_ID.into(),
+        nonce: NONCE.into(),
         was_running: true,
         autostart_before: false,
         had_template: true,
