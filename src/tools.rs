@@ -7,31 +7,40 @@
 //! `from` + `api_key`: probe the live host and either write a fresh
 //! introspection JSON (`dir`) or report drift (`check_drift`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use plugin_toolkit::prelude::*;
 
 use crate::endpoint::{self, endpoint_db};
 use crate::{Client, Config, schema_pull};
 
-/// Resolve a [`Client`] for an auto-generated surface tool (`crate::surface`).
-///
-/// Connection selection, in order: an explicit `from` + `api_key` override wins
-/// (paired with optional `insecure`); otherwise the named endpoint from the
-/// registry (`unraid.{list,create,...}`); otherwise, when `endpoint` is omitted
-/// and exactly one endpoint is registered, that sole endpoint. Anything else is
-/// an error naming the fix.
 /// [`Config`] for an explicit `from` override; carries this host's CSRF token
-/// only when `from` is loopback.
+/// only when `from` is the local loopback origin.
 fn from_config(from: &str, api_key: impl Into<String>, insecure: bool) -> Result<Config> {
+    from_config_with(from, api_key, insecure, Path::new(endpoint::VAR_INI))
+}
+
+fn from_config_with(
+    from: &str,
+    api_key: impl Into<String>,
+    insecure: bool,
+    var_ini: &Path,
+) -> Result<Config> {
     if from.trim().is_empty() {
         bail!("`from` must not be blank");
     }
     Ok(Config::new(from, api_key)
         .insecure(insecure)
-        .csrf_token(endpoint::local_csrf(from)))
+        .csrf_token(endpoint::local_csrf_from(from, var_ini)))
 }
 
+/// Resolve a [`Client`] for an auto-generated surface tool (`crate::surface`).
+///
+/// Connection selection, in order: an explicit `from` + `api_key` override wins
+/// (paired with optional `insecure`); otherwise the named endpoint from the
+/// registry (`unraid.{list,create,...}`); otherwise, when `endpoint` is omitted
+/// and exactly one enabled endpoint is registered, that sole endpoint. Disabled
+/// endpoints are never used. Anything else is an error naming the fix.
 pub(crate) async fn surface_client(
     endpoint: Option<String>,
     from: Option<String>,
@@ -50,15 +59,18 @@ pub(crate) async fn surface_client(
         Some(name) => endpoint_db::get(&name)?
             .ok_or_else(|| anyhow!("no unraid endpoint named `{name}` — see `unraid.list`"))?,
         None => {
-            let mut all = endpoint_db::list()?;
+            let mut all: Vec<_> = endpoint_db::list()?
+                .into_iter()
+                .filter(|r| r.enabled)
+                .collect();
             match all.len() {
                 1 => all.remove(0),
                 0 => bail!(
-                    "no unraid endpoints registered — add one with `unraid.create`, \
+                    "no enabled unraid endpoints registered — add one with `unraid.create`, \
                      or pass `from` + `api_key`"
                 ),
                 n => bail!(
-                    "{n} unraid endpoints registered — pass `endpoint` to pick one, \
+                    "{n} enabled unraid endpoints registered — pass `endpoint` to pick one, \
                      or `from` + `api_key`"
                 ),
             }
@@ -194,7 +206,7 @@ mod tests {
     use plugin_toolkit::prelude::{ToolCtx, json};
     use std::path::PathBuf;
     use std::sync::Arc;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn empty_ctx() -> ToolCtx {
@@ -338,10 +350,48 @@ mod tests {
         );
     }
 
+    fn var_ini() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("var.ini");
+        std::fs::write(&path, "csrf_token=\"LOCAL-CSRF\"\n").unwrap();
+        (dir, path)
+    }
+
     #[test]
-    fn remote_from_carries_no_csrf_token() {
-        let cfg = from_config("http://10.0.0.5", "tok", false).unwrap();
-        assert!(cfg.csrf_token.is_none());
+    fn from_carries_csrf_token_only_to_the_local_origin() {
+        let (_dir, ini) = var_ini();
+        let cfg = from_config_with("http://127.0.0.1", "tok", false, &ini).unwrap();
+        assert_eq!(cfg.csrf_token.as_deref(), Some("LOCAL-CSRF"));
+        for from in [
+            "http://10.0.0.5",
+            "http://evil.example\\@127.0.0.1",
+            "https://evil.example\\@[::1]:443",
+        ] {
+            let cfg = from_config_with(from, "tok", false, &ini).unwrap();
+            assert!(cfg.csrf_token.is_none(), "{from}");
+        }
+    }
+
+    #[tokio::test]
+    async fn from_on_a_non_local_origin_sends_no_csrf_header() {
+        let server = MockServer::start().await;
+        Mock::given(header_exists("x-csrf-token"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "vars": { "version": "7.3.1" } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, ini) = var_ini();
+        let cfg = from_config_with(&server.uri(), "tok", false, &ini).unwrap();
+        let version = Client::new(cfg).probe_version().await.unwrap();
+        assert_eq!(version.as_deref(), Some("7.3.1"));
     }
 
     #[tokio::test]

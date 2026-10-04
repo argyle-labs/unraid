@@ -32,11 +32,12 @@ path = "src/main.rs"
 # Add a new version by dropping its introspection JSON into `schemas/`.
 
 [dependencies]
-# The SOLE dependency. Every external crate the plugin needs (serde, serde_json,
-# schemars, clap, graphql_client, sha2, thiserror, anyhow, tracing, tokio, …) is
-# reached through `plugin_toolkit::*` / its prelude, injected by
-# `#[plugin_struct]` / `#[orca_tool]`, or rewritten into the generated GraphQL
-# module by the build-time codegen. The plugin source names no external crate.
+# plugin-toolkit is the gateway dependency: every external crate the plugin
+# needs (serde, serde_json, schemars, clap, graphql_client, sha2, thiserror,
+# anyhow, tracing, tokio, …) is reached through `plugin_toolkit::*` / its
+# prelude, injected by `#[plugin_struct]` / `#[orca_tool]`, or rewritten into
+# the generated GraphQL module by the build-time codegen. `url` below is the one
+# exception.
 # This is a subprocess `[[bin]]` plugin that talks to the orca daemon over its
 # Unix socket via `serve_tool_plugin!` from plugin-toolkit — no FFI/cdylib.
 #
@@ -49,6 +50,9 @@ path = "src/main.rs"
 # below are used: `db` because `plugin_toolkit::runtime` is gated on it, `http`
 # because this plugin makes real outbound calls, `graphql` for the Unraid API.
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "graphql", "http", "delegated-http"] }
+# The WHATWG URL parser reqwest itself uses (already in the lock): the CSRF
+# loopback gate must parse a URL exactly the way the request will be sent.
+url = "2"
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }

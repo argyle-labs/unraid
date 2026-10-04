@@ -2758,6 +2758,7 @@ dependencies = [
  "syn 2.0.119",
  "tempfile",
  "tokio",
+ "url",
  "wiremock",
 ]
 
