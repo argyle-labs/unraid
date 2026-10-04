@@ -96,7 +96,7 @@ impl ApiVersion {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Resolved URL of the host's GraphQL front (`scheme://host[:port]`); the
     /// `/graphql` path is appended. Registered endpoints resolve this from
@@ -112,6 +112,20 @@ pub struct Config {
     /// rejects an api-key-only request with `Invalid CSRF token`.
     pub csrf_token: Option<String>,
     pub insecure: bool,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("url", &self.url)
+            .field("api_key", &"<redacted>")
+            .field(
+                "csrf_token",
+                &self.csrf_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("insecure", &self.insecure)
+            .finish()
+    }
 }
 
 impl Config {
@@ -432,6 +446,15 @@ mod tests {
 
     fn cfg(uri: String) -> Config {
         Config::new(uri, "tok")
+    }
+
+    #[test]
+    fn config_debug_redacts_secrets() {
+        let c = Config::new("http://10.0.0.5", "secret-key").csrf_token(Some("secret-csrf".into()));
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("secret-key"), "{dbg}");
+        assert!(!dbg.contains("secret-csrf"), "{dbg}");
+        assert!(dbg.contains("http://10.0.0.5"), "{dbg}");
     }
 
     #[tokio::test]
