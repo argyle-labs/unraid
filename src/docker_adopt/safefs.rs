@@ -19,7 +19,7 @@ use std::path::{Component, Path, PathBuf};
 
 use plugin_toolkit::hash::hex_encode;
 use plugin_toolkit::prelude::*;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags, Stat};
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
@@ -137,17 +137,15 @@ impl Dir {
         Ok(rustix::fs::fstat(&self.fd)?)
     }
 
+    /// Permission bits (`0o7777`) of this directory.
+    pub fn mode(&self) -> Result<u32> {
+        Ok(mode_bits(&self.stat()?))
+    }
+
     /// Owner and mode problem of this directory, if root should not act in it.
     pub fn root_owned_problem(&self) -> Result<Option<String>> {
         let st = self.stat()?;
         Ok(root_owned_problem(&self.path, st.st_uid, mode_bits(&st)))
-    }
-
-    /// `(st_dev, st_ino)`: identifies this directory across later opens.
-    #[allow(clippy::unnecessary_cast)]
-    pub fn identity(&self) -> Result<(u64, u64)> {
-        let st = self.stat()?;
-        Ok((st.st_dev as u64, st.st_ino as u64))
     }
 
     fn child_os(&self, name: &OsStr) -> Result<Dir> {
@@ -191,6 +189,8 @@ impl Dir {
         let n = component(name)?;
         rustix::fs::mkdirat(&self.fd, n, perm(0o700))
             .map_err(|e| anyhow!("create {}: {e}", self.path.join(n).display()))?;
+        #[cfg(test)]
+        tests::after_mkdir(&self.path.join(n));
         let d = self.child_os(n)?;
         let st = d.stat()?;
         if st.st_uid != rustix::process::geteuid().as_raw() || !d.entries()?.is_empty() {
@@ -331,12 +331,18 @@ impl Dir {
     }
 
     /// Move `name` to `to/to_name`, both relative to held descriptors.
+    /// Fails if `to/to_name` exists: `RENAME_NOREPLACE` where the filesystem
+    /// supports it, else a check just before the rename.
     pub fn rename_into(&self, name: &str, to: &Dir, to_name: &str) -> Result<()> {
         let (n, t) = (component(name)?, component(to_name)?);
         if to.exists(to_name)? {
             bail!("{} already exists", to.path.join(t).display());
         }
-        rustix::fs::renameat(&self.fd, n, &to.fd, t).map_err(|e| {
+        let r = match rustix::fs::renameat_with(&self.fd, n, &to.fd, t, RenameFlags::NOREPLACE) {
+            Err(Errno::INVAL | Errno::NOSYS) => rustix::fs::renameat(&self.fd, n, &to.fd, t),
+            r => r,
+        };
+        r.map_err(|e| {
             anyhow!(
                 "move {} to {}: {e}",
                 self.path.join(n).display(),
@@ -396,6 +402,40 @@ pub fn replace_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 pub fn remove_file(path: &Path) -> Result<bool> {
     let (d, n) = split(path)?;
     d.remove_file(n)
+}
+
+/// Refuse a tree root should not copy: anything but regular files,
+/// directories and symlinks (device nodes, FIFOs, sockets), setuid/setgid
+/// files, setuid directories, and nesting deeper than [`MAX_DEPTH`].
+/// A setgid directory only sets group inheritance and is allowed.
+pub fn check_copyable(root: &Dir) -> Result<()> {
+    check_copyable_depth(root, 0)
+}
+
+fn check_copyable_depth(dir: &Dir, depth: usize) -> Result<()> {
+    if depth > MAX_DEPTH {
+        bail!("{} is nested deeper than {MAX_DEPTH}", dir.path.display());
+    }
+    for n in dir.entries()? {
+        let st = rustix::fs::statat(&dir.fd, &n, AtFlags::SYMLINK_NOFOLLOW)?;
+        let shown = dir.path.join(&n);
+        let mode = mode_bits(&st);
+        match file_type(&st) {
+            FileType::Directory if mode & 0o4000 != 0 => {
+                bail!("{} is a setuid directory", shown.display())
+            }
+            FileType::Directory => check_copyable_depth(&dir.child_os(&n)?, depth + 1)?,
+            FileType::RegularFile if mode & 0o6000 != 0 => {
+                bail!("{} is setuid/setgid (mode {mode:o})", shown.display())
+            }
+            FileType::RegularFile | FileType::Symlink => {}
+            other => bail!(
+                "{} is a {other:?}, not a regular file, directory or symlink",
+                shown.display()
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// A content summary of a tree: entry count, regular-file bytes, and the
@@ -463,7 +503,10 @@ fn manifest_into(
                 let t = rustix::fs::readlinkat(&dir.fd, &n, Vec::new())?;
                 ('l', 0, String::from_utf8_lossy(t.to_bytes()).into_owned())
             }
-            _ => ('o', 0, String::new()),
+            _ => bail!(
+                "{} is not a regular file, directory or symlink",
+                dir.path.join(&n).display()
+            ),
         };
         rows.push(format!(
             "{}\t{kind}\t{size}\t{:o}\t{}\t{}\t{content}",
@@ -477,8 +520,124 @@ fn manifest_into(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static AFTER_MKDIR: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    /// Runs a test's swap between `mkdirat` and the open in `create_child`.
+    pub(crate) fn after_mkdir(p: &Path) {
+        if let Some(f) = AFTER_MKDIR.with(|h| h.borrow_mut().take()) {
+            f(p);
+        }
+    }
+
+    pub(crate) fn on_next_mkdir(f: impl FnOnce(&Path) + 'static) {
+        AFTER_MKDIR.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    #[test]
+    fn create_child_refuses_a_directory_swapped_in_after_mkdir() {
+        let (_d, r) = root();
+        let d = Dir::open(&r).unwrap();
+        on_next_mkdir(|p| {
+            fs::rename(p, p.with_file_name("ours")).unwrap();
+            fs::create_dir(p).unwrap();
+            fs::write(p.join("theirs"), b"x").unwrap();
+        });
+        let e = d.create_child("new", 0o700).unwrap_err().to_string();
+        assert!(e.contains("changed while it was created"), "{e}");
+    }
+
+    fn mkfifo(p: &Path) {
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(p)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn reading_a_fifo_fails_fast_instead_of_blocking() {
+        let (_d, r) = root();
+        mkfifo(&r.join("fifo"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = r.clone();
+        std::thread::spawn(move || {
+            let d = Dir::open(&dir).unwrap();
+            tx.send(d.read_file("fifo").is_err()).ok();
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opening a FIFO blocked");
+        assert!(refused, "a FIFO was read as a regular file");
+    }
+
+    #[test]
+    fn copy_check_refuses_special_and_setid_files_and_deep_trees() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, r) = root();
+        fs::create_dir_all(r.join("ok/sub")).unwrap();
+        fs::write(r.join("ok/sub/f"), b"x").unwrap();
+        symlink("/etc/passwd", r.join("ok/l")).unwrap();
+        fs::create_dir(r.join("ok/g")).unwrap();
+        fs::set_permissions(r.join("ok/g"), fs::Permissions::from_mode(0o2775)).unwrap();
+        assert!(check_copyable(&Dir::open(&r.join("ok")).unwrap()).is_ok());
+
+        fs::create_dir(r.join("fifo")).unwrap();
+        mkfifo(&r.join("fifo/p"));
+        assert!(check_copyable(&Dir::open(&r.join("fifo")).unwrap()).is_err());
+        assert!(manifest(&Dir::open(&r.join("fifo")).unwrap()).is_err());
+
+        for mode in [0o4755, 0o2755] {
+            let d = r.join(format!("suid{mode:o}"));
+            fs::create_dir(&d).unwrap();
+            fs::write(d.join("bin"), b"x").unwrap();
+            fs::set_permissions(d.join("bin"), fs::Permissions::from_mode(mode)).unwrap();
+            let e = check_copyable(&Dir::open(&d).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("setuid/setgid"), "{e}");
+        }
+
+        let mut deep = r.join("deep");
+        for _ in 0..=MAX_DEPTH + 1 {
+            deep.push("d");
+        }
+        fs::create_dir_all(&deep).unwrap();
+        let e = check_copyable(&Dir::open(&r.join("deep")).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("deeper than"), "{e}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copy_check_refuses_device_nodes() {
+        if super::super::host::euid() != Some(0) {
+            return;
+        }
+        let (_d, r) = root();
+        assert!(
+            std::process::Command::new("mknod")
+                .arg(r.join("null"))
+                .args(["c", "1", "3"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let e = check_copyable(&Dir::open(&r).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("CharacterDevice"), "{e}");
+    }
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -537,10 +696,7 @@ mod tests {
             0o700
         );
         assert!(d.create_child("sub", 0o700).is_err());
-        assert_eq!(
-            d.ensure_child("sub", 0o700).unwrap().identity().unwrap(),
-            sub.identity().unwrap()
-        );
+        assert_eq!(d.ensure_child("sub", 0o700).unwrap().path(), sub.path());
         assert!(d.remove_file("sub").is_err());
     }
 

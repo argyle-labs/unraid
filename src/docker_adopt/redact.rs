@@ -4,6 +4,7 @@
 //! The declared `role = "admin"` is not yet enforced for plugin tools
 //! (argyle-labs/orca#763), so dry-run output may reach non-admins.
 
+use std::ops::Range;
 use std::sync::OnceLock;
 
 use plugin_toolkit::hash::{hex_encode, sha256};
@@ -13,7 +14,7 @@ use super::template::xml_escape;
 /// Substrings that mark a name as secret, case-insensitively.
 const SECRET_PARTS: &[&str] = &[
     "pass", "pwd", "token", "secret", "key", "auth", "cred", "cookie", "session", "private", "jwt",
-    "salt", "dsn", "webhook", "signing", "encrypt",
+    "salt", "dsn", "webhook", "signing", "encrypt", "claim",
 ];
 
 /// `pw` only as a whole word (`DB_PW`, `pw`), not inside `pwm` or `upward`.
@@ -69,27 +70,81 @@ pub fn token(value: &str) -> String {
     )
 }
 
-/// Byte range of the password in a `scheme://user:password@host` value. The
-/// authority ends at the first `/`, `?` or `#`; userinfo ends at its last `@`
-/// (a raw `@` inside a password is common).
-fn url_password_range(v: &str) -> Option<std::ops::Range<usize>> {
-    let start = v.find("://")? + 3;
-    let rest = &v[start..];
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    let at = authority.rfind('@')?;
-    let colon = authority[..at].find(':')?;
-    (colon + 1 < at).then(|| start + colon + 1..start + at)
-}
-
-pub fn url_password(v: &str) -> Option<&str> {
-    url_password_range(v).map(|r| &v[r])
-}
-
-fn mask_url(v: &str) -> String {
-    match url_password_range(v) {
-        Some(r) => format!("{}{}{}", &v[..r.start], token(&v[r.clone()]), &v[r.end..]),
-        None => v.to_string(),
+/// Byte ranges of the passwords in every `scheme://user:password@host` in
+/// `v`. Each authority ends at the first `/`, `?`, `#` or whitespace; its
+/// userinfo ends at the last `@` (a raw `@` inside a password is common).
+fn url_password_ranges(v: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(p) = v[from..].find("://") {
+        let start = from + p + 3;
+        let rest = &v[start..];
+        let end = rest
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .unwrap_or(rest.len());
+        let authority = &rest[..end];
+        if let Some(at) = authority.rfind('@')
+            && let Some(colon) = authority[..at].find(':')
+            && colon + 1 < at
+        {
+            out.push(start + colon + 1..start + at);
+        }
+        from = start + end;
     }
+    out
+}
+
+/// Byte ranges of `password=…` / `pwd=…` values (any case) up to the next
+/// `;` or whitespace, as in connection strings.
+fn kv_password_ranges(v: &str) -> Vec<Range<usize>> {
+    let lower = v.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for key in ["password=", "pwd="] {
+        let mut from = 0;
+        while let Some(p) = lower[from..].find(key) {
+            let start = from + p + key.len();
+            let len = v[start..]
+                .find(|c: char| c == ';' || c.is_whitespace())
+                .unwrap_or(v.len() - start);
+            if len > 0 {
+                out.push(start..start + len);
+            }
+            from = start;
+        }
+    }
+    out
+}
+
+/// Every inline secret in a value, sorted and merged.
+fn secret_ranges(v: &str) -> Vec<Range<usize>> {
+    let mut all = url_password_ranges(v);
+    all.extend(kv_password_ranges(v));
+    all.sort_by_key(|r| r.start);
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for r in all {
+        match out.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// The inline secrets (URL passwords, `password=` values) in `v`.
+pub fn inline_secrets(v: &str) -> Vec<&str> {
+    secret_ranges(v).into_iter().map(|r| &v[r]).collect()
+}
+
+fn mask_inline(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut pos = 0;
+    for r in secret_ranges(v) {
+        out.push_str(&v[pos..r.start]);
+        out.push_str(&token(&v[r.clone()]));
+        pos = r.end;
+    }
+    out.push_str(&v[pos..]);
+    out
 }
 
 /// An env value as shown: whole value masked for a secret name, otherwise
@@ -98,7 +153,7 @@ pub fn mask(key: &str, value: &str) -> String {
     if is_secret_key(key) {
         token(value)
     } else {
-        mask_url(value)
+        mask_inline(value)
     }
 }
 
@@ -106,12 +161,12 @@ pub fn mask_label(key: &str, value: &str) -> String {
     if is_secret_label_key(key) {
         token(value)
     } else {
-        mask_url(value)
+        mask_inline(value)
     }
 }
 
 /// A command flag name whose value is secret: secret-looking long names,
-/// and the conventional short password flag `-p`.
+/// and the conventional short password flag `-p` (also as `-p<value>`).
 fn is_secret_flag(flag: &str, short: bool) -> bool {
     if short {
         flag == "p"
@@ -130,6 +185,10 @@ pub fn secret_cmd_values(args: &[String]) -> Vec<String> {
         };
         let short = !flag.starts_with('-');
         let flag = flag.trim_start_matches('-');
+        if short && flag.len() > 1 && flag.starts_with('p') && !flag.starts_with("p=") {
+            out.push(flag[1..].to_string());
+            continue;
+        }
         match flag.split_once('=') {
             Some((f, v)) if is_secret_flag(f, short) && !v.is_empty() => out.push(v.to_string()),
             None if is_secret_flag(flag, short) => {
@@ -151,7 +210,7 @@ pub fn mask_cmd(args: &[String]) -> Vec<String> {
             for s in &secrets {
                 a = a.replace(s.as_str(), &token(s));
             }
-            mask_url(&a)
+            mask_inline(&a)
         })
         .collect()
 }
@@ -180,21 +239,27 @@ impl Redactor {
         }
     }
 
-    /// Register an env pair: the value if the name is secret, else any URL
-    /// password in it.
+    fn push_inline(&mut self, value: &str) {
+        for s in inline_secrets(value) {
+            self.push(s);
+        }
+    }
+
+    /// Register an env pair: the value if the name is secret, else every
+    /// inline secret in it.
     pub fn add(&mut self, key: &str, value: &str) {
         if is_secret_key(key) {
             self.push(value);
-        } else if let Some(pw) = url_password(value) {
-            self.push(pw);
+        } else {
+            self.push_inline(value);
         }
     }
 
     pub fn add_label(&mut self, key: &str, value: &str) {
         if is_secret_label_key(key) {
             self.push(value);
-        } else if let Some(pw) = url_password(value) {
-            self.push(pw);
+        } else {
+            self.push_inline(value);
         }
     }
 
@@ -203,9 +268,7 @@ impl Redactor {
             self.push(&v);
         }
         for a in args {
-            if let Some(pw) = url_password(a) {
-                self.push(pw);
-            }
+            self.push_inline(a);
         }
     }
 
@@ -244,22 +307,29 @@ impl Redactor {
 }
 
 /// `--log-opt k=v` / `--log-opt=k=v` values masked by key, in a
-/// space-separated parameter string (dockerMan's ExtraParams).
+/// whitespace-separated parameter string (dockerMan's ExtraParams). The
+/// original separators are kept.
 pub fn mask_extra_params(params: &str) -> String {
+    let mut out = String::with_capacity(params.len());
     let mut next = false;
-    params
-        .split(' ')
-        .map(|w| {
-            let out = match (next, w.strip_prefix("--log-opt=")) {
+    let mut rest = params;
+    while !rest.is_empty() {
+        let ws = rest.len() - rest.trim_start().len();
+        out.push_str(&rest[..ws]);
+        rest = &rest[ws..];
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let w = &rest[..end];
+        if !w.is_empty() {
+            out.push_str(&match (next, w.strip_prefix("--log-opt=")) {
                 (true, _) => mask_kv(w),
                 (false, Some(kv)) => format!("--log-opt={}", mask_kv(kv)),
                 (false, None) => w.to_string(),
-            };
+            });
             next = w == "--log-opt";
-            out
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+        }
+        rest = &rest[end..];
+    }
+    out
 }
 
 /// A `key=value` log option with its value masked by key.
@@ -315,7 +385,7 @@ pub fn mask_template_xml(xml: &str) -> String {
             .map(|a| a.1);
         let secret = target.as_deref().is_some_and(is_secret_key)
             || attr(open, "Mask").is_some_and(|a| a.1 == "true");
-        let hide = |v: &str| if secret { token(v) } else { mask_url(v) };
+        let hide = |v: &str| if secret { token(v) } else { mask_inline(v) };
         match attr(open, "Default") {
             Some((r, d)) if !d.is_empty() => {
                 out.push_str(&open[..r.start]);
@@ -429,9 +499,9 @@ mod tests {
 
     #[test]
     fn url_passwords_labels_and_cmd_flags_are_masked() {
-        assert_eq!(url_password("postgres://u:pw1@db:5432/x"), Some("pw1"));
-        assert_eq!(url_password("https://host/a:b@c"), None);
-        assert_eq!(url_password("http://user@host"), None);
+        assert_eq!(inline_secrets("postgres://u:pw1@db:5432/x"), vec!["pw1"]);
+        assert!(inline_secrets("https://host/a:b@c").is_empty());
+        assert!(inline_secrets("http://user@host").is_empty());
         let m = mask("DATABASE_URL", "postgres://u:pw1@db/x");
         assert!(
             !m.contains("pw1") && m.starts_with("postgres://u:<redacted:"),
@@ -492,11 +562,11 @@ mod tests {
 
     #[test]
     fn url_password_bounds_the_authority_and_takes_the_last_at() {
-        assert_eq!(url_password("https://u:p@ss@h/x"), Some("p@ss"));
-        assert_eq!(url_password("https://h/path?u=a:b@c"), None);
-        assert_eq!(url_password("https://h#a:b@c"), None);
-        assert_eq!(url_password("redis://:pw9@h:6379"), Some("pw9"));
-        assert_eq!(url_password("http://u:@h"), None);
+        assert_eq!(inline_secrets("https://u:p@ss@h/x"), vec!["p@ss"]);
+        assert!(inline_secrets("https://h/path?u=a:b@c").is_empty());
+        assert!(inline_secrets("https://h#a:b@c").is_empty());
+        assert_eq!(inline_secrets("redis://:pw9@h:6379"), vec!["pw9"]);
+        assert!(inline_secrets("http://u:@h").is_empty());
         // Masked by position, even when the same text appears earlier.
         let m = mask("X", "pw9 redis://u:pw9@h");
         assert!(m.starts_with("pw9 redis://u:<redacted:"), "{m}");
@@ -537,5 +607,44 @@ mod tests {
                 .1
                 == "2"
         );
+    }
+
+    #[test]
+    fn every_url_and_password_assignment_is_masked() {
+        let v = "primary=redis://:aa11@h1 replica=redis://:bb22@h2";
+        assert_eq!(inline_secrets(v), vec!["aa11", "bb22"]);
+        let m = mask("NODES", v);
+        assert!(!m.contains("aa11") && !m.contains("bb22"), "{m}");
+        let r = Redactor::from_env([("NODES", v)]);
+        assert!(!r.text("x aa11 bb22").contains("aa11"));
+        assert!(!r.text("x aa11 bb22").contains("bb22"));
+
+        let cs = "Server=db;User Id=sa;Password=Pa55w0rd;PWD=other1;";
+        assert_eq!(inline_secrets(cs), vec!["Pa55w0rd", "other1"]);
+        let m = mask("CONNECTION", cs);
+        assert!(!m.contains("Pa55w0rd") && !m.contains("other1"), "{m}");
+        assert!(
+            m.starts_with("Server=db;User Id=sa;Password=<redacted:"),
+            "{m}"
+        );
+        assert!(is_secret_key("PLEX_CLAIM"));
+    }
+
+    #[test]
+    fn attached_short_password_is_masked() {
+        let args: Vec<String> = ["mysql", "-uroot", "-ps3cret"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(secret_cmd_values(&args), vec!["s3cret"]);
+        assert!(!mask_cmd(&args).join(" ").contains("s3cret"));
+    }
+
+    #[test]
+    fn extra_params_keep_whitespace_runs() {
+        let p = mask_extra_params("--log-opt   splunk-token=abcd1234\t--x  y");
+        assert!(!p.contains("abcd1234"), "{p}");
+        assert!(p.starts_with("--log-opt   splunk-token=<redacted:"), "{p}");
+        assert!(p.ends_with("\t--x  y"), "{p}");
     }
 }

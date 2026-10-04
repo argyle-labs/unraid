@@ -538,6 +538,25 @@ fn stacks_under_a_writable_root_are_not_retired() {
 }
 
 #[test]
+fn a_bad_pre_existing_retired_dir_is_a_plan_problem() {
+    if host::euid() != Some(0) {
+        return; // only root can make a root-owned stacks root
+    }
+    let d = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(d.path()).unwrap().join("stacks");
+    std::fs::create_dir(&root).unwrap();
+    assert!(stacks_root_problems(std::slice::from_ref(&root)).is_empty());
+    let retired = root.with_file_name("stacks-retired");
+    std::fs::write(&retired, b"").unwrap();
+    let p = stacks_root_problems(std::slice::from_ref(&root));
+    assert!(p[&root].contains("not a real directory"), "{p:?}");
+    std::fs::remove_file(&retired).unwrap();
+    std::os::unix::fs::symlink("/etc", &retired).unwrap();
+    let p = stacks_root_problems(std::slice::from_ref(&root));
+    assert!(p[&root].contains("pre-existing"), "{p:?}");
+}
+
+#[test]
 fn compose_network_shared_with_another_container_blocks() {
     let mut s = compose_snapshot();
     let mut other = s.container.clone();
@@ -624,6 +643,8 @@ fn migrate_rewrites_paths_and_orders_steps() {
             "save-inspect",
             "write-template",
             "set-autostart",
+            "expose-copy",
+            "expose-copy",
             "rebuild",
             "ensure-state",
             "verify-managed",
@@ -631,8 +652,6 @@ fn migrate_rewrites_paths_and_orders_steps() {
             "refresh-icons",
             "remove-volume",
             "remove-volume",
-            "commit-copy",
-            "commit-copy",
         ]
     );
 }
@@ -881,7 +900,7 @@ async fn failure_before_rebuild_rolls_back_this_runs_changes() {
 }
 
 #[tokio::test]
-async fn migrated_copies_are_committed_after_their_volumes_go() {
+async fn migrated_copies_are_exposed_right_before_the_rebuild() {
     let mut f = pbs();
     f.c.config.labels = Some(BTreeMap::from([(
         MANAGED_LABEL.to_string(),
@@ -900,20 +919,58 @@ async fn migrated_copies_are_committed_after_their_volumes_go() {
     let mock = Mock::new(f.c.clone(), f.img.clone(), None);
     apply(&mock, &ctx(&plan, &f), &plan.steps).await.unwrap();
     let calls = mock.calls();
-    let first_commit = calls.iter().position(|c| c == "priv commit_copy").unwrap();
-    let last_rm = calls
-        .iter()
-        .rposition(|c| c.starts_with("docker volume rm"))
-        .unwrap();
-    assert!(last_rm < first_commit, "{calls:?}");
-    assert_eq!(calls.iter().filter(|c| *c == "priv commit_copy").count(), 2);
+    let rebuild = calls.iter().position(|c| c == "priv rebuild").unwrap();
+    assert_eq!(
+        &calls[rebuild - 2..rebuild],
+        &["priv expose_copy", "priv expose_copy"],
+        "{calls:?}"
+    );
     assert!(
         mock.ops
             .lock()
             .unwrap()
             .iter()
-            .any(|o| matches!(o, PrivilegedOp::CommitCopy { nonce, .. } if nonce == NONCE))
+            .any(|o| matches!(o, PrivilegedOp::ExposeCopy { nonce, .. } if nonce == NONCE))
     );
+}
+
+#[tokio::test]
+async fn exposed_copies_are_left_in_place_by_a_rollback() {
+    let f = pbs();
+    let plan = plan_adopt(&snapshot(&f), &opts(None, true));
+    let copy = |suffix: &str| Step::CopyVolume {
+        volume: format!("pbs-{suffix}"),
+        suffix: suffix.into(),
+        to: format!("/mnt/user/appdata/pbs/{suffix}"),
+    };
+    let steps = vec![
+        copy("config"),
+        copy("logs"),
+        Step::ExposeCopy {
+            suffix: "config".into(),
+        },
+        Step::Stop,
+    ];
+    let mock = Mock::new(f.c.clone(), f.img.clone(), Some("docker stop pbs"));
+    let err = apply(&mock, &ctx(&plan, &f), &steps)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("left exposed copy /mnt/user/appdata/pbs/config in place"),
+        "{err}"
+    );
+    assert!(err.contains("remove copy logs"), "{err}");
+    assert!(!err.contains("remove copy config"), "{err}");
+    let removed: Vec<PrivilegedOp> = mock
+        .ops
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|o| matches!(o, PrivilegedOp::RemoveCopy { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(removed.len(), 1);
 }
 
 #[tokio::test]
