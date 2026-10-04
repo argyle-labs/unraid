@@ -524,6 +524,20 @@ fn compose_container_moves_to_bridge_and_retires_its_stack() {
 }
 
 #[test]
+fn stacks_under_a_writable_root_are_not_retired() {
+    let mut s = compose_snapshot();
+    s.stacks_root_problems.insert(
+        PathBuf::from("/opt/stacks"),
+        "/opt/stacks is owned by uid 99".into(),
+    );
+    let plan = plan_adopt(&s, &opts(None, false));
+    let l = plan.compose.unwrap();
+    assert!(l.retire.is_none());
+    assert!(l.keep_reason.unwrap().contains("uid 99"));
+    assert!(!plan.steps.iter().any(|st| st.action() == "retire-stack"));
+}
+
+#[test]
 fn compose_network_shared_with_another_container_blocks() {
     let mut s = compose_snapshot();
     let mut other = s.container.clone();

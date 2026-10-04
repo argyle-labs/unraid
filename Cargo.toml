@@ -32,7 +32,7 @@ path = "src/main.rs"
 # Add a new version by dropping its introspection JSON into `schemas/`.
 
 [dependencies]
-# The SOLE dependency. Every external crate the plugin needs (serde, serde_json,
+# The main dependency. Every external crate the plugin needs (serde, serde_json,
 # schemars, clap, graphql_client, sha2, thiserror, anyhow, tracing, tokio, …) is
 # reached through `plugin_toolkit::*` / its prelude, injected by
 # `#[plugin_struct]` / `#[orca_tool]`, or rewritten into the generated GraphQL
@@ -49,6 +49,13 @@ path = "src/main.rs"
 # below are used: `db` because `plugin_toolkit::runtime` is gated on it, `http`
 # because this plugin makes real outbound calls, `graphql` for the Unraid API.
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "graphql", "http", "delegated-http"] }
+# Root-side file operations for `unraid.docker.*` hold directory descriptors
+# (openat/openat2, mkdirat, unlinkat, renameat) so a path swapped mid-operation
+# under the world-writable /mnt/user/appdata is never followed; the toolkit
+# exposes no fd-relative fs API. sha2 hashes copied files from those
+# descriptors. Both are already in the toolkit's dependency graph.
+rustix = { version = "1.1", features = ["fs", "process", "std"] }
+sha2 = "0.11"
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }

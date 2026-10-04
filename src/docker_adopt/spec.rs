@@ -541,7 +541,13 @@ pub fn diff(want: &RunSpec, got: &RunSpec, mode: DiffMode) -> Vec<Delta> {
     diff_set("mount", &want.mounts, &got.mounts, &mut out);
     diff_map("tmpfs", &want.tmpfs, &got.tmpfs, plain, &mut out);
     diff_value("log driver", &want.log_driver, &got.log_driver, &mut out);
-    diff_map("log-opt", &want.log_opts, &got.log_opts, plain, &mut out);
+    diff_map(
+        "log-opt",
+        &want.log_opts,
+        &got.log_opts,
+        redact::mask,
+        &mut out,
+    );
     diff_value("gpus", &want.gpus, &got.gpus, &mut out);
     match (&want.restart, &got.restart) {
         (a, b) if a == b => {}
@@ -636,7 +642,7 @@ pub fn docker_run_command(spec: &RunSpec) -> String {
         w.push(format!("--log-driver={}", spec.log_driver));
     }
     for (k, v) in &spec.log_opts {
-        w.push(format!("--log-opt={k}={v}"));
+        w.push(format!("--log-opt={k}={}", redact::mask(k, v)));
     }
     if let Some(g) = &spec.gpus {
         w.push(format!("--gpus={g}"));

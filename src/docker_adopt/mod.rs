@@ -568,6 +568,8 @@ pub struct Snapshot {
     /// Log options the docker daemon applies by default.
     pub daemon_log_opts: BTreeMap<String, String>,
     pub stacks_roots: Vec<PathBuf>,
+    /// Stacks roots root may not move directories out of, and why.
+    pub stacks_root_problems: BTreeMap<PathBuf, String>,
     /// Content of the compose file in the container's compose working dir.
     pub compose_file: Option<String>,
 }
@@ -680,13 +682,20 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
     blockers.extend(image_blocker(s));
     blockers.extend(template_collisions(name, &s.templates));
 
-    let compose = orphans::compose_leftovers(
+    let mut compose = orphans::compose_leftovers(
         c,
         &s.all,
         s.run_id.get(..8).unwrap_or_default(),
         &s.stacks_roots,
         s.compose_file.as_deref(),
     );
+    if let Some(l) = compose.as_mut()
+        && let Some((dir, _)) = &l.retire
+        && let Some(why) = dir.parent().and_then(|p| s.stacks_root_problems.get(p))
+    {
+        l.keep_reason = Some(format!("not retiring {}: {why}", dir.display()));
+        l.retire = None;
+    }
     let compose_moving = compose.as_ref().is_some_and(|l| l.network.is_some());
     unsupported.extend(inspect::unmodelled(
         &s.container_raw,
@@ -924,7 +933,8 @@ pub fn fidelity(
     }
 }
 
-/// The rendered command for display: secret env values masked.
+/// The rendered command for display: secret env, label and log-opt values
+/// masked.
 pub fn mask_command(cmd: &str, r: &Redactor) -> String {
     let Ok(words) = spec::shell_split(cmd.trim()) else {
         return r.text(cmd);
@@ -932,8 +942,13 @@ pub fn mask_command(cmd: &str, r: &Redactor) -> String {
     let mut out = Vec::with_capacity(words.len());
     let mut env_next = false;
     let mut label_next = false;
+    let mut log_next = false;
     for w in words {
-        let masked = if label_next || w.starts_with("--label=") {
+        let masked = if log_next {
+            redact::mask_kv(&w)
+        } else if let Some(kv) = w.strip_prefix("--log-opt=") {
+            format!("--log-opt={}", redact::mask_kv(kv))
+        } else if label_next || w.starts_with("--label=") {
             let prefix = if label_next { "" } else { "--label=" };
             let body = w.strip_prefix("--label=").unwrap_or(&w);
             match body.split_once('=') {
@@ -958,6 +973,7 @@ pub fn mask_command(cmd: &str, r: &Redactor) -> String {
         };
         env_next = w == "-e" || w == "--env";
         label_next = w == "-l" || w == "--label";
+        log_next = w == "--log-opt";
         out.push(spec::shell_quote(&masked));
     }
     r.text(&out.join(" "))
@@ -971,6 +987,9 @@ fn redactor_for(c: &ContainerInspect, extra: &[&RunSpec]) -> Redactor {
     }
     for (k, v) in c.config.labels.iter().flatten() {
         r.add_label(k, v);
+    }
+    for (k, v) in c.host_config.log_config.config.iter().flatten() {
+        r.add(k, v);
     }
     r.add_cmd(c.config.cmd.as_deref().unwrap_or_default());
     for s in extra {
@@ -1174,11 +1193,23 @@ async fn snapshot(name: &str) -> Result<Snapshot> {
         daemon_log_opts: std::fs::read_to_string(host::DOCKER_CFG)
             .map(|c| host::daemon_log_opts(&c))
             .unwrap_or_default(),
+        stacks_root_problems: stacks_root_problems(&orphans::stacks_roots()),
         stacks_roots: orphans::stacks_roots(),
         compose_file,
         container,
         container_raw,
     })
+}
+
+fn stacks_root_problems(roots: &[PathBuf]) -> BTreeMap<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+    roots
+        .iter()
+        .filter_map(|r| {
+            let md = std::fs::metadata(r).ok()?;
+            safefs::root_owned_problem(r, md.uid(), md.mode()).map(|w| (r.clone(), w))
+        })
+        .collect()
 }
 
 fn split_deltas(deltas: Vec<Delta>, r: &Redactor) -> (Vec<String>, Vec<String>) {

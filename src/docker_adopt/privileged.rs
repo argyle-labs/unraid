@@ -13,6 +13,7 @@
 //! this binary as `unraid --privileged-op` with `{op, payload}` on stdin.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use plugin_toolkit::contract::BoxFuture;
@@ -23,7 +24,7 @@ use plugin_toolkit::serde_json::{self, Value};
 use super::host::{self, APPDATA, AUTOSTART_FILE, REBUILD_SCRIPT};
 use super::inspect::{COMPOSE_PROJECT, ContainerInspect, VolumeInspect};
 use super::orphans;
-use super::safefs;
+use super::safefs::{self, Dir};
 use super::template::{self, MANAGED_MARKER};
 use super::validate_name;
 
@@ -128,10 +129,25 @@ pub fn validate_run_id(id: &str) -> Result<()> {
         && b[16..]
             .iter()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c));
-    if !ok {
+    if !ok || !real_timestamp(&id[..15]) {
         bail!("invalid run id {id:?}");
     }
     Ok(())
+}
+
+/// `YYYYMMDD-HHMMSS` names a real UTC date and time.
+fn real_timestamp(ts: &str) -> bool {
+    let n = |r: std::ops::Range<usize>| ts[r].parse::<u32>().unwrap_or(u32::MAX);
+    let (y, m, d) = (n(0..4), n(4..6), n(6..8));
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&d) && n(9..11) < 24 && n(11..13) < 60 && n(13..15) < 60
 }
 
 pub fn validate_nonce(n: &str) -> Result<()> {
@@ -168,77 +184,138 @@ fn none_sentinel(name: &str, backup_id: &str) -> String {
     format!("{}.none", template::backup_path(name, backup_id))
 }
 
-fn marker_body(volume: &str, nonce: &str) -> String {
-    format!("{volume}\n{nonce}\n")
+fn marker_name(suffix: &str) -> String {
+    format!(".orca-copy-{suffix}")
 }
 
-/// The appdata side of CopyVolume, rooted at `appdata` (canonical): make
-/// `<appdata>/<name>` a real directory, claim the copy with an exclusive
-/// marker, and create the empty destination. Returns the destination.
+/// A copy in progress: `<appdata>/<name>` and its fresh destination, both
+/// held open so a swapped path cannot redirect the copy.
+#[derive(Debug)]
+pub struct CopyDest {
+    pub app: Dir,
+    pub dest: Dir,
+}
+
+/// The appdata side of CopyVolume, under the held `appdata` directory: open
+/// (or create) `<name>`, claim the copy with an exclusive marker holding the
+/// volume and this run's nonce, create the destination 0700 so nothing else
+/// can write into it mid-copy, and record its identity in the marker.
 pub fn prepare_copy_dest(
-    appdata: &Path,
+    appdata: &Dir,
     name: &str,
     suffix: &str,
     volume: &str,
     nonce: &str,
-) -> Result<PathBuf> {
+) -> Result<CopyDest> {
     validate_name("container name", name)?;
     validate_name("destination", suffix)?;
     validate_nonce(nonce)?;
-    let parent = safefs::ensure_dir(&appdata.join(name))?;
-    safefs::real_dir_at(&parent, &appdata.join(name))?;
-    safefs::create_new_file(
-        &parent.join(format!(".orca-copy-{suffix}")),
-        marker_body(volume, nonce).as_bytes(),
-        0o600,
-    )
-    .context("a copy marker already exists (stale run?); inspect it before retrying")?;
-    let dest = safefs::create_dir_new(&parent.join(suffix))?;
-    safefs::real_dir_at(&dest, &appdata.join(name).join(suffix))?;
-    Ok(dest)
+    let app = appdata.ensure_child(name, 0o755)?;
+    let mut marker = app
+        .create_file_open(&marker_name(suffix), 0o600)
+        .context("a copy marker already exists (stale run?); inspect it before retrying")?;
+    marker.write_all(format!("{volume}\n{nonce}\n").as_bytes())?;
+    let dest = app.create_child(suffix, 0o700)?;
+    let (dev, ino) = dest.identity()?;
+    marker.write_all(format!("{dev}:{ino}\n").as_bytes())?;
+    marker.sync_all()?;
+    Ok(CopyDest { app, dest })
 }
 
-/// Check this run's marker for a copy; returns the marker path.
-pub fn check_copy_marker(appdata: &Path, name: &str, suffix: &str, nonce: &str) -> Result<PathBuf> {
-    validate_name("container name", name)?;
+/// `cp -a` the held `src` into the held destination and verify the copy.
+/// Both are passed to `cp` as `/proc/<pid>/fd/<n>`, so it writes exactly
+/// where the descriptors point.
+pub async fn copy_pinned(src: &Dir, cd: &CopyDest, volume: &str) -> Result<String> {
+    let from = format!("{}/.", src.proc_path()?);
+    host::run("/bin/cp", &["-a", &from, &cd.dest.proc_path()?]).await?;
+    let a = safefs::manifest(src)?;
+    let b = safefs::manifest(&cd.dest)?;
+    if a != b {
+        bail!(
+            "copy of {volume} differs: source {} entries/{} bytes/{}, copy {}/{}/{}",
+            a.entries,
+            a.bytes,
+            &a.digest[..12],
+            b.entries,
+            b.bytes,
+            &b.digest[..12]
+        );
+    }
+    Ok(format!(
+        "copied to {}: {} entries, {} bytes, content manifest {}",
+        cd.dest.path().display(),
+        a.entries,
+        a.bytes,
+        &a.digest[..12]
+    ))
+}
+
+/// Check this run's marker for `suffix` in the held `<name>` directory;
+/// returns the destination identity it recorded, if it got that far.
+pub fn check_copy_marker(app: &Dir, suffix: &str, nonce: &str) -> Result<Option<(u64, u64)>> {
     validate_name("destination", suffix)?;
     validate_nonce(nonce)?;
-    let parent = appdata.join(name);
-    safefs::real_dir_at(&parent, &parent)?;
-    let marker = parent.join(format!(".orca-copy-{suffix}"));
-    let body = safefs::read_file(&marker)?
-        .ok_or_else(|| anyhow!("{} has no copy marker", parent.join(suffix).display()))?;
+    let body = app
+        .read_file(&marker_name(suffix))?
+        .ok_or_else(|| anyhow!("{} has no copy marker", app.path().join(suffix).display()))?;
     let body = String::from_utf8_lossy(&body);
-    if body.lines().nth(1) != Some(nonce) {
+    let mut lines = body.lines();
+    if lines.nth(1) != Some(nonce) {
         bail!("copy marker for {suffix} belongs to another run");
     }
-    Ok(marker)
+    Ok(lines.next().and_then(|l| {
+        let (d, i) = l.split_once(':')?;
+        Some((d.parse().ok()?, i.parse().ok()?))
+    }))
 }
 
-/// Remove this run's copy at `<appdata>/<name>/<suffix>` unless `mounted`.
-pub fn remove_copy_at(
-    appdata: &Path,
-    name: &str,
-    suffix: &str,
-    nonce: &str,
-    mounted: &[String],
-) -> Result<String> {
-    let marker = check_copy_marker(appdata, name, suffix, nonce)?;
-    let dest = appdata.join(name).join(suffix);
+/// Remove this run's copy `<name>/<suffix>` unless `mounted`. Only the very
+/// directory this run created is emptied, by descriptor.
+pub fn remove_copy(app: &Dir, suffix: &str, nonce: &str, mounted: &[String]) -> Result<String> {
+    let id = check_copy_marker(app, suffix, nonce)?;
+    let shown = app.path().join(suffix);
     if !mounted.is_empty() {
-        bail!("{} is mounted ({})", dest.display(), mounted.join(", "));
+        bail!("{} is mounted ({})", shown.display(), mounted.join(", "));
     }
-    match fs::symlink_metadata(&dest) {
-        Ok(_) => {
-            safefs::real_dir_at(&dest, &dest)?;
-            // remove_dir_all does not follow symlinks inside the tree.
-            fs::remove_dir_all(&dest)?;
+    if let Some(dest) = app.child_opt(suffix)? {
+        if Some(dest.identity()?) != id {
+            bail!("{} is not the directory this run created", shown.display());
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+        dest.clear()?;
+        if Some(app.child(suffix)?.identity()?) != id {
+            bail!("{} was replaced during removal", shown.display());
+        }
+        app.remove_empty_dir(suffix)?;
     }
-    safefs::remove_file(&marker)?;
-    Ok(format!("removed {}", dest.display()))
+    app.remove_file(&marker_name(suffix))?;
+    Ok(format!("removed {}", shown.display()))
+}
+
+/// Accept this run's copy: drop its marker so it can no longer be removed.
+pub fn commit_copy(app: &Dir, suffix: &str, nonce: &str) -> Result<String> {
+    check_copy_marker(app, suffix, nonce)?;
+    app.remove_file(&marker_name(suffix))?;
+    Ok(format!("committed {suffix}"))
+}
+
+fn appdata_dir() -> Result<Dir> {
+    Dir::open(Path::new(APPDATA))
+}
+
+fn app_dir(name: &str) -> Result<Dir> {
+    validate_name("container name", name)?;
+    appdata_dir()?.child(name)
+}
+
+/// Retire stack `dir_name` from the held stacks `root` into `retired`,
+/// both directories root-owned and not group/world-writable.
+pub fn retire_pinned(root: &Dir, dir_name: &str, retired: &Dir, to_name: &str) -> Result<()> {
+    for d in [root, retired] {
+        if let Some(why) = d.root_owned_problem()? {
+            bail!("refusing to retire a stack: {why}");
+        }
+    }
+    root.rename_into(dir_name, retired, to_name)
 }
 
 /// `dir/<file name of path>`: the template-side paths, rooted at `dir`.
@@ -328,10 +405,6 @@ async fn containers_using_volume(volume: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-fn canonical_appdata() -> Result<PathBuf> {
-    fs::canonicalize(APPDATA).with_context(|| format!("resolve {APPDATA}"))
-}
-
 /// Run one op as root. Every input is re-validated here, and every file
 /// touched goes through [`safefs`].
 pub async fn execute(op: &PrivilegedOp) -> Result<String> {
@@ -406,20 +479,20 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
                 bail!("{name} is running; stop it before copying its volumes");
             }
             let v = host::inspect_volume(volume).await?;
-            let src = VolumeInspect::expected_mountpoint(volume);
+            let src_path = VolumeInspect::expected_mountpoint(volume);
             if v.driver != "local" || v.options.as_ref().is_some_and(|o| !o.is_empty()) {
                 bail!("volume {volume} is not a plain local volume");
             }
-            if v.mountpoint != src {
-                bail!("volume {volume} data is not at {src}");
+            if v.mountpoint != src_path {
+                bail!("volume {volume} data is not at {src_path}");
             }
-            safefs::real_dir_at(Path::new(&src), Path::new(&src))?;
+            let src = Dir::open(Path::new(&src_path))?;
+            src.proc_path()?;
             let users = containers_using_volume(volume).await?;
             if users.iter().any(|u| u != name) {
                 bail!("volume {volume} is also used by [{}]", users.join(", "));
             }
-            let appdata = canonical_appdata()?;
-            let planned = appdata.join(name).join(dest_suffix);
+            let planned = Path::new(APPDATA).join(name).join(dest_suffix);
             let mounted = orphans::binds_overlapping(&planned, &host::inspect_all().await?);
             if !mounted.is_empty() {
                 bail!(
@@ -428,51 +501,27 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
                     mounted.into_iter().collect::<Vec<_>>().join(", ")
                 );
             }
-            let dest = prepare_copy_dest(&appdata, name, dest_suffix, volume, nonce)?;
-            let dest_s = dest.to_string_lossy().into_owned();
-            host::run("cp", &["-a", &format!("{src}/."), &dest_s]).await?;
-            let a = host::manifest(Path::new(&src))?;
-            let b = host::manifest(&dest)?;
-            if a != b {
-                bail!(
-                    "copy of {volume} differs: source {} entries/{} bytes/{}, copy {}/{}/{}",
-                    a.entries,
-                    a.bytes,
-                    &a.digest[..12],
-                    b.entries,
-                    b.bytes,
-                    &b.digest[..12]
-                );
-            }
-            Ok(format!(
-                "copied to {dest_s}: {} entries, {} bytes, content manifest {}",
-                a.entries,
-                a.bytes,
-                &a.digest[..12]
-            ))
+            let cd = prepare_copy_dest(&appdata_dir()?, name, dest_suffix, volume, nonce)?;
+            copy_pinned(&src, &cd, volume).await
         }
         PrivilegedOp::RemoveCopy {
             name,
             dest_suffix,
             nonce,
         } => {
-            let appdata = canonical_appdata()?;
-            let dest = appdata.join(name).join(dest_suffix);
+            let app = app_dir(name)?;
+            let planned = Path::new(APPDATA).join(name).join(dest_suffix);
             let mounted: Vec<String> =
-                orphans::binds_overlapping(&dest, &host::inspect_all().await?)
+                orphans::binds_overlapping(&planned, &host::inspect_all().await?)
                     .into_iter()
                     .collect();
-            remove_copy_at(&appdata, name, dest_suffix, nonce, &mounted)
+            remove_copy(&app, dest_suffix, nonce, &mounted)
         }
         PrivilegedOp::CommitCopy {
             name,
             dest_suffix,
             nonce,
-        } => {
-            let marker = check_copy_marker(&canonical_appdata()?, name, dest_suffix, nonce)?;
-            safefs::remove_file(&marker)?;
-            Ok(format!("committed {dest_suffix}"))
-        }
+        } => commit_copy(&app_dir(name)?, dest_suffix, nonce),
         PrivilegedOp::RetireStack {
             name,
             project,
@@ -484,23 +533,28 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
             validate_name("compose project", project)?;
             validate_run_id(run_id)?;
             let dir = Path::new(dir);
-            safefs::real_dir_at(dir, dir)?;
-            let parent = dir
-                .parent()
-                .ok_or_else(|| anyhow!("{} has no parent", dir.display()))?;
-            let under_root = orphans::stacks_roots()
+            let (Some(parent), Some(dir_name)) =
+                (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
+            else {
+                bail!("{} is not a stack directory", dir.display());
+            };
+            let root_path = orphans::stacks_roots()
                 .iter()
                 .filter_map(|r| fs::canonicalize(r).ok())
-                .any(|r| r == parent);
-            if !under_root {
-                bail!(
-                    "{} is not directly under a configured stacks root",
-                    dir.display()
-                );
-            }
-            let compose = host::compose_file(dir)
+                .find(|r| r == parent)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{} is not directly under a configured stacks root",
+                        dir.display()
+                    )
+                })?;
+            let root = Dir::open(&root_path)?;
+            let stack = root.child(dir_name)?;
+            let compose = orphans::COMPOSE_FILES
+                .iter()
+                .find_map(|f| stack.read_file(f).ok().flatten())
                 .ok_or_else(|| anyhow!("{} has no compose file", dir.display()))?;
-            if !orphans::compose_matches(dir, project, &compose) {
+            if !orphans::compose_matches(dir, project, &String::from_utf8_lossy(&compose)) {
                 bail!("{} is not compose project {project}", dir.display());
             }
             let members = host::docker(&[
@@ -521,16 +575,23 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
             if Path::new(to) != want {
                 bail!("planned target {to} != {}", want.display());
             }
-            let retired = want
-                .parent()
-                .ok_or_else(|| anyhow!("{} has no parent", want.display()))?;
-            let retired = safefs::ensure_dir(retired)?;
-            let target = retired.join(want.file_name().unwrap_or_default());
-            if fs::symlink_metadata(&target).is_ok() {
-                bail!("{} already exists", target.display());
+            let (Some(retired_path), Some(to_name)) =
+                (want.parent(), want.file_name().and_then(|n| n.to_str()))
+            else {
+                bail!("{} has no parent", want.display());
+            };
+            let (Some(top), Some(retired_name)) = (
+                retired_path.parent(),
+                retired_path.file_name().and_then(|n| n.to_str()),
+            ) else {
+                bail!("{} has no parent", retired_path.display());
+            };
+            if let Some(why) = root.root_owned_problem()? {
+                bail!("refusing to retire a stack: {why}");
             }
-            fs::rename(dir, &target)?;
-            Ok(format!("moved {} to {}", dir.display(), target.display()))
+            let retired = Dir::open(top)?.ensure_child(retired_name, 0o755)?;
+            retire_pinned(&root, dir_name, &retired, to_name)?;
+            Ok(format!("moved {} to {}", dir.display(), want.display()))
         }
     }
 }
@@ -720,19 +781,34 @@ mod tests {
 
     const NONCE: &str = "0123456789abcdef";
 
+    fn open(p: &Path) -> Dir {
+        Dir::open(p).unwrap()
+    }
+
     #[test]
-    fn copy_destination_is_created_fresh_and_claimed() {
+    fn copy_destination_is_created_fresh_private_and_claimed() {
+        use std::os::unix::fs::PermissionsExt;
         let (_d, root) = appdata();
-        let dest = prepare_copy_dest(&root, "pbs", "config", "pbs-config", NONCE).unwrap();
-        assert_eq!(dest, root.join("pbs/config"));
-        assert!(prepare_copy_dest(&root, "pbs", "config", "pbs-config", NONCE).is_err());
+        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "pbs-config", NONCE).unwrap();
+        assert_eq!(cd.dest.path(), root.join("pbs/config"));
+        assert_eq!(
+            fs::metadata(root.join("pbs/config"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let id = check_copy_marker(&cd.app, "config", NONCE).unwrap();
+        assert_eq!(id, Some(cd.dest.identity().unwrap()));
+        assert!(prepare_copy_dest(&open(&root), "pbs", "config", "pbs-config", NONCE).is_err());
         for bad in ["..", "a/b", ".hidden", ""] {
             assert!(
-                prepare_copy_dest(&root, "pbs", bad, "v", NONCE).is_err(),
+                prepare_copy_dest(&open(&root), "pbs", bad, "v", NONCE).is_err(),
                 "{bad}"
             );
         }
-        assert!(prepare_copy_dest(&root, "../etc", "x", "v", NONCE).is_err());
+        assert!(prepare_copy_dest(&open(&root), "../etc", "x", "v", NONCE).is_err());
     }
 
     #[test]
@@ -744,52 +820,133 @@ mod tests {
         fs::create_dir(root.join("pbs")).unwrap();
 
         symlink(&outside, root.join("pbs/config")).unwrap();
-        assert!(prepare_copy_dest(&root, "pbs", "config", "v", NONCE).is_err());
+        assert!(prepare_copy_dest(&open(&root), "pbs", "config", "v", NONCE).is_err());
         fs::remove_file(root.join("pbs/.orca-copy-config")).ok();
 
         let victim = outside.join("go");
         fs::write(&victim, b"keep").unwrap();
         symlink(&victim, root.join("pbs/.orca-copy-logs")).unwrap();
-        assert!(prepare_copy_dest(&root, "pbs", "logs", "v", NONCE).is_err());
+        assert!(prepare_copy_dest(&open(&root), "pbs", "logs", "v", NONCE).is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"keep");
 
         let (_d2, root2) = appdata();
         symlink(&outside, root2.join("pbs")).unwrap();
-        assert!(prepare_copy_dest(&root2, "pbs", "config", "v", NONCE).is_err());
+        assert!(prepare_copy_dest(&open(&root2), "pbs", "config", "v", NONCE).is_err());
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    }
+
+    /// The attack from the review: after every check, `<appdata>/<name>` is
+    /// renamed away and replaced by a symlink to somewhere else.
+    fn swap_app_for_symlink(root: &Path, outside: &Path) {
+        fs::rename(root.join("pbs"), root.join("pbs-moved")).unwrap();
+        std::os::unix::fs::symlink(outside, root.join("pbs")).unwrap();
+    }
+
+    #[test]
+    fn an_ancestor_swap_after_the_checks_cannot_redirect_writes() {
+        let (_d, root) = appdata();
+        let (_o, outside) = appdata();
+        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "v", NONCE).unwrap();
+        swap_app_for_symlink(&root, &outside);
+        // Writes go through the held descriptor, into the moved directory.
+        cd.dest.create_file("data", b"x", 0o600).unwrap();
+        assert!(root.join("pbs-moved/config/data").exists());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_ancestor_swap_cannot_redirect_cp() {
+        let (_d, root) = appdata();
+        let (_o, outside) = appdata();
+        let (_s, src) = appdata();
+        fs::create_dir(src.join("sub")).unwrap();
+        fs::write(src.join("sub/f"), b"payload").unwrap();
+        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "v", NONCE).unwrap();
+        swap_app_for_symlink(&root, &outside);
+        copy_pinned(&open(&src), &cd, "v").await.unwrap();
+        assert_eq!(
+            fs::read(root.join("pbs-moved/config/sub/f")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_ancestor_swap_cannot_redirect_removal() {
+        let (_d, root) = appdata();
+        let (_o, outside) = appdata();
+        fs::write(outside.join("precious"), b"keep").unwrap();
+        fs::create_dir(outside.join("config")).unwrap();
+        fs::write(outside.join("config/precious"), b"keep").unwrap();
+        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "v", NONCE).unwrap();
+        cd.dest.create_file("f", b"x", 0o600).unwrap();
+        drop(cd);
+        swap_app_for_symlink(&root, &outside);
+        // A fresh open (the RemoveCopy op) refuses the symlinked <name>.
+        assert!(open(&root).child("pbs").is_err());
+        // A directory held from before the swap removes only its own copy.
+        let app = open(&root.join("pbs-moved"));
+        remove_copy(&app, "config", NONCE, &[]).unwrap();
+        assert!(!root.join("pbs-moved/config").exists());
+        assert!(outside.join("precious").exists());
+        assert!(outside.join("config/precious").exists());
+    }
+
+    #[test]
+    fn removal_refuses_a_directory_this_run_did_not_create() {
+        let (_d, root) = appdata();
+        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "v", NONCE).unwrap();
+        // Someone renames our copy away and moves other data into its name.
+        fs::rename(root.join("pbs/config"), root.join("pbs/ours")).unwrap();
+        fs::create_dir(root.join("pbs/config")).unwrap();
+        fs::write(root.join("pbs/config/theirs"), b"keep").unwrap();
+        assert!(remove_copy(&cd.app, "config", NONCE, &[]).is_err());
+        assert!(root.join("pbs/config/theirs").exists());
     }
 
     #[test]
     fn copies_are_removed_only_by_their_own_run_and_when_unmounted() {
         let (_d, root) = appdata();
-        let dest = prepare_copy_dest(&root, "pbs", "config", "pbs-config", NONCE).unwrap();
-        fs::write(dest.join("f"), b"x").unwrap();
-        assert!(remove_copy_at(&root, "pbs", "config", "fedcba9876543210", &[]).is_err());
-        assert!(
-            remove_copy_at(
-                &root,
-                "pbs",
-                "config",
-                NONCE,
-                &["/mnt/user/appdata/pbs".into()]
-            )
-            .is_err()
-        );
-        assert!(dest.exists());
-        remove_copy_at(&root, "pbs", "config", NONCE, &[]).unwrap();
-        assert!(!dest.exists());
+        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "pbs-config", NONCE).unwrap();
+        cd.dest.create_file("f", b"x", 0o600).unwrap();
+        fs::create_dir_all(root.join("pbs/config/a/b")).unwrap();
+        let app = &cd.app;
+        assert!(remove_copy(app, "config", "fedcba9876543210", &[]).is_err());
+        assert!(remove_copy(app, "config", NONCE, &["/mnt/user/appdata/pbs".into()]).is_err());
+        assert!(root.join("pbs/config").exists());
+        remove_copy(app, "config", NONCE, &[]).unwrap();
+        assert!(!root.join("pbs/config").exists());
         assert!(!root.join("pbs/.orca-copy-config").exists());
-        assert!(remove_copy_at(&root, "pbs", "config", NONCE, &[]).is_err());
+        assert!(remove_copy(app, "config", NONCE, &[]).is_err());
     }
 
     #[test]
     fn committed_copies_cannot_be_removed() {
         let (_d, root) = appdata();
-        prepare_copy_dest(&root, "pbs", "config", "v", NONCE).unwrap();
-        let marker = check_copy_marker(&root, "pbs", "config", NONCE).unwrap();
-        safefs::remove_file(&marker).unwrap();
-        assert!(remove_copy_at(&root, "pbs", "config", NONCE, &[]).is_err());
+        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "v", NONCE).unwrap();
+        assert!(commit_copy(&cd.app, "config", "fedcba9876543210").is_err());
+        commit_copy(&cd.app, "config", NONCE).unwrap();
+        assert!(remove_copy(&cd.app, "config", NONCE, &[]).is_err());
         assert!(root.join("pbs/config").exists());
+    }
+
+    #[test]
+    fn retire_moves_between_held_directories_and_checks_ownership() {
+        let (_d, root) = appdata();
+        fs::create_dir_all(root.join("stacks/web")).unwrap();
+        fs::create_dir(root.join("stacks-retired")).unwrap();
+        let stacks = open(&root.join("stacks"));
+        let retired = open(&root.join("stacks-retired"));
+        let r = retire_pinned(&stacks, "web", &retired, "web-compose-20261004");
+        if host::euid() == Some(0) {
+            r.unwrap();
+            assert!(root.join("stacks-retired/web-compose-20261004").exists());
+        } else {
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains("must be root-owned"), "{e}");
+            assert!(root.join("stacks/web").exists());
+        }
     }
 
     const RUN: &str = "20261004-120000-0123abcd";
@@ -851,6 +1008,10 @@ mod tests {
         let id = new_run_id();
         assert!(validate_run_id(&id).is_ok(), "{id}");
         for bad in [
+            "20261304-120000-0123abcd",
+            "20260230-120000-0123abcd",
+            "20261004-250000-0123abcd",
+            "20261004-126000-0123abcd",
             "",
             "20261004",
             "20261004-120000-ABCDEF12",
@@ -859,6 +1020,8 @@ mod tests {
         ] {
             assert!(validate_run_id(bad).is_err(), "{bad}");
         }
+        assert!(validate_run_id("20240229-235959-0123abcd").is_ok());
+        assert!(validate_run_id("20230229-000000-0123abcd").is_err());
         assert!(validate_nonce(NONCE).is_ok());
         assert!(validate_nonce("xyz").is_err());
     }

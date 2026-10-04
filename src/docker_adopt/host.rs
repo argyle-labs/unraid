@@ -246,62 +246,6 @@ pub async fn refresh_icons() -> Result<()> {
         .map(|_| ())
 }
 
-/// A content summary of a tree: entry count, regular-file bytes, and the
-/// sha256 of the sorted `(path, type, size, mode, uid, gid, content)` list,
-/// where content is a file's sha256 or a symlink's target. Symlinks are not
-/// followed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Manifest {
-    pub entries: u64,
-    pub bytes: u64,
-    pub digest: String,
-}
-
-pub fn manifest(root: &Path) -> Result<Manifest> {
-    use std::os::unix::fs::MetadataExt;
-    let mut rows = Vec::new();
-    let mut bytes = 0;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for e in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
-            let e = e?;
-            let md = fs::symlink_metadata(e.path())?;
-            let rel = e.path().strip_prefix(root)?.to_string_lossy().into_owned();
-            let kind = if md.is_dir() {
-                stack.push(e.path());
-                'd'
-            } else if md.is_file() {
-                bytes += md.len();
-                'f'
-            } else if md.file_type().is_symlink() {
-                'l'
-            } else {
-                'o'
-            };
-            let size = if kind == 'f' { md.len() } else { 0 };
-            let content = if kind == 'f' {
-                plugin_toolkit::hash::sha256_file(&e.path())?
-            } else if kind == 'l' {
-                fs::read_link(e.path())?.to_string_lossy().into_owned()
-            } else {
-                String::new()
-            };
-            rows.push(format!(
-                "{rel}\t{kind}\t{size}\t{:o}\t{}\t{}\t{content}",
-                md.mode() & 0o7777,
-                md.uid(),
-                md.gid()
-            ));
-        }
-    }
-    rows.sort();
-    Ok(Manifest {
-        entries: rows.len() as u64,
-        bytes,
-        digest: sha256_hex(rows.join("\n").as_bytes()),
-    })
-}
-
 pub fn is_nonempty_dir(p: &Path) -> bool {
     fs::read_dir(p).is_ok_and(|mut d| d.next().is_some())
 }
@@ -404,33 +348,6 @@ mod tests {
         assert_eq!(o.get("max-size").map(String::as_str), Some("50m"));
         assert_eq!(o.get("max-file").map(String::as_str), Some("1"));
         assert!(daemon_log_opts("DOCKER_LOG_ROTATION=\"no\"\nDOCKER_LOG_SIZE=\"50m\"").is_empty());
-    }
-
-    #[test]
-    fn manifest_detects_content_shape_changes() {
-        let a = tempfile::tempdir().unwrap();
-        fs::create_dir(a.path().join("sub")).unwrap();
-        fs::write(a.path().join("x"), b"12345").unwrap();
-        fs::write(a.path().join("sub/y"), b"123").unwrap();
-        let m = manifest(a.path()).unwrap();
-        assert_eq!((m.entries, m.bytes), (3, 8));
-        fs::rename(a.path().join("x"), a.path().join("z")).unwrap();
-        let m2 = manifest(a.path()).unwrap();
-        assert_eq!((m2.entries, m2.bytes), (3, 8));
-        assert_ne!(m.digest, m2.digest);
-        // Same names, sizes and modes, different bytes.
-        let mtime = fs::metadata(a.path().join("z"))
-            .unwrap()
-            .modified()
-            .unwrap();
-        fs::write(a.path().join("z"), b"54321").unwrap();
-        fs::File::options()
-            .write(true)
-            .open(a.path().join("z"))
-            .unwrap()
-            .set_modified(mtime)
-            .unwrap();
-        assert_ne!(manifest(a.path()).unwrap().digest, m2.digest);
     }
 
     #[test]
