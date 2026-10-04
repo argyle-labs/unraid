@@ -1,0 +1,315 @@
+[
+    {
+        "Id": "3e606c99649b5b6f67d9d86edfd229bed3d8d056fccfd96226129aab15536186",
+        "Created": "2026-10-04T07:05:04.495767568Z",
+        "Path": "/usr/bin/tini",
+        "Args": [
+            "--",
+            "/usr/local/bin/entrypoint.sh"
+        ],
+        "State": {
+            "Status": "running",
+            "Running": true,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 1612044,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "2026-10-04T07:05:04.664260109Z",
+            "FinishedAt": "0001-01-01T00:00:00Z",
+            "Health": {
+                "Status": "healthy",
+                "FailingStreak": 0,
+                "Log": [
+                    {
+                        "Start": "2026-10-04T09:41:13.61448168-06:00",
+                        "End": "2026-10-04T09:41:13.666179871-06:00",
+                        "ExitCode": 0,
+                        "Output": ""
+                    },
+                    {
+                        "Start": "2026-10-04T09:41:43.667062117-06:00",
+                        "End": "2026-10-04T09:41:43.711755018-06:00",
+                        "ExitCode": 0,
+                        "Output": ""
+                    },
+                    {
+                        "Start": "2026-10-04T09:42:13.712831793-06:00",
+                        "End": "2026-10-04T09:42:13.759093329-06:00",
+                        "ExitCode": 0,
+                        "Output": ""
+                    },
+                    {
+                        "Start": "2026-10-04T09:42:43.75955044-06:00",
+                        "End": "2026-10-04T09:42:43.8150375-06:00",
+                        "ExitCode": 0,
+                        "Output": ""
+                    },
+                    {
+                        "Start": "2026-10-04T09:43:13.81639444-06:00",
+                        "End": "2026-10-04T09:43:13.86906647-06:00",
+                        "ExitCode": 0,
+                        "Output": ""
+                    }
+                ]
+            }
+        },
+        "Image": "sha256:0378ed42e0adc88cedf9f261c732ef23a045868e2830a424305e862516445262",
+        "ResolvConfPath": "/var/lib/docker/containers/3e606c99649b5b6f67d9d86edfd229bed3d8d056fccfd96226129aab15536186/resolv.conf",
+        "HostnamePath": "/var/lib/docker/containers/3e606c99649b5b6f67d9d86edfd229bed3d8d056fccfd96226129aab15536186/hostname",
+        "HostsPath": "/var/lib/docker/containers/3e606c99649b5b6f67d9d86edfd229bed3d8d056fccfd96226129aab15536186/hosts",
+        "LogPath": "/var/lib/docker/containers/3e606c99649b5b6f67d9d86edfd229bed3d8d056fccfd96226129aab15536186/3e606c99649b5b6f67d9d86edfd229bed3d8d056fccfd96226129aab15536186-json.log",
+        "Name": "/pbs",
+        "RestartCount": 0,
+        "Driver": "btrfs",
+        "Platform": "linux",
+        "MountLabel": "",
+        "ProcessLabel": "",
+        "AppArmorProfile": "",
+        "ExecIDs": null,
+        "HostConfig": {
+            "Binds": [
+                "pbs-config:/etc/proxmox-backup",
+                "pbs-logs:/var/log/proxmox-backup",
+                "/mnt/user/pbs:/mnt/willow-pbs"
+            ],
+            "ContainerIDFile": "",
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {
+                    "max-file": "1",
+                    "max-size": "50m"
+                }
+            },
+            "NetworkMode": "bridge",
+            "PortBindings": {
+                "8007/tcp": [
+                    {
+                        "HostIp": "",
+                        "HostPort": "8007"
+                    }
+                ]
+            },
+            "RestartPolicy": {
+                "Name": "unless-stopped",
+                "MaximumRetryCount": 0
+            },
+            "AutoRemove": false,
+            "VolumeDriver": "",
+            "VolumesFrom": null,
+            "ConsoleSize": [
+                0,
+                0
+            ],
+            "CapAdd": null,
+            "CapDrop": null,
+            "CgroupnsMode": "private",
+            "Dns": null,
+            "DnsOptions": [],
+            "DnsSearch": [],
+            "ExtraHosts": null,
+            "GroupAdd": null,
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": null,
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": false,
+            "PublishAllPorts": false,
+            "ReadonlyRootfs": false,
+            "SecurityOpt": null,
+            "Tmpfs": {
+                "/run/proxmox-backup": "rw,nosuid,nodev,mode=0755"
+            },
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": 67108864,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": 0,
+            "NanoCpus": 0,
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": [],
+            "BlkioDeviceReadBps": [],
+            "BlkioDeviceWriteBps": [],
+            "BlkioDeviceReadIOps": [],
+            "BlkioDeviceWriteIOps": [],
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": [],
+            "DeviceCgroupRules": null,
+            "DeviceRequests": null,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "MemorySwappiness": null,
+            "OomKillDisable": null,
+            "PidsLimit": null,
+            "Ulimits": [],
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "Mounts": [
+                {
+                    "Type": "bind",
+                    "Source": "/mnt/pbs-remote",
+                    "Target": "/mnt/pbs-remote",
+                    "BindOptions": {
+                        "Propagation": "rslave"
+                    }
+                }
+            ],
+            "MaskedPaths": [
+                "/proc/acpi",
+                "/proc/asound",
+                "/proc/interrupts",
+                "/proc/kcore",
+                "/proc/keys",
+                "/proc/latency_stats",
+                "/proc/sched_debug",
+                "/proc/scsi",
+                "/proc/timer_list",
+                "/proc/timer_stats",
+                "/sys/devices/virtual/powercap",
+                "/sys/firmware"
+            ],
+            "ReadonlyPaths": [
+                "/proc/bus",
+                "/proc/fs",
+                "/proc/irq",
+                "/proc/sys",
+                "/proc/sysrq-trigger"
+            ]
+        },
+        "GraphDriver": {
+            "Data": {
+                "ID": "3e606c99649b5b6f67d9d86edfd229bed3d8d056fccfd96226129aab15536186"
+            },
+            "Name": "btrfs"
+        },
+        "Mounts": [
+            {
+                "Type": "volume",
+                "Name": "pbs-config",
+                "Source": "/var/lib/docker/volumes/pbs-config/_data",
+                "Destination": "/etc/proxmox-backup",
+                "Driver": "local",
+                "Mode": "z",
+                "RW": true,
+                "Propagation": ""
+            },
+            {
+                "Type": "volume",
+                "Name": "pbs-logs",
+                "Source": "/var/lib/docker/volumes/pbs-logs/_data",
+                "Destination": "/var/log/proxmox-backup",
+                "Driver": "local",
+                "Mode": "z",
+                "RW": true,
+                "Propagation": ""
+            },
+            {
+                "Type": "bind",
+                "Source": "/mnt/user/pbs",
+                "Destination": "/mnt/willow-pbs",
+                "Mode": "",
+                "RW": true,
+                "Propagation": "rprivate"
+            },
+            {
+                "Type": "bind",
+                "Source": "/mnt/pbs-remote",
+                "Destination": "/mnt/pbs-remote",
+                "Mode": "",
+                "RW": true,
+                "Propagation": "rslave"
+            }
+        ],
+        "Config": {
+            "Hostname": "62c7f1883665",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": false,
+            "AttachStdout": false,
+            "AttachStderr": false,
+            "ExposedPorts": {
+                "8007/tcp": {}
+            },
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "PUID=99",
+                "PGID=100",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "DEBIAN_FRONTEND=noninteractive"
+            ],
+            "Cmd": null,
+            "Healthcheck": {
+                "Test": [
+                    "CMD-SHELL",
+                    "curl -fsk https://127.0.0.1:8007/api2/json/ping >/dev/null || exit 1"
+                ],
+                "Interval": 30000000000,
+                "Timeout": 5000000000,
+                "StartPeriod": 60000000000,
+                "Retries": 3
+            },
+            "Image": "gitea.scottkey.me/argyle-labs/pbs:4.2",
+            "Volumes": {
+                "/etc/proxmox-backup": {},
+                "/var/log/proxmox-backup": {}
+            },
+            "WorkingDir": "",
+            "Entrypoint": [
+                "/usr/bin/tini",
+                "--",
+                "/usr/local/bin/entrypoint.sh"
+            ],
+            "Labels": {}
+        },
+        "NetworkSettings": {
+            "SandboxID": "8cde526407d43a6c0b860bf8999f91d8a98233f939ce55192ace4782cfab22f5",
+            "SandboxKey": "/var/run/docker/netns/8cde526407d4",
+            "Ports": {
+                "8007/tcp": [
+                    {
+                        "HostIp": "0.0.0.0",
+                        "HostPort": "8007"
+                    },
+                    {
+                        "HostIp": "::",
+                        "HostPort": "8007"
+                    }
+                ]
+            },
+            "Networks": {
+                "bridge": {
+                    "IPAMConfig": null,
+                    "Links": null,
+                    "Aliases": null,
+                    "DriverOpts": null,
+                    "GwPriority": 0,
+                    "NetworkID": "867159e5be56662edab73e7371132c56cf36bba50ba6be2b5fe5025834602f5f",
+                    "EndpointID": "7fa451e8a5ef0b4f37e50878c5380cd215122af9de01fb16a3a9de8542f77b38",
+                    "Gateway": "172.17.0.1",
+                    "IPAddress": "172.17.0.2",
+                    "MacAddress": "1a:aa:a6:2b:63:ec",
+                    "IPPrefixLen": 16,
+                    "IPv6Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "DNSNames": null
+                }
+            }
+        }
+    }
+]

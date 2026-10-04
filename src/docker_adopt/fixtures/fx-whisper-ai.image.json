@@ -1,0 +1,69 @@
+[
+    {
+        "Id": "sha256:29ba705a475c1a2b8729408d25be23c7c2ff7ccaa1d30ab7d7c6e03ac3026b36",
+        "RepoTags": [
+            "onerahmet/openai-whisper-asr-webservice:latest-gpu"
+        ],
+        "RepoDigests": [
+            "onerahmet/openai-whisper-asr-webservice@sha256:1132aa08c6eb9b440408864e8c25733d22a197ffea7c6975d60a4f4b6fd7b08b"
+        ],
+        "Comment": "buildkit.dockerfile.v0",
+        "Created": "2025-07-01T19:17:31.703327221Z",
+        "Config": {
+            "ExposedPorts": {
+                "9000/tcp": {}
+            },
+            "Env": [
+                "PATH=/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/app/.venv/bin",
+                "NVARCH=x86_64",
+                "NVIDIA_REQUIRE_CUDA=cuda>=12.6 brand=unknown,driver>=470,driver<471 brand=grid,driver>=470,driver<471 brand=tesla,driver>=470,driver<471 brand=nvidia,driver>=470,driver<471 brand=quadro,driver>=470,driver<471 brand=quadrortx,driver>=470,driver<471 brand=nvidiartx,driver>=470,driver<471 brand=vapps,driver>=470,driver<471 brand=vpc,driver>=470,driver<471 brand=vcs,driver>=470,driver<471 brand=vws,driver>=470,driver<471 brand=cloudgaming,driver>=470,driver<471 brand=unknown,driver>=535,driver<536 brand=grid,driver>=535,driver<536 brand=tesla,driver>=535,driver<536 brand=nvidia,driver>=535,driver<536 brand=quadro,driver>=535,driver<536 brand=quadrortx,driver>=535,driver<536 brand=nvidiartx,driver>=535,driver<536 brand=vapps,driver>=535,driver<536 brand=vpc,driver>=535,driver<536 brand=vcs,driver>=535,driver<536 brand=vws,driver>=535,driver<536 brand=cloudgaming,driver>=535,driver<536 brand=unknown,driver>=550,driver<551 brand=grid,driver>=550,driver<551 brand=tesla,driver>=550,driver<551 brand=nvidia,driver>=550,driver<551 brand=quadro,driver>=550,driver<551 brand=quadrortx,driver>=550,driver<551 brand=nvidiartx,driver>=550,driver<551 brand=vapps,driver>=550,driver<551 brand=vpc,driver>=550,driver<551 brand=vcs,driver>=550,driver<551 brand=vws,driver>=550,driver<551 brand=cloudgaming,driver>=550,driver<551",
+                "NV_CUDA_CUDART_VERSION=12.6.77-1",
+                "CUDA_VERSION=12.6.3",
+                "LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64",
+                "NVIDIA_VISIBLE_DEVICES=all",
+                "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+                "PYTHON_VERSION=3.10",
+                "POETRY_VENV=/app/.venv"
+            ],
+            "Entrypoint": [
+                "whisper-asr-webservice"
+            ],
+            "WorkingDir": "/app",
+            "Labels": {
+                "maintainer": "NVIDIA CORPORATION <cudatools@nvidia.com>",
+                "org.opencontainers.image.ref.name": "ubuntu",
+                "org.opencontainers.image.version": "22.04"
+            }
+        },
+        "Architecture": "amd64",
+        "Os": "linux",
+        "Size": 14568864400,
+        "GraphDriver": {
+            "Data": null,
+            "Name": "btrfs"
+        },
+        "RootFS": {
+            "Type": "layers",
+            "Layers": [
+                "sha256:2573e0d8158209ed54ab25c87bcdcb00bd3d2539246960a3d592a1c599d70465",
+                "sha256:782979f338e98d1e0241d3cb112e75d90e3484563e23090673d97e9b82c71c11",
+                "sha256:f0caebf6d8861a8dfb8630799ed7adae3d6e4885b0d8eb186e252c35e87a4ce4",
+                "sha256:cc9ee102691b0001ef58aac6dd110a06ec89469ff13c11e526dfaadb39eba791",
+                "sha256:f72f00af3d1173f2896261009fdf165589496b3d8d3db4f15f93034a3aadf38d",
+                "sha256:60b8c7778c50ab14442726b0992d3b5a33abdeafd1d99bec151d0cc8f92594f8",
+                "sha256:8829a9f4a27fa3619255f947e6332fd29e5424999b533659a1e4b85bd3db3315",
+                "sha256:110fd00dbb3a3fdf95cc4c093fa2fb8bde1a25804a97c229f31910654a175d01",
+                "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+                "sha256:d818e86df5a90b145e7b64338e03feb83e68d11a1b163c063181fc1662391fd7",
+                "sha256:d6810a77a2b9816adeb38e038d74f0bc37d66c0d388fec9c7de699a955a3fe31",
+                "sha256:e6aa733077b2eb1e08ca5f69dfeb1403f6cf5a33265c9aa28265bbf3dceb5af0",
+                "sha256:4ade3862de887bda6ade24990d86abe357925eab552f551242f4eedee819bbdc",
+                "sha256:62f6080c181cc4bd36fc25e83cb345059df9ede3232700bf652829a0b8ed3ef3",
+                "sha256:20d1ffe5c429e2af8984c29864dd5c466b751acc50c8d757c54bc01de13dbbd0"
+            ]
+        },
+        "Metadata": {
+            "LastTagTime": "0001-01-01T00:00:00Z"
+        }
+    }
+]

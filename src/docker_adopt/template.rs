@@ -1,10 +1,15 @@
 //! Unraid dockerMan user templates (`my-<name>.xml`): build one from a
 //! [`RunSpec`], render it, and patch the `<Icon>` of an existing one.
 
+use super::redact::is_secret_key;
 use super::spec::{self, MountKind, RunSpec};
 
 pub const TEMPLATES_DIR: &str = "/boot/config/plugins/dockerMan/templates-user";
 pub const DEFAULT_ICON_BASE: &str = "https://gitea.scottkey.me/argyle-labs";
+/// Hosts an icon base URL may point at, besides those in [`ICON_HOSTS_ENV`].
+pub const DEFAULT_ICON_HOSTS: &[&str] = &["gitea.scottkey.me"];
+/// Comma-separated extra icon hosts, set on the orca daemon.
+pub const ICON_HOSTS_ENV: &str = "ORCA_UNRAID_ICON_HOSTS";
 /// Marks a template orca wrote. An XML comment, which dockerMan ignores.
 pub const MANAGED_MARKER: &str = "<!-- managed-by: orca -->";
 
@@ -14,6 +19,38 @@ pub fn template_path(name: &str) -> String {
 
 pub fn backup_path(name: &str, date: &str) -> String {
     format!("{}.bak-{date}", template_path(name))
+}
+
+pub fn inspect_backup_path(name: &str, date: &str) -> String {
+    format!("{}.inspect-{date}.json", template_path(name))
+}
+
+/// An icon base must be https on an allowlisted host, with nothing a
+/// template or shell could misread.
+pub fn validate_icon_base(base: &str, extra_hosts: &[String]) -> Result<(), String> {
+    let bad = || format!("invalid icon_base '{base}'");
+    let rest = base
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("{}: must be https", bad()))?;
+    if base
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || "\"'<>`\\&?#".contains(c))
+    {
+        return Err(format!("{}: contains a forbidden character", bad()));
+    }
+    let host = rest.split('/').next().unwrap_or("").to_ascii_lowercase();
+    let allowed = DEFAULT_ICON_HOSTS
+        .iter()
+        .map(|h| h.to_string())
+        .chain(extra_hosts.iter().map(|h| h.trim().to_ascii_lowercase()))
+        .any(|h| !h.is_empty() && h == host);
+    if !allowed {
+        return Err(format!(
+            "{}: host {host:?} is not allowlisted (add it to {ICON_HOSTS_ENV})",
+            bad()
+        ));
+    }
+    Ok(())
 }
 
 pub fn icon_url(base: &str, repo: &str) -> String {
@@ -116,6 +153,17 @@ impl Template {
             });
         }
 
+        // dockerMan injects `TZ=""` before the template's variables; an explicit
+        // TZ variable comes later and wins.
+        if !spec.tz.is_empty() {
+            configs.push(TemplateConfig {
+                kind: ConfigKind::Variable,
+                name: "TZ".to_string(),
+                target: "TZ".to_string(),
+                mode: String::new(),
+                value: spec.tz.clone(),
+            });
+        }
         for (k, v) in &spec.env {
             configs.push(TemplateConfig {
                 kind: ConfigKind::Variable,
@@ -154,6 +202,10 @@ impl Template {
         }
         if let Some(r) = &spec.restart {
             extra.push(format!("--restart {}", spec::shell_quote(r)));
+        }
+        // dockerMan always adds its own --pids-limit first; a later one wins.
+        if let Some(n) = spec.pids_limit.filter(|n| *n != spec::UNRAID_PIDS_LIMIT) {
+            extra.push(format!("--pids-limit {n}"));
         }
         for (k, v) in &spec.labels {
             extra.push(format!(
@@ -204,17 +256,23 @@ impl Template {
         el(&mut x, "Category", "");
         el(&mut x, "WebUI", "");
         el(&mut x, "Icon", &self.icon);
-        el(&mut x, "ExtraParams", &self.extra_params);
-        el(&mut x, "PostArgs", &self.post_args);
+        // dockerMan HTML-decodes these two fields once more after XML parsing.
+        el(
+            &mut x,
+            "ExtraParams",
+            &self.extra_params.replace('&', "&amp;"),
+        );
+        el(&mut x, "PostArgs", &self.post_args.replace('&', "&amp;"));
         for c in &self.configs {
             x.push_str(&format!(
                 "  <Config Name=\"{}\" Target=\"{}\" Default=\"{}\" Mode=\"{}\" Description=\"\" \
-                 Type=\"{}\" Display=\"always\" Required=\"false\" Mask=\"false\">{}</Config>\n",
+                 Type=\"{}\" Display=\"always\" Required=\"false\" Mask=\"{}\">{}</Config>\n",
                 xml_escape(&c.name),
                 xml_escape(&c.target),
                 xml_escape(&c.value),
                 xml_escape(&c.mode),
                 c.kind.as_str(),
+                c.kind == ConfigKind::Variable && is_secret_key(&c.target),
                 xml_escape(&c.value),
             ));
         }
@@ -244,6 +302,13 @@ pub fn xml_unescape(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
+}
+
+/// The text of the first `<Name>` element, if any.
+pub fn extract_name(xml: &str) -> Option<String> {
+    let s = xml.find("<Name>")? + "<Name>".len();
+    let e = xml[s..].find("</Name>")? + s;
+    Some(xml_unescape(xml[s..e].trim()))
 }
 
 /// Byte range of the `<Icon>` element (`<Icon>…</Icon>` or `<Icon/>`).

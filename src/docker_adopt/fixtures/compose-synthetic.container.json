@@ -34,7 +34,7 @@
     "Privileged": false,
     "PortBindings": { "5001/tcp": [{ "HostIp": "", "HostPort": "5001" }] },
     "RestartPolicy": { "Name": "unless-stopped", "MaximumRetryCount": 0 },
-    "LogConfig": { "Type": "json-file", "Config": {} },
+    "LogConfig": { "Type": "json-file", "Config": { "max-file": "1", "max-size": "50m" } },
     "ShmSize": 67108864,
     "IpcMode": "private",
     "Runtime": "runc"

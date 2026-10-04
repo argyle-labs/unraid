@@ -1,0 +1,275 @@
+[
+    {
+        "Id": "bc405da8c18f9629f07d8a5b38341c3100d3d59c6b9c23ddacdb7cb238117cb8",
+        "Created": "2026-09-25T02:21:57.155213526Z",
+        "Path": "whisper-asr-webservice",
+        "Args": [],
+        "State": {
+            "Status": "running",
+            "Running": true,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 3341905,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "2026-10-04T15:03:58.553591605Z",
+            "FinishedAt": "2026-10-04T15:03:22.819503899Z"
+        },
+        "Image": "sha256:29ba705a475c1a2b8729408d25be23c7c2ff7ccaa1d30ab7d7c6e03ac3026b36",
+        "ResolvConfPath": "/var/lib/docker/containers/bc405da8c18f9629f07d8a5b38341c3100d3d59c6b9c23ddacdb7cb238117cb8/resolv.conf",
+        "HostnamePath": "/var/lib/docker/containers/bc405da8c18f9629f07d8a5b38341c3100d3d59c6b9c23ddacdb7cb238117cb8/hostname",
+        "HostsPath": "/var/lib/docker/containers/bc405da8c18f9629f07d8a5b38341c3100d3d59c6b9c23ddacdb7cb238117cb8/hosts",
+        "LogPath": "/var/lib/docker/containers/bc405da8c18f9629f07d8a5b38341c3100d3d59c6b9c23ddacdb7cb238117cb8/bc405da8c18f9629f07d8a5b38341c3100d3d59c6b9c23ddacdb7cb238117cb8-json.log",
+        "Name": "/whisper-ai",
+        "RestartCount": 0,
+        "Driver": "btrfs",
+        "Platform": "linux",
+        "MountLabel": "",
+        "ProcessLabel": "",
+        "AppArmorProfile": "",
+        "ExecIDs": null,
+        "HostConfig": {
+            "Binds": [
+                "whisper-ai_whisper_cache:/app/.cache",
+                "whisper-ai_whisper_models:/app/models",
+                "/usr/share/zoneinfo:/usr/share/zoneinfo:ro"
+            ],
+            "ContainerIDFile": "",
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {
+                    "max-file": "1",
+                    "max-size": "50m"
+                }
+            },
+            "NetworkMode": "bridge",
+            "PortBindings": {
+                "9000/tcp": [
+                    {
+                        "HostIp": "",
+                        "HostPort": "10300"
+                    }
+                ]
+            },
+            "RestartPolicy": {
+                "Name": "unless-stopped",
+                "MaximumRetryCount": 0
+            },
+            "AutoRemove": false,
+            "VolumeDriver": "",
+            "VolumesFrom": null,
+            "ConsoleSize": [
+                0,
+                0
+            ],
+            "CapAdd": null,
+            "CapDrop": null,
+            "CgroupnsMode": "private",
+            "Dns": [],
+            "DnsOptions": [],
+            "DnsSearch": [],
+            "ExtraHosts": null,
+            "GroupAdd": null,
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": null,
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": false,
+            "PublishAllPorts": false,
+            "ReadonlyRootfs": false,
+            "SecurityOpt": null,
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": 67108864,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": 0,
+            "NanoCpus": 0,
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": [],
+            "BlkioDeviceReadBps": [],
+            "BlkioDeviceWriteBps": [],
+            "BlkioDeviceReadIOps": [],
+            "BlkioDeviceWriteIOps": [],
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": [],
+            "DeviceCgroupRules": null,
+            "DeviceRequests": [
+                {
+                    "Driver": "",
+                    "Count": -1,
+                    "DeviceIDs": null,
+                    "Capabilities": [
+                        [
+                            "gpu"
+                        ]
+                    ],
+                    "Options": {}
+                }
+            ],
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "MemorySwappiness": null,
+            "OomKillDisable": null,
+            "PidsLimit": null,
+            "Ulimits": [],
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "MaskedPaths": [
+                "/proc/acpi",
+                "/proc/asound",
+                "/proc/interrupts",
+                "/proc/kcore",
+                "/proc/keys",
+                "/proc/latency_stats",
+                "/proc/sched_debug",
+                "/proc/scsi",
+                "/proc/timer_list",
+                "/proc/timer_stats",
+                "/sys/devices/virtual/powercap",
+                "/sys/firmware"
+            ],
+            "ReadonlyPaths": [
+                "/proc/bus",
+                "/proc/fs",
+                "/proc/irq",
+                "/proc/sys",
+                "/proc/sysrq-trigger"
+            ]
+        },
+        "GraphDriver": {
+            "Data": {
+                "ID": "bc405da8c18f9629f07d8a5b38341c3100d3d59c6b9c23ddacdb7cb238117cb8"
+            },
+            "Name": "btrfs"
+        },
+        "Mounts": [
+            {
+                "Type": "volume",
+                "Name": "whisper-ai_whisper_cache",
+                "Source": "/var/lib/docker/volumes/whisper-ai_whisper_cache/_data",
+                "Destination": "/app/.cache",
+                "Driver": "local",
+                "Mode": "z",
+                "RW": true,
+                "Propagation": ""
+            },
+            {
+                "Type": "volume",
+                "Name": "whisper-ai_whisper_models",
+                "Source": "/var/lib/docker/volumes/whisper-ai_whisper_models/_data",
+                "Destination": "/app/models",
+                "Driver": "local",
+                "Mode": "z",
+                "RW": true,
+                "Propagation": ""
+            },
+            {
+                "Type": "bind",
+                "Source": "/usr/share/zoneinfo",
+                "Destination": "/usr/share/zoneinfo",
+                "Mode": "ro",
+                "RW": false,
+                "Propagation": "rprivate"
+            }
+        ],
+        "Config": {
+            "Hostname": "bc405da8c18f",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": false,
+            "AttachStdout": false,
+            "AttachStderr": false,
+            "ExposedPorts": {
+                "9000/tcp": {}
+            },
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "TZ=America/Denver",
+                "HF_HOME=/app/.cache/huggingface",
+                "ASR_ENGINE=faster_whisper",
+                "ASR_CONDITION_ON_PREVIOUS_TEXT=true",
+                "XDG_CACHE_HOME=/app/.cache",
+                "MPLCONFIGDIR=/app/.cache/matplotlib",
+                "ASR_COMPUTE_TYPE=float16",
+                "ASR_MODEL_PATH=/app/models",
+                "ASR_MODEL=medium",
+                "ASR_TASK=transcribe",
+                "ASR_DEVICE=cuda",
+                "ASR_BEAM_SIZE=5",
+                "ASR_BEST_OF=5",
+                "PATH=/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/app/.venv/bin",
+                "NVARCH=x86_64",
+                "NVIDIA_REQUIRE_CUDA=cuda>=12.6 brand=unknown,driver>=470,driver<471 brand=grid,driver>=470,driver<471 brand=tesla,driver>=470,driver<471 brand=nvidia,driver>=470,driver<471 brand=quadro,driver>=470,driver<471 brand=quadrortx,driver>=470,driver<471 brand=nvidiartx,driver>=470,driver<471 brand=vapps,driver>=470,driver<471 brand=vpc,driver>=470,driver<471 brand=vcs,driver>=470,driver<471 brand=vws,driver>=470,driver<471 brand=cloudgaming,driver>=470,driver<471 brand=unknown,driver>=535,driver<536 brand=grid,driver>=535,driver<536 brand=tesla,driver>=535,driver<536 brand=nvidia,driver>=535,driver<536 brand=quadro,driver>=535,driver<536 brand=quadrortx,driver>=535,driver<536 brand=nvidiartx,driver>=535,driver<536 brand=vapps,driver>=535,driver<536 brand=vpc,driver>=535,driver<536 brand=vcs,driver>=535,driver<536 brand=vws,driver>=535,driver<536 brand=cloudgaming,driver>=535,driver<536 brand=unknown,driver>=550,driver<551 brand=grid,driver>=550,driver<551 brand=tesla,driver>=550,driver<551 brand=nvidia,driver>=550,driver<551 brand=quadro,driver>=550,driver<551 brand=quadrortx,driver>=550,driver<551 brand=nvidiartx,driver>=550,driver<551 brand=vapps,driver>=550,driver<551 brand=vpc,driver>=550,driver<551 brand=vcs,driver>=550,driver<551 brand=vws,driver>=550,driver<551 brand=cloudgaming,driver>=550,driver<551",
+                "NV_CUDA_CUDART_VERSION=12.6.77-1",
+                "CUDA_VERSION=12.6.3",
+                "LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64",
+                "NVIDIA_VISIBLE_DEVICES=all",
+                "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+                "PYTHON_VERSION=3.10",
+                "POETRY_VENV=/app/.venv"
+            ],
+            "Cmd": null,
+            "Image": "onerahmet/openai-whisper-asr-webservice:latest-gpu",
+            "Volumes": null,
+            "WorkingDir": "/app",
+            "Entrypoint": [
+                "whisper-asr-webservice"
+            ],
+            "Labels": {
+                "maintainer": "NVIDIA CORPORATION <cudatools@nvidia.com>",
+                "org.opencontainers.image.ref.name": "ubuntu",
+                "org.opencontainers.image.version": "22.04"
+            }
+        },
+        "NetworkSettings": {
+            "SandboxID": "9d9449ce30ea5aa38e20a0beb898a081cd8a7bc4f05f8c8162c71098716bc26c",
+            "SandboxKey": "/var/run/docker/netns/9d9449ce30ea",
+            "Ports": {
+                "9000/tcp": [
+                    {
+                        "HostIp": "0.0.0.0",
+                        "HostPort": "10300"
+                    },
+                    {
+                        "HostIp": "::",
+                        "HostPort": "10300"
+                    }
+                ]
+            },
+            "Networks": {
+                "bridge": {
+                    "IPAMConfig": null,
+                    "Links": null,
+                    "Aliases": null,
+                    "DriverOpts": null,
+                    "GwPriority": 0,
+                    "NetworkID": "867159e5be56662edab73e7371132c56cf36bba50ba6be2b5fe5025834602f5f",
+                    "EndpointID": "fcfcf106dfe05d2fa4d8fe7e524c7f35cdd98ac77cfa1db81e308d01cd5d77c9",
+                    "Gateway": "172.17.0.1",
+                    "IPAddress": "172.17.0.4",
+                    "MacAddress": "92:4e:31:58:cc:9d",
+                    "IPPrefixLen": 16,
+                    "IPv6Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "DNSNames": null
+                }
+            }
+        }
+    }
+]

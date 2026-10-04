@@ -1,0 +1,60 @@
+[
+    {
+        "Id": "sha256:0378ed42e0adc88cedf9f261c732ef23a045868e2830a424305e862516445262",
+        "RepoTags": [
+            "gitea.scottkey.me/argyle-labs/pbs:4.2"
+        ],
+        "RepoDigests": [
+            "gitea.scottkey.me/argyle-labs/pbs@sha256:9b6d1d8db31fc583d2307dffe2a1320d10dbd08f525c33f5546dd3e5dcd0ab5e"
+        ],
+        "Comment": "buildkit.dockerfile.v0",
+        "Created": "2026-09-26T03:24:18.388781261Z",
+        "Config": {
+            "ExposedPorts": {
+                "8007/tcp": {}
+            },
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "DEBIAN_FRONTEND=noninteractive"
+            ],
+            "Entrypoint": [
+                "/usr/bin/tini",
+                "--",
+                "/usr/local/bin/entrypoint.sh"
+            ],
+            "Volumes": {
+                "/etc/proxmox-backup": {},
+                "/var/log/proxmox-backup": {}
+            },
+            "Healthcheck": {
+                "Test": [
+                    "CMD-SHELL",
+                    "curl -fsk https://127.0.0.1:8007/api2/json/ping >/dev/null || exit 1"
+                ],
+                "Interval": 30000000000,
+                "Timeout": 5000000000,
+                "StartPeriod": 60000000000,
+                "Retries": 3
+            }
+        },
+        "Architecture": "amd64",
+        "Os": "linux",
+        "Size": 436080843,
+        "GraphDriver": {
+            "Data": null,
+            "Name": "btrfs"
+        },
+        "RootFS": {
+            "Type": "layers",
+            "Layers": [
+                "sha256:a6dc765193a52cbaede3c93a9ff48b9540948dd0774bbe7031fcb5847606f9ac",
+                "sha256:f69ddb7d3e34e92b7b594e47e5e120c5761c52d9f35d6ef5858b9ab8f51e73bc",
+                "sha256:78f28477fedac93071ecb3f9339f856c8e1de79cfa686eed694e6d8d57c49ca4",
+                "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+            ]
+        },
+        "Metadata": {
+            "LastTagTime": "0001-01-01T00:00:00Z"
+        }
+    }
+]

@@ -1,13 +1,15 @@
-//! Typed subset of `docker inspect` / `docker image inspect` JSON, and the
-//! projection of a live container into a [`RunSpec`].
+//! Typed subset of `docker inspect` / `docker image inspect` / `docker volume
+//! inspect` JSON, and the projection of a live container into a [`RunSpec`].
 //!
-//! Every facet that the template cannot carry is reported as `unsupported`
-//! rather than dropped, so the fidelity gate refuses a container it would
-//! otherwise silently change.
+//! The typed structs carry only what the template models. [`unmodelled`] walks
+//! the raw JSON and reports every other key whose value differs from docker's
+//! default (or, for image-derived config, from the image), so a facet this
+//! module does not know about blocks the adopt instead of being dropped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::serde_json::{Value, json};
 
 use super::spec::{self, MountKind, MountSpec, RunSpec};
 
@@ -19,7 +21,7 @@ pub struct ContainerInspect {
     pub id: String,
     #[serde(default)]
     pub name: String,
-    /// Image id (`sha256:…`) the container was created from.
+    /// Image id (`sha256:…`) the container runs.
     #[serde(default)]
     pub image: String,
     #[serde(default)]
@@ -80,49 +82,7 @@ pub struct HostConfig {
     #[serde(default)]
     pub device_requests: Option<Vec<DeviceRequest>>,
     #[serde(default)]
-    pub cap_add: Option<Vec<String>>,
-    #[serde(default)]
-    pub cap_drop: Option<Vec<String>>,
-    #[serde(default)]
-    pub devices: Option<Vec<DeviceMapping>>,
-    #[serde(default)]
-    pub ulimits: Option<Vec<Ulimit>>,
-    #[serde(default)]
-    pub sysctls: Option<BTreeMap<String, String>>,
-    #[serde(default)]
-    pub security_opt: Option<Vec<String>>,
-    #[serde(default)]
-    pub extra_hosts: Option<Vec<String>>,
-    #[serde(default)]
-    pub dns: Option<Vec<String>>,
-    #[serde(default)]
-    pub dns_search: Option<Vec<String>>,
-    #[serde(default)]
-    pub group_add: Option<Vec<String>>,
-    #[serde(default)]
-    pub links: Option<Vec<String>>,
-    #[serde(default)]
-    pub volumes_from: Option<Vec<String>>,
-    #[serde(default)]
-    pub memory: Option<i64>,
-    #[serde(default)]
-    pub nano_cpus: Option<i64>,
-    #[serde(default)]
-    pub cpuset_cpus: Option<String>,
-    #[serde(default)]
-    pub shm_size: Option<i64>,
-    #[serde(default)]
-    pub pid_mode: Option<String>,
-    #[serde(default)]
-    pub ipc_mode: Option<String>,
-    #[serde(default)]
-    pub userns_mode: Option<String>,
-    #[serde(default)]
-    pub runtime: Option<String>,
-    #[serde(default)]
-    pub init: Option<bool>,
-    #[serde(default)]
-    pub readonly_rootfs: Option<bool>,
+    pub pids_limit: Option<i64>,
 }
 
 #[orca_struct]
@@ -172,24 +132,6 @@ pub struct DeviceRequest {
 #[orca_struct]
 #[derive(Debug, Clone, Default)]
 #[serde(rename_all = "PascalCase")]
-pub struct DeviceMapping {
-    #[serde(default)]
-    pub path_on_host: String,
-    #[serde(default)]
-    pub path_in_container: String,
-}
-
-#[orca_struct]
-#[derive(Debug, Clone, Default)]
-#[serde(rename_all = "PascalCase")]
-pub struct Ulimit {
-    #[serde(default)]
-    pub name: String,
-}
-
-#[orca_struct]
-#[derive(Debug, Clone, Default)]
-#[serde(rename_all = "PascalCase")]
 pub struct MountPoint {
     #[serde(default, rename = "Type")]
     pub kind: String,
@@ -225,22 +167,20 @@ pub struct NetworkSettings {
 
 #[orca_struct]
 #[derive(Debug, Clone, Default)]
+#[serde(rename_all = "PascalCase")]
 pub struct NetworkEndpoint {
-    #[serde(default, rename = "IPAMConfig")]
-    pub ipam_config: Option<IpamConfig>,
-}
-
-#[orca_struct]
-#[derive(Debug, Clone, Default)]
-pub struct IpamConfig {
-    #[serde(default, rename = "IPv4Address")]
-    pub ipv4_address: Option<String>,
+    #[serde(default)]
+    pub aliases: Option<Vec<String>>,
 }
 
 #[orca_struct]
 #[derive(Debug, Clone, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct ImageInspect {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub repo_tags: Option<Vec<String>>,
     #[serde(default)]
     pub config: ImageConfig,
 }
@@ -263,6 +203,22 @@ pub struct ImageConfig {
     pub labels: Option<BTreeMap<String, String>>,
 }
 
+#[orca_struct]
+#[derive(Debug, Clone, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct VolumeInspect {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub driver: String,
+    #[serde(default)]
+    pub mountpoint: String,
+    #[serde(default)]
+    pub labels: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub options: Option<BTreeMap<String, String>>,
+}
+
 /// Compose project label docker compose stamps on every container it creates.
 pub const COMPOSE_PROJECT: &str = "com.docker.compose.project";
 /// Compose working-directory label (the stack directory).
@@ -271,6 +227,10 @@ pub const COMPOSE_WORKING_DIR: &str = "com.docker.compose.project.working_dir";
 pub const MANAGED_LABEL: &str = "net.unraid.docker.managed";
 /// Label carrying the icon URL Unraid's Docker tab shows.
 pub const ICON_LABEL: &str = "net.unraid.docker.icon";
+/// Label docker puts on volumes it created for an anonymous mount.
+pub const ANONYMOUS_VOLUME_LABEL: &str = "com.docker.volume.anonymous";
+/// Where the `local` volume driver keeps a volume's data.
+pub const VOLUMES_ROOT: &str = "/var/lib/docker/volumes";
 
 impl ContainerInspect {
     /// Container name without docker's leading `/`.
@@ -304,18 +264,27 @@ impl ContainerInspect {
     }
 }
 
-/// A 64-hex volume name is one docker generated for an anonymous volume.
-pub fn is_anonymous_volume(name: &str) -> bool {
-    name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
+impl VolumeInspect {
+    pub fn is_anonymous(&self) -> bool {
+        self.labels
+            .as_ref()
+            .is_some_and(|l| l.contains_key(ANONYMOUS_VOLUME_LABEL))
+    }
+
+    /// The only data path a `local` volume may have.
+    pub fn expected_mountpoint(name: &str) -> String {
+        format!("{VOLUMES_ROOT}/{name}/_data")
+    }
 }
 
-fn nonempty<T>(v: &Option<Vec<T>>) -> bool {
-    v.as_ref().is_some_and(|v| !v.is_empty())
+/// Image env entries (`K=V`), the set a container inherits without asking.
+pub fn baked_env(img: &ImageInspect) -> BTreeSet<String> {
+    img.config.env.iter().flatten().cloned().collect()
 }
 
-/// The live container as a [`RunSpec`], plus every facet the template cannot
-/// express. Image-baked env/labels and Unraid-injected items are excluded so
-/// the spec carries only what the operator set.
+/// The live container as a [`RunSpec`], plus facets the typed model reads but
+/// the template cannot express. Image-baked env/labels and Unraid-injected
+/// items are excluded so the spec carries only what the operator set.
 pub fn live_spec(c: &ContainerInspect, img: &ImageInspect) -> (RunSpec, Vec<String>) {
     let mut unsupported = Vec::new();
     let hc = &c.host_config;
@@ -323,27 +292,17 @@ pub fn live_spec(c: &ContainerInspect, img: &ImageInspect) -> (RunSpec, Vec<Stri
     if network.starts_with("container:") {
         unsupported.push(format!("network mode {network}"));
     }
-    if let Some(nets) = &c.network_settings.networks {
-        if nets.len() > 1 {
-            let names: Vec<&str> = nets.keys().map(String::as_str).collect();
-            unsupported.push(format!(
-                "attached to multiple networks [{}]",
-                names.join(", ")
-            ));
-        }
-        for (net, ep) in nets {
-            if let Some(ip) = ep
-                .ipam_config
-                .as_ref()
-                .and_then(|i| i.ipv4_address.as_deref())
-                .filter(|ip| !ip.is_empty())
-            {
-                unsupported.push(format!("static IP {ip} on network {net}"));
-            }
-        }
+    if let Some(nets) = &c.network_settings.networks
+        && nets.len() > 1
+    {
+        let names: Vec<&str> = nets.keys().map(String::as_str).collect();
+        unsupported.push(format!(
+            "attached to multiple networks [{}]",
+            names.join(", ")
+        ));
     }
 
-    let mut ports = std::collections::BTreeSet::new();
+    let mut ports = BTreeSet::new();
     for (cport, binds) in hc.port_bindings.iter().flatten() {
         for b in binds.iter().flatten() {
             if b.host_port.is_empty() {
@@ -354,23 +313,22 @@ pub fn live_spec(c: &ContainerInspect, img: &ImageInspect) -> (RunSpec, Vec<Stri
         }
     }
 
-    let baked_env: std::collections::HashSet<&str> = img
-        .config
-        .env
-        .iter()
-        .flatten()
-        .map(String::as_str)
-        .collect();
+    let baked = baked_env(img);
     let mut env = BTreeMap::new();
+    let mut tz = String::new();
     for kv in c.config.env.iter().flatten() {
-        if baked_env.contains(kv.as_str()) {
+        let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
+        if k == "TZ" {
+            tz = v.to_string();
             continue;
         }
-        let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
+        if baked.contains(kv) {
+            continue;
+        }
         env.insert(k.to_string(), v.to_string());
     }
 
-    let mut mounts = std::collections::BTreeSet::new();
+    let mut mounts = BTreeSet::new();
     for m in &c.mounts {
         match m.kind.as_str() {
             "volume" => mounts.insert(MountSpec {
@@ -394,11 +352,10 @@ pub fn live_spec(c: &ContainerInspect, img: &ImageInspect) -> (RunSpec, Vec<Stri
         };
     }
 
-    let hostname = {
-        let h = &c.config.hostname;
-        let short_id = c.id.get(..12).unwrap_or(&c.id);
-        (!h.is_empty() && h != short_id && network != "host").then(|| h.clone())
-    };
+    let short_id = c.id.get(..12).unwrap_or(&c.id);
+    let h = &c.config.hostname;
+    let hostname = (!h.is_empty() && network != "host").then(|| h.clone());
+    let hostname_is_default = hostname.as_deref() == Some(short_id);
 
     let mut gpus = None;
     for dr in hc.device_requests.iter().flatten() {
@@ -458,59 +415,6 @@ pub fn live_spec(c: &ContainerInspect, img: &ImageInspect) -> (RunSpec, Vec<Stri
         unsupported.push("tty/stdin allocation".to_string());
     }
 
-    for (what, set) in [
-        ("cap-add", nonempty(&hc.cap_add)),
-        ("cap-drop", nonempty(&hc.cap_drop)),
-        ("devices", nonempty(&hc.devices)),
-        ("ulimits", nonempty(&hc.ulimits)),
-        ("security-opt", nonempty(&hc.security_opt)),
-        ("extra hosts", nonempty(&hc.extra_hosts)),
-        ("dns", nonempty(&hc.dns)),
-        ("dns-search", nonempty(&hc.dns_search)),
-        ("group-add", nonempty(&hc.group_add)),
-        ("links", nonempty(&hc.links)),
-        ("volumes-from", nonempty(&hc.volumes_from)),
-        (
-            "sysctls",
-            hc.sysctls.as_ref().is_some_and(|s| !s.is_empty()),
-        ),
-        ("memory limit", hc.memory.unwrap_or(0) != 0),
-        ("cpu limit", hc.nano_cpus.unwrap_or(0) != 0),
-        (
-            "cpuset",
-            hc.cpuset_cpus.as_deref().is_some_and(|s| !s.is_empty()),
-        ),
-        (
-            "shm-size",
-            !matches!(hc.shm_size, None | Some(0) | Some(67_108_864)),
-        ),
-        (
-            "pid mode",
-            hc.pid_mode.as_deref().is_some_and(|s| !s.is_empty()),
-        ),
-        (
-            "ipc mode",
-            !matches!(
-                hc.ipc_mode.as_deref(),
-                None | Some("") | Some("private") | Some("shareable")
-            ),
-        ),
-        (
-            "userns mode",
-            hc.userns_mode.as_deref().is_some_and(|s| !s.is_empty()),
-        ),
-        (
-            "runtime",
-            !matches!(hc.runtime.as_deref(), None | Some("") | Some("runc")),
-        ),
-        ("init", hc.init == Some(true)),
-        ("read-only rootfs", hc.readonly_rootfs == Some(true)),
-    ] {
-        if set {
-            unsupported.push(format!("unsupported host config: {what}"));
-        }
-    }
-
     let log_driver = if hc.log_config.kind.is_empty() {
         spec::DEFAULT_LOG_DRIVER.to_string()
     } else {
@@ -523,17 +427,183 @@ pub fn live_spec(c: &ContainerInspect, img: &ImageInspect) -> (RunSpec, Vec<Stri
         network,
         privileged: hc.privileged,
         hostname,
+        hostname_is_default,
         ports,
         env,
+        tz,
         mounts,
         tmpfs: hc.tmpfs.clone().unwrap_or_default(),
         log_driver,
         log_opts: hc.log_config.config.clone().unwrap_or_default(),
         gpus,
         restart,
+        pids_limit: hc.pids_limit.filter(|n| *n > 0),
         labels,
         cmd,
         other: Vec::new(),
     };
     (spec.normalized(), unsupported)
+}
+
+/// HostConfig keys the typed model translates.
+const MODELLED_HOST: &[&str] = &[
+    "Binds",
+    "LogConfig",
+    "NetworkMode",
+    "PortBindings",
+    "RestartPolicy",
+    "Privileged",
+    "Tmpfs",
+    "DeviceRequests",
+    "PidsLimit",
+    "Mounts",
+];
+/// Daemon-populated HostConfig keys that do not express operator intent.
+const IGNORED_HOST: &[&str] = &["MaskedPaths", "ReadonlyPaths", "ContainerIDFile"];
+/// Config keys the typed model translates or that only mirror other state.
+const MODELLED_CONFIG: &[&str] = &[
+    "Hostname",
+    "Env",
+    "Cmd",
+    "Image",
+    "Entrypoint",
+    "Labels",
+    "User",
+    "WorkingDir",
+    "Tty",
+    "OpenStdin",
+    "AttachStdin",
+    "AttachStdout",
+    "AttachStderr",
+    "StdinOnce",
+    "ArgsEscaped",
+    // Mirrors image VOLUMEs plus `-v /path` mounts, which appear in Mounts.
+    "Volumes",
+    "ExposedPorts",
+];
+
+fn is_zero(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Bool(b) => !b,
+        Value::Number(n) => n.as_f64() == Some(0.0),
+        Value::String(s) => s.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+    }
+}
+
+/// HostConfig defaults that are not zero values.
+fn host_default(key: &str, v: &Value) -> bool {
+    match key {
+        "ConsoleSize" => v == &json!([0, 0]),
+        "ShmSize" => v == &json!(67_108_864),
+        "Runtime" => v == &json!("runc"),
+        "IpcMode" => v == &json!("private"),
+        "CgroupnsMode" => v == &json!("private"),
+        _ => false,
+    }
+}
+
+const BIND_OPTS: &[&str] = &[
+    "rw", "ro", "z", "Z", "rprivate", "private", "rslave", "slave", "rshared", "shared",
+];
+
+/// Every operator-set facet in the raw inspect JSON that the template model
+/// does not carry. `compose_moving` suppresses compose's own network aliases,
+/// which the move to `bridge` drops deliberately.
+pub fn unmodelled(container: &Value, image: &Value, compose_moving: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(hc) = container.get("HostConfig").and_then(Value::as_object) {
+        for (k, v) in hc {
+            if MODELLED_HOST.contains(&k.as_str()) || IGNORED_HOST.contains(&k.as_str()) {
+                continue;
+            }
+            if !is_zero(v) && !host_default(k, v) {
+                out.push(format!("HostConfig.{k}={v}"));
+            }
+        }
+        for b in hc
+            .get("Binds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let opts = b.splitn(3, ':').nth(2).unwrap_or("");
+            for o in opts.split(',').filter(|o| !o.is_empty()) {
+                if !BIND_OPTS.contains(&o) {
+                    out.push(format!("bind option {o:?} in {b:?}"));
+                }
+            }
+        }
+        for m in hc
+            .get("Mounts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+        {
+            for (k, v) in m {
+                let ok = match k.as_str() {
+                    "Type" | "Source" | "Target" | "ReadOnly" | "Consistency" => true,
+                    "BindOptions" => v.as_object().is_none_or(|o| {
+                        o.iter().all(|(bk, bv)| bk == "Propagation" || is_zero(bv))
+                    }),
+                    _ => is_zero(v),
+                };
+                if !ok {
+                    out.push(format!("mount option {k}={v}"));
+                }
+            }
+        }
+    }
+
+    let img_cfg = image.get("Config");
+    if let Some(cfg) = container.get("Config").and_then(Value::as_object) {
+        for (k, v) in cfg {
+            if MODELLED_CONFIG.contains(&k.as_str()) || is_zero(v) {
+                continue;
+            }
+            if img_cfg.and_then(|i| i.get(k)) == Some(v) {
+                continue;
+            }
+            out.push(format!("Config.{k}={v}"));
+        }
+        let image_exposed = img_cfg.and_then(|i| i.get("ExposedPorts"));
+        let published = container
+            .pointer("/HostConfig/PortBindings")
+            .and_then(Value::as_object);
+        for p in cfg
+            .get("ExposedPorts")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|o| o.keys())
+        {
+            let in_image = image_exposed.and_then(|e| e.get(p)).is_some();
+            let in_published = published.is_some_and(|b| b.contains_key(p));
+            if !in_image && !in_published {
+                out.push(format!(
+                    "exposed port {p} not published and not from the image"
+                ));
+            }
+        }
+    }
+
+    if let Some(nets) = container
+        .pointer("/NetworkSettings/Networks")
+        .and_then(Value::as_object)
+    {
+        for (net, ep) in nets {
+            for key in ["IPAMConfig", "Links", "DriverOpts"] {
+                if let Some(v) = ep.get(key).filter(|v| !is_zero(v)) {
+                    out.push(format!("network {net} {key}={v}"));
+                }
+            }
+            if !compose_moving && let Some(v) = ep.get("Aliases").filter(|v| !is_zero(v)) {
+                out.push(format!("network {net} Aliases={v}"));
+            }
+        }
+    }
+    out
 }
