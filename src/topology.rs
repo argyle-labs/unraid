@@ -15,11 +15,11 @@
 //! so it can't blank out claims from the others. Returns empty silently
 //! when no endpoints are registered.
 
+use crate::Client;
 use crate::endpoint::{EndpointRow, endpoint_db};
 use crate::generated::v7_3_1::docker_containers::{
     ContainerState, DockerContainersDockerContainers,
 };
-use crate::{Client, Config};
 use plugin_toolkit::contract::TopologyClaim;
 use plugin_toolkit::contract::topology::TopologyCollector;
 use plugin_toolkit::prelude::*;
@@ -69,7 +69,7 @@ pub async fn collect_claims() -> Result<Vec<TopologyClaim>> {
 }
 
 async fn collect_for_endpoint(ep: &EndpointRow) -> Result<Vec<TopologyClaim>> {
-    let cfg = Config::new(ep.base_url.clone(), ep.api_key.clone()).insecure(ep.insecure);
+    let cfg = crate::endpoint::resolve_config(ep).await?;
     let data = Client::new(cfg).docker_containers().await?;
     Ok(data
         .docker

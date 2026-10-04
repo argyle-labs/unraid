@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use plugin_toolkit::prelude::*;
 
-use crate::endpoint::endpoint_db;
+use crate::endpoint::{self, endpoint_db};
 use crate::{Client, Config, schema_pull};
 
 /// Resolve a [`Client`] for an auto-generated surface tool (`crate::surface`).
@@ -51,9 +51,7 @@ pub(crate) async fn surface_client(
             }
         }
     };
-    Ok(Client::new(
-        Config::new(row.base_url, row.api_key).insecure(row.insecure),
-    ))
+    Ok(Client::new(endpoint::resolve_config(&row).await?))
 }
 
 #[orca_struct(args)]

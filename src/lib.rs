@@ -98,25 +98,28 @@ impl ApiVersion {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub base_url: String,
+    /// Resolved URL of the host's GraphQL front (`scheme://host[:port]`); the
+    /// `/graphql` path is appended. Registered endpoints resolve this from
+    /// their routes — see [`crate::endpoint::resolve_config`].
+    pub url: String,
     /// Unraid API key, sent as the `x-api-key` header. Generate one in
     /// Settings → Management Access → API Keys on the Unraid web UI.
     /// The `Authorization: Bearer` header is ignored by the Unraid GraphQL
     /// endpoint — calls without `x-api-key` fall through to browser-session
     /// CSRF auth and fail with `Invalid CSRF token`.
     pub api_key: String,
+    /// Sent as `x-csrf-token` when set. The unix-socket path to the API
+    /// rejects an api-key-only request with `Invalid CSRF token`.
+    pub csrf_token: Option<String>,
     pub insecure: bool,
 }
 
 impl Config {
-    /// Local nginx proxy for the Unraid GraphQL API — the reachable URL for a
-    /// colocated collector when no explicit `base_url` is set.
-    pub const LOCAL_BASE_URL: &'static str = "http://127.0.0.1";
-
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+    pub fn new(url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            base_url: base_url.into(),
+            url: url.into(),
             api_key: api_key.into(),
+            csrf_token: None,
             insecure: false,
         }
     }
@@ -126,25 +129,23 @@ impl Config {
         self
     }
 
-    fn endpoint(&self) -> String {
-        format!("{}/graphql", self.base())
+    pub fn csrf_token(mut self, token: Option<String>) -> Self {
+        self.csrf_token = token;
+        self
     }
 
-    /// The base URL to build requests against. On Unraid the GraphQL API is
-    /// reached through the local nginx proxy at `http://127.0.0.1` (which
-    /// fronts the root-owned unix socket), and the topology collector runs
-    /// COLOCATED on the box — so an empty/unset `base_url` resolves to that
-    /// loopback default instead of yielding a relative URL. This also keeps
-    /// the collector working if the stored `base_url` is ever lost (an
-    /// endpoint's URL is not load-bearing when the daemon is on the same host).
-    /// An explicit `base_url` (e.g. a remote `from` probe) is honored as-is.
-    fn base(&self) -> &str {
-        let trimmed = self.base_url.trim().trim_end_matches('/');
-        if trimmed.is_empty() {
-            Self::LOCAL_BASE_URL
-        } else {
-            trimmed
+    fn endpoint(&self) -> String {
+        format!("{}/graphql", self.url.trim().trim_end_matches('/'))
+    }
+
+    /// Request headers every GraphQL call carries.
+    pub(crate) fn headers(&self) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        headers.insert("x-api-key".to_string(), self.api_key.clone());
+        if let Some(token) = &self.csrf_token {
+            headers.insert("x-csrf-token".to_string(), token.clone());
         }
+        headers
     }
 }
 
@@ -219,12 +220,9 @@ impl Client {
 
     /// Build a client pinned to a specific [`ApiVersion`].
     pub fn new_with(cfg: Config, api: ApiVersion) -> Self {
-        let endpoint = cfg.endpoint();
-        let mut headers = HashMap::new();
-        headers.insert("x-api-key".to_string(), cfg.api_key);
         Self {
-            endpoint,
-            headers,
+            endpoint: cfg.endpoint(),
+            headers: cfg.headers(),
             insecure: cfg.insecure,
             api,
             gql: GraphQlClient::new(),
@@ -600,26 +598,29 @@ mod tests {
         assert!(c.insecure);
     }
 
-    #[test]
-    fn endpoint_defaults_empty_base_url_to_loopback() {
-        // Colocated collector: an empty/blank stored base_url must resolve to
-        // the local nginx proxy, not yield a relative URL.
-        assert_eq!(
-            Config::new("", "tok").endpoint(),
-            "http://127.0.0.1/graphql"
-        );
-        assert_eq!(
-            Config::new("   ", "tok").endpoint(),
-            "http://127.0.0.1/graphql"
-        );
+    #[tokio::test]
+    async fn csrf_token_is_sent_when_set() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(header("x-api-key", "tok"))
+            .and(header("x-csrf-token", "csrf"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "vars": { "version": "7.3.1" } }
+            })))
+            .mount(&server)
+            .await;
+        let v = Client::new(cfg(server.uri()).csrf_token(Some("csrf".into())))
+            .probe_version()
+            .await
+            .unwrap();
+        assert_eq!(v.as_deref(), Some("7.3.1"));
     }
 
     #[test]
-    fn endpoint_honors_explicit_base_url() {
-        // A real base_url (e.g. a remote `from` probe) is used as-is.
-        assert_eq!(
-            Config::new("http://10.0.0.10", "tok").endpoint(),
-            "http://10.0.0.10/graphql"
-        );
+    fn headers_omit_csrf_when_unset() {
+        let h = cfg("http://10.0.0.10".into()).headers();
+        assert_eq!(h.get("x-api-key").map(String::as_str), Some("tok"));
+        assert!(!h.contains_key("x-csrf-token"));
     }
 }

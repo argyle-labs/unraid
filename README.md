@@ -25,7 +25,7 @@ orca talks to a live Unraid host through its **GraphQL API** (typed queries, no 
 
 | Command | What it does |
 | --- | --- |
-| `unraid.list` / `unraid.detail` / `unraid.create` / `unraid.update` / `unraid.delete` | Endpoint registry — register the Unraid hosts orca reads (base URL, `x-api-key`, self-signed TLS). The API key is stored secret-side. |
+| `unraid.list` / `unraid.detail` / `unraid.create` / `unraid.update` / `unraid.delete` | Endpoint registry — register the Unraid hosts orca reads (`--route`s, `--api-key`, self-signed TLS). The API key is stored in the secrets domain (`unraid.<endpoint>.api_key`), never on the endpoint row. |
 | `unraid.schema` | Inspect the embedded GraphQL schemas, pull a fresh introspection from a live host, or check drift between live and committed. |
 | `unraid.<operation>` | **Auto-generated, one per GraphQL operation** — e.g. `unraid.array_status`, `unraid.shares`, `unraid.docker_containers`, `unraid.parity_history`. Args carry the operation's typed variables; the return is its typed response. Mutations require `role = "admin"`. See below. |
 | `unraid.plugins` / `unraid.installed_plugins` / `unraid.add_plugin` / `unraid.remove_plugin` / `unraid.install_plugin` / `unraid.plugin_install_operations` | **Plugin management** over the Unraid plugin manager: list (with versions), add, remove, and install/update by `.plg` URL. `unraid.install_plugin` with `forced: true` is the update path — because the plugin manager runs as root and owns the USB `/boot` write, routing orca's **own** update through it is what makes a self-update survive reboot (vs. the unprivileged daemon, which can't write flash). Installs are async — poll `unraid.plugin_install_operations` for `QUEUED → RUNNING → SUCCEEDED`. |
@@ -35,6 +35,14 @@ orca talks to a live Unraid host through its **GraphQL API** (typed queries, no 
 Every `.graphql` operation in `queries/` becomes an `#[orca_tool]` at build time (`build/surface.rs` walks the codegen'd query modules). Add a `.graphql` file → a new typed tool appears next build; nothing is hand-wired. Query operations surface as read tools, mutations as `role = "admin"` tools, and the full request/response shape is runtime-introspectable via each tool's arg/output JSON Schema.
 
 Each tool resolves its connection in this order: an explicit `from` + `api_key` override wins; otherwise the named `endpoint` from the registry; otherwise, the sole registered endpoint when exactly one exists.
+
+A registered endpoint is addressed by its `routes`, tried in order (enabled ones only, last-good first). An endpoint with no routes is treated as colocated and reached on loopback (`http://127.0.0.1`, nginx in front of the API's unix socket). When `/var/local/emhttp/var.ini` is readable, its `csrf_token` is sent as `x-csrf-token` alongside `x-api-key`.
+
+```sh
+orca unraid.create --name tower --api-key "$KEY"                                  # colocated
+orca unraid.create --name tower --api-key "$KEY" --route lan_v4=http://10.0.0.5   # remote
+orca unraid.update --name tower --api-key "$NEW_KEY"                               # rotate the key
+```
 
 **Topology backend** — a `topology` collector (registered via the toolkit's `topology_backend_def`) emits one `container` claim per Docker workload per enabled endpoint, so Unraid hosts and the containers they run surface in orca's systems graph. The GraphQL API is the read path because Unraid's Docker socket is `root:docker`-only.
 
@@ -47,7 +55,7 @@ Mint one on the host — `unraid-api apikey --create --name "orca collector"` �
 ## Layout
 
 - `src/lib.rs` — typed GraphQL client facade (per-version schema routing, drift detection).
-- `src/endpoint.rs` — `#[endpoint_resource]` registry: the `unraid.{list,detail,create,update,delete}` tools.
+- `src/endpoint.rs` — `#[endpoint_resource]` registry (`unraid.{list,detail,create,update,delete}`) and route + secret resolution into a client `Config`.
 - `src/tools.rs` — the `unraid.schema` tool (pull / drift-check).
 - `src/topology.rs` — the `TopologyClaim` collector (Docker workloads via GraphQL).
 - `src/registration.rs` — advertises the `topology` backend and dispatches its `collect_claims` op.

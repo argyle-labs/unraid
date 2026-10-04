@@ -112,10 +112,7 @@ pub async fn schema_pull(cfg: Config, dir: &Path) -> Result<SchemaPull> {
 }
 
 async fn run_introspection(cfg: &Config) -> Result<String> {
-    let endpoint = format!("{}/graphql", cfg.base_url.trim_end_matches('/'));
-    let mut headers = std::collections::HashMap::new();
-    headers.insert("x-api-key".to_string(), cfg.api_key.clone());
-    introspect_raw(&endpoint, &headers, cfg.insecure).await
+    introspect_raw(&cfg.endpoint(), &cfg.headers(), cfg.insecure).await
 }
 
 /// Run the standard GraphQL introspection query against `endpoint` and
