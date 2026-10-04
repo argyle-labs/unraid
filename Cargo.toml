@@ -40,11 +40,8 @@ path = "src/main.rs"
 # This is a subprocess `[[bin]]` plugin that talks to the orca daemon over its
 # Unix socket via `serve_tool_plugin!` from plugin-toolkit — no FFI/cdylib.
 #
-# Pinned to the orca rc tag that carries the plugin-toolkit surface. REQUIRES an
-# rc >= the one containing the codegen path-rewrite + `plugin_toolkit::hash` +
-# `graphql::GraphQLQuery` re-export (the single-dep toolkit slice). Until that rc
-# is cut, the committed `[patch]` in `.cargo/config.toml` resolves these to the
-# local in-tree toolkit at ../orca.
+# Tracks orca `main` via the public GitHub git source; the committed Cargo.lock
+# pins the resolved commit and CI builds `--locked`.
 # `default-features = false`: the toolkit's default is `full`, which is the
 # DAEMON profile (in-process host-side proxies, db, notify, containers, openapi,
 # jemalloc-stats). A subprocess plugin needs none of that, and taking it linked
