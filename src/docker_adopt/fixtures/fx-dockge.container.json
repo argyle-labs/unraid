@@ -1,0 +1,301 @@
+[
+    {
+        "Id": "a64ac9763e47b5f486e7ca3a6abe2a70d7af014e82aa7851a6aaa578b2e80611",
+        "Created": "2026-10-04T15:02:44.628405639Z",
+        "Path": "/usr/bin/dumb-init",
+        "Args": [
+            "--",
+            "tsx",
+            "./backend/index.ts"
+        ],
+        "State": {
+            "Status": "running",
+            "Running": true,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 3337334,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "2026-10-04T15:02:44.757385388Z",
+            "FinishedAt": "0001-01-01T00:00:00Z",
+            "Health": {
+                "Status": "healthy",
+                "FailingStreak": 0,
+                "Log": [
+                    {
+                        "Start": "2026-10-04T09:38:51.569319354-06:00",
+                        "End": "2026-10-04T09:38:51.614067781-06:00",
+                        "ExitCode": 0,
+                        "Output": "2026/10/04 09:38:51 Checking http://127.0.0.1:5001\n2026/10/04 09:38:51 Health Check OK [Res Code: 200]\n"
+                    },
+                    {
+                        "Start": "2026-10-04T09:39:51.615434692-06:00",
+                        "End": "2026-10-04T09:39:51.657893481-06:00",
+                        "ExitCode": 0,
+                        "Output": "2026/10/04 09:39:51 Checking http://127.0.0.1:5001\n2026/10/04 09:39:51 Health Check OK [Res Code: 200]\n"
+                    },
+                    {
+                        "Start": "2026-10-04T09:40:51.659301984-06:00",
+                        "End": "2026-10-04T09:40:51.711685069-06:00",
+                        "ExitCode": 0,
+                        "Output": "2026/10/04 09:40:51 Checking http://127.0.0.1:5001\n2026/10/04 09:40:51 Health Check OK [Res Code: 200]\n"
+                    },
+                    {
+                        "Start": "2026-10-04T09:41:51.71196736-06:00",
+                        "End": "2026-10-04T09:41:51.748137014-06:00",
+                        "ExitCode": 0,
+                        "Output": "2026/10/04 09:41:51 Checking http://127.0.0.1:5001\n2026/10/04 09:41:51 Health Check OK [Res Code: 200]\n"
+                    },
+                    {
+                        "Start": "2026-10-04T09:42:51.748629245-06:00",
+                        "End": "2026-10-04T09:42:51.792619007-06:00",
+                        "ExitCode": 0,
+                        "Output": "2026/10/04 09:42:51 Checking http://127.0.0.1:5001\n2026/10/04 09:42:51 Health Check OK [Res Code: 200]\n"
+                    }
+                ]
+            }
+        },
+        "Image": "sha256:e85d511b2a8b883da8a1ac2fde39ecddacdc011734e9f89a14b7798d82d5a0d3",
+        "ResolvConfPath": "/var/lib/docker/containers/a64ac9763e47b5f486e7ca3a6abe2a70d7af014e82aa7851a6aaa578b2e80611/resolv.conf",
+        "HostnamePath": "/var/lib/docker/containers/a64ac9763e47b5f486e7ca3a6abe2a70d7af014e82aa7851a6aaa578b2e80611/hostname",
+        "HostsPath": "/var/lib/docker/containers/a64ac9763e47b5f486e7ca3a6abe2a70d7af014e82aa7851a6aaa578b2e80611/hosts",
+        "LogPath": "/var/lib/docker/containers/a64ac9763e47b5f486e7ca3a6abe2a70d7af014e82aa7851a6aaa578b2e80611/a64ac9763e47b5f486e7ca3a6abe2a70d7af014e82aa7851a6aaa578b2e80611-json.log",
+        "Name": "/dockge",
+        "RestartCount": 0,
+        "Driver": "btrfs",
+        "Platform": "linux",
+        "MountLabel": "",
+        "ProcessLabel": "",
+        "AppArmorProfile": "",
+        "ExecIDs": null,
+        "HostConfig": {
+            "Binds": [
+                "/var/run/docker.sock:/var/run/docker.sock:rw",
+                "/mnt/user/appdata/dockge/data:/app/data:rw",
+                "/mnt/user/appdata/dockge/stacks:/mnt/user/appdata/dockge/stacks:rw"
+            ],
+            "ContainerIDFile": "",
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {
+                    "max-file": "1",
+                    "max-size": "50m"
+                }
+            },
+            "NetworkMode": "bridge",
+            "PortBindings": {
+                "5001/tcp": [
+                    {
+                        "HostIp": "",
+                        "HostPort": "5001"
+                    }
+                ]
+            },
+            "RestartPolicy": {
+                "Name": "no",
+                "MaximumRetryCount": 0
+            },
+            "AutoRemove": false,
+            "VolumeDriver": "",
+            "VolumesFrom": null,
+            "ConsoleSize": [
+                0,
+                0
+            ],
+            "CapAdd": null,
+            "CapDrop": null,
+            "CgroupnsMode": "private",
+            "Dns": null,
+            "DnsOptions": [],
+            "DnsSearch": [],
+            "ExtraHosts": null,
+            "GroupAdd": null,
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": null,
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": false,
+            "PublishAllPorts": false,
+            "ReadonlyRootfs": false,
+            "SecurityOpt": null,
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": 67108864,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": 0,
+            "NanoCpus": 0,
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": [],
+            "BlkioDeviceReadBps": [],
+            "BlkioDeviceWriteBps": [],
+            "BlkioDeviceReadIOps": [],
+            "BlkioDeviceWriteIOps": [],
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": [],
+            "DeviceCgroupRules": null,
+            "DeviceRequests": null,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "MemorySwappiness": null,
+            "OomKillDisable": null,
+            "PidsLimit": 2048,
+            "Ulimits": [],
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "MaskedPaths": [
+                "/proc/acpi",
+                "/proc/asound",
+                "/proc/interrupts",
+                "/proc/kcore",
+                "/proc/keys",
+                "/proc/latency_stats",
+                "/proc/sched_debug",
+                "/proc/scsi",
+                "/proc/timer_list",
+                "/proc/timer_stats",
+                "/sys/devices/virtual/powercap",
+                "/sys/firmware"
+            ],
+            "ReadonlyPaths": [
+                "/proc/bus",
+                "/proc/fs",
+                "/proc/irq",
+                "/proc/sys",
+                "/proc/sysrq-trigger"
+            ]
+        },
+        "GraphDriver": {
+            "Data": {
+                "ID": "a64ac9763e47b5f486e7ca3a6abe2a70d7af014e82aa7851a6aaa578b2e80611"
+            },
+            "Name": "btrfs"
+        },
+        "Mounts": [
+            {
+                "Type": "bind",
+                "Source": "/mnt/user/appdata/dockge/stacks",
+                "Destination": "/mnt/user/appdata/dockge/stacks",
+                "Mode": "rw",
+                "RW": true,
+                "Propagation": "rprivate"
+            },
+            {
+                "Type": "bind",
+                "Source": "/var/run/docker.sock",
+                "Destination": "/var/run/docker.sock",
+                "Mode": "rw",
+                "RW": true,
+                "Propagation": "rprivate"
+            },
+            {
+                "Type": "bind",
+                "Source": "/mnt/user/appdata/dockge/data",
+                "Destination": "/app/data",
+                "Mode": "rw",
+                "RW": true,
+                "Propagation": "rprivate"
+            }
+        ],
+        "Config": {
+            "Hostname": "a64ac9763e47",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": false,
+            "AttachStdout": false,
+            "AttachStderr": false,
+            "ExposedPorts": {
+                "5001/tcp": {}
+            },
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "TZ=America/Denver",
+                "HOST_OS=Unraid",
+                "HOST_HOSTNAME=",
+                "HOST_CONTAINERNAME=dockge",
+                "DOCKGE_STACKS_DIR=/mnt/user/appdata/dockge/stacks",
+                "UV_USE_IO_URING=0",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "NODE_VERSION=22.14.0",
+                "YARN_VERSION=1.22.22"
+            ],
+            "Cmd": [
+                "tsx",
+                "./backend/index.ts"
+            ],
+            "Healthcheck": {
+                "Test": [
+                    "CMD-SHELL",
+                    "extra/healthcheck"
+                ],
+                "Interval": 60000000000,
+                "Timeout": 30000000000,
+                "StartPeriod": 60000000000,
+                "Retries": 5
+            },
+            "Image": "louislam/dockge:1",
+            "Volumes": {
+                "/app/data": {}
+            },
+            "WorkingDir": "/app",
+            "Entrypoint": [
+                "/usr/bin/dumb-init",
+                "--"
+            ],
+            "Labels": {
+                "net.unraid.docker.icon": "https://gitea.scottkey.me/argyle-labs/dockge/raw/branch/main/assets/icon-256.png",
+                "net.unraid.docker.managed": "dockerman",
+                "net.unraid.docker.webui": "http://[IP]:[PORT:5001]/"
+            }
+        },
+        "NetworkSettings": {
+            "SandboxID": "4c561f363e93272e1426650c51333a351aeec0e1864213f29cf6be415692c564",
+            "SandboxKey": "/var/run/docker/netns/4c561f363e93",
+            "Ports": {
+                "5001/tcp": [
+                    {
+                        "HostIp": "0.0.0.0",
+                        "HostPort": "5001"
+                    },
+                    {
+                        "HostIp": "::",
+                        "HostPort": "5001"
+                    }
+                ]
+            },
+            "Networks": {
+                "bridge": {
+                    "IPAMConfig": null,
+                    "Links": null,
+                    "Aliases": null,
+                    "DriverOpts": null,
+                    "GwPriority": 0,
+                    "NetworkID": "867159e5be56662edab73e7371132c56cf36bba50ba6be2b5fe5025834602f5f",
+                    "EndpointID": "0cb59c5bd7c8af889d09530cb29d3b52e0d47d5b9a7183f8314ff7f33e75e8d5",
+                    "Gateway": "172.17.0.1",
+                    "IPAddress": "172.17.0.5",
+                    "MacAddress": "8e:50:0a:c0:62:de",
+                    "IPPrefixLen": 16,
+                    "IPv6Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "DNSNames": null
+                }
+            }
+        }
+    }
+]

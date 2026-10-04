@@ -1,0 +1,73 @@
+[
+    {
+        "Id": "sha256:e85d511b2a8b883da8a1ac2fde39ecddacdc011734e9f89a14b7798d82d5a0d3",
+        "RepoTags": [
+            "louislam/dockge:1"
+        ],
+        "RepoDigests": [
+            "louislam/dockge@sha256:335c6368b880ecc203236ed89e6e5232e0d6578e8ef5920e4a502390451502bf"
+        ],
+        "Comment": "buildkit.dockerfile.v0",
+        "Created": "2025-03-30T17:38:39.16369026Z",
+        "Config": {
+            "ExposedPorts": {
+                "5001/tcp": {}
+            },
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "NODE_VERSION=22.14.0",
+                "YARN_VERSION=1.22.22",
+                "UV_USE_IO_URING=0"
+            ],
+            "Entrypoint": [
+                "/usr/bin/dumb-init",
+                "--"
+            ],
+            "Cmd": [
+                "tsx",
+                "./backend/index.ts"
+            ],
+            "Volumes": {
+                "/app/data": {}
+            },
+            "WorkingDir": "/app",
+            "ArgsEscaped": true,
+            "Healthcheck": {
+                "Test": [
+                    "CMD-SHELL",
+                    "extra/healthcheck"
+                ],
+                "Interval": 60000000000,
+                "Timeout": 30000000000,
+                "StartPeriod": 60000000000,
+                "Retries": 5
+            }
+        },
+        "Architecture": "amd64",
+        "Os": "linux",
+        "Size": 754790238,
+        "GraphDriver": {
+            "Data": null,
+            "Name": "btrfs"
+        },
+        "RootFS": {
+            "Type": "layers",
+            "Layers": [
+                "sha256:1287fbecdfcce6ee8cf2436e5b9e9d86a4648db2d91080377d499737f1b307f3",
+                "sha256:dc691fd1dda42160edec3f9504d42694ef9992728f96c87acd04865b945381f2",
+                "sha256:3cfe045b3fb34ecc615a5ea3bb1905528f10db09f96c693e246339fb70644cb4",
+                "sha256:b6540cd06602515b9df7128111acc2999f9f72ed7c1e1b5b473ac12cad81d12b",
+                "sha256:d8ea3993deaa4e856fb56abbac8bc975918ad22a9a02afb4e9d5cb43dea97510",
+                "sha256:a1c6e812b5322660a26c1c19ad257fb30a7ec84ba1392e432c823d0773bd1d40",
+                "sha256:0513a4f48a479c1be130c11bacec41d38fa64b4cc00cbe8fb7de628e03b084c6",
+                "sha256:9656ecc99ebb911837ffe7f4f26a5ed9248c9acfa7a8e783a32e5d237cd0fd50",
+                "sha256:c6744fa838847bdd06d3c295dcfc21bc079aa25792dcf8f6942ae6f62d6361e4",
+                "sha256:9061a346e238ffe18d4a03ef3e728f6d87ff691ec6ae33f0ec3f0e2f421bada6",
+                "sha256:c87ceba0efbaa5f861a255d14a3425cd65a68b4103f00673ca2740d96a4885cc"
+            ]
+        },
+        "Metadata": {
+            "LastTagTime": "0001-01-01T00:00:00Z"
+        }
+    }
+]
