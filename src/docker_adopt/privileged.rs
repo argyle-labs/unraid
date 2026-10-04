@@ -13,7 +13,6 @@
 //! this binary as `unraid --privileged-op` with `{op, payload}` on stdin.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use plugin_toolkit::contract::BoxFuture;
@@ -69,22 +68,23 @@ pub enum PrivilegedOp {
         name: String,
     },
     RefreshIcons,
-    /// Copy a stopped container's local docker volume into
-    /// `/mnt/user/appdata/<name>/<dest_suffix>` and verify the copy.
+    /// Copy a stopped container's local docker volume into a root-only
+    /// stage under `/mnt/user/appdata/<name>` and verify the copy.
     CopyVolume {
         name: String,
         volume: String,
         dest_suffix: String,
         nonce: String,
     },
-    /// Remove a copy this run's CopyVolume made, while nothing mounts it.
+    /// Remove this run's staged copy. Never touches an exposed one.
     RemoveCopy {
         name: String,
         dest_suffix: String,
         nonce: String,
     },
-    /// Accept this run's copy: drop its marker so it can no longer be removed.
-    CommitCopy {
+    /// Move this run's staged copy to `<name>/<dest_suffix>`, where the
+    /// template mounts it.
+    ExposeCopy {
         name: String,
         dest_suffix: String,
         nonce: String,
@@ -184,118 +184,158 @@ fn none_sentinel(name: &str, backup_id: &str) -> String {
     format!("{}.none", template::backup_path(name, backup_id))
 }
 
-fn marker_name(suffix: &str) -> String {
-    format!(".orca-copy-{suffix}")
+// A copy is staged in `<appdata>/<name>/.orca-stage-<h>/data`, where `<h>`
+// is a hash of the run's nonce and the suffix. The stage is created 0700 by
+// root and checked to be the directory just made, so nothing else can reach
+// into it, and `cp -a` (which ends by giving `data` the source's owner and
+// mode) never exposes the tree mid-copy. A later process recognises its stage
+// by a token file inside holding the nonce, which is never shown and cannot be
+// read or written by anyone else; device/inode numbers are not used, since
+// shfs (FUSE) does not promise them stable across processes.
+const STAGE_TOKEN: &str = ".orca-stage-token";
+const STAGE_DATA: &str = "data";
+
+fn stage_name(nonce: &str, suffix: &str) -> String {
+    format!(
+        ".orca-stage-{}",
+        &sha256_hex(format!("{nonce}/{suffix}").as_bytes())[..16]
+    )
 }
 
-/// A copy in progress: `<appdata>/<name>` and its fresh destination, both
-/// held open so a swapped path cannot redirect the copy.
-#[derive(Debug)]
-pub struct CopyDest {
-    pub app: Dir,
-    pub dest: Dir,
+fn stage_token(nonce: &str, suffix: &str) -> String {
+    format!("{nonce}\n{suffix}\n")
 }
 
-/// The appdata side of CopyVolume, under the held `appdata` directory: open
-/// (or create) `<name>`, claim the copy with an exclusive marker holding the
-/// volume and this run's nonce, create the destination 0700 so nothing else
-/// can write into it mid-copy, and record its identity in the marker.
-pub fn prepare_copy_dest(
-    appdata: &Dir,
-    name: &str,
-    suffix: &str,
-    volume: &str,
-    nonce: &str,
-) -> Result<CopyDest> {
+/// This run's stage for `suffix` under the held `<name>` directory, after
+/// checking it is root's (this process's uid), 0700, and holds this run's
+/// token. `None` when there is no stage.
+pub fn open_stage(app: &Dir, nonce: &str, suffix: &str) -> Result<Option<Dir>> {
+    validate_name("destination", suffix)?;
+    validate_nonce(nonce)?;
+    let Some(stage) = app.child_opt(&stage_name(nonce, suffix))? else {
+        return Ok(None);
+    };
+    let st = stage.stat()?;
+    if st.st_uid != rustix::process::geteuid().as_raw() || stage.mode()? != 0o700 {
+        bail!("{} is not this run's stage", stage.path().display());
+    }
+    if stage.read_file(STAGE_TOKEN)?.as_deref() != Some(stage_token(nonce, suffix).as_bytes()) {
+        bail!("{} is not this run's stage", stage.path().display());
+    }
+    Ok(Some(stage))
+}
+
+/// Delete a stage this process holds and checked: its data by descriptor,
+/// then the token, then the (now empty) stage directory.
+fn discard_stage(app: &Dir, stage: &Dir, name: &str) -> Result<()> {
+    if let Some(d) = stage.child_opt(STAGE_DATA)? {
+        d.clear()?;
+        stage.remove_empty_dir(STAGE_DATA)?;
+    }
+    stage.remove_file(STAGE_TOKEN)?;
+    app.remove_empty_dir(name)
+}
+
+/// Create this run's empty stage for `suffix` under `<appdata>/<name>`,
+/// refusing when `<name>/<suffix>` already exists. Returns `(<name>, stage)`.
+pub fn create_stage(appdata: &Dir, name: &str, suffix: &str, nonce: &str) -> Result<(Dir, Dir)> {
     validate_name("container name", name)?;
     validate_name("destination", suffix)?;
     validate_nonce(nonce)?;
     let app = appdata.ensure_child(name, 0o755)?;
-    let mut marker = app
-        .create_file_open(&marker_name(suffix), 0o600)
-        .context("a copy marker already exists (stale run?); inspect it before retrying")?;
-    marker.write_all(format!("{volume}\n{nonce}\n").as_bytes())?;
-    let dest = app.create_child(suffix, 0o700)?;
-    let (dev, ino) = dest.identity()?;
-    marker.write_all(format!("{dev}:{ino}\n").as_bytes())?;
-    marker.sync_all()?;
-    Ok(CopyDest { app, dest })
+    if app.exists(suffix)? {
+        bail!("{} already exists", app.path().join(suffix).display());
+    }
+    let sname = stage_name(nonce, suffix);
+    let stage = app.create_child(&sname, 0o700)?;
+    if let Err(e) = stage.create_file(STAGE_TOKEN, stage_token(nonce, suffix).as_bytes(), 0o600) {
+        app.remove_empty_dir(&sname).ok();
+        return Err(e);
+    }
+    Ok((app, stage))
 }
 
-/// `cp -a` the held `src` into the held destination and verify the copy.
-/// Both are passed to `cp` as `/proc/<pid>/fd/<n>`, so it writes exactly
-/// where the descriptors point.
-pub async fn copy_pinned(src: &Dir, cd: &CopyDest, volume: &str) -> Result<String> {
+/// Stage a verified copy of the held `src` under `<appdata>/<name>`:
+/// refuse anything unsafe to copy as root, `cp` into the held stage through
+/// `/proc/<pid>/fd/<n>` without security xattrs, re-check the copy, and
+/// compare manifests. On failure the stage is removed in this process.
+pub async fn stage_copy(
+    appdata: &Dir,
+    src: &Dir,
+    name: &str,
+    suffix: &str,
+    volume: &str,
+    nonce: &str,
+) -> Result<String> {
     let from = format!("{}/.", src.proc_path()?);
-    host::run("/bin/cp", &["-a", &from, &cd.dest.proc_path()?]).await?;
-    let a = safefs::manifest(src)?;
-    let b = safefs::manifest(&cd.dest)?;
-    if a != b {
-        bail!(
-            "copy of {volume} differs: source {} entries/{} bytes/{}, copy {}/{}/{}",
+    let (app, stage) = create_stage(appdata, name, suffix, nonce)?;
+    let sname = stage_name(nonce, suffix);
+    let copied = async {
+        safefs::check_copyable(src)?;
+        let to = format!("{}/{STAGE_DATA}", stage.proc_path()?);
+        // `-a` would also carry security.* xattrs (file capabilities).
+        host::run(
+            "/bin/cp",
+            &[
+                "-R",
+                "--no-dereference",
+                "--preserve=mode,ownership,timestamps,links",
+                &from,
+                &to,
+            ],
+        )
+        .await?;
+        let data = stage.child(STAGE_DATA)?;
+        safefs::check_copyable(&data)?;
+        let a = safefs::manifest(src)?;
+        let b = safefs::manifest(&data)?;
+        if a != b {
+            bail!(
+                "copy of {volume} differs: source {} entries/{} bytes/{}, copy {}/{}/{}",
+                a.entries,
+                a.bytes,
+                &a.digest[..12],
+                b.entries,
+                b.bytes,
+                &b.digest[..12]
+            );
+        }
+        Ok(format!(
+            "staged {}: {} entries, {} bytes, content manifest {}",
+            app.path().join(&sname).display(),
             a.entries,
             a.bytes,
-            &a.digest[..12],
-            b.entries,
-            b.bytes,
-            &b.digest[..12]
-        );
+            &a.digest[..12]
+        ))
     }
-    Ok(format!(
-        "copied to {}: {} entries, {} bytes, content manifest {}",
-        cd.dest.path().display(),
-        a.entries,
-        a.bytes,
-        &a.digest[..12]
-    ))
+    .await;
+    if copied.is_err() {
+        discard_stage(&app, &stage, &sname).ok();
+    }
+    copied
 }
 
-/// Check this run's marker for `suffix` in the held `<name>` directory;
-/// returns the destination identity it recorded, if it got that far.
-pub fn check_copy_marker(app: &Dir, suffix: &str, nonce: &str) -> Result<Option<(u64, u64)>> {
-    validate_name("destination", suffix)?;
-    validate_nonce(nonce)?;
-    let body = app
-        .read_file(&marker_name(suffix))?
-        .ok_or_else(|| anyhow!("{} has no copy marker", app.path().join(suffix).display()))?;
-    let body = String::from_utf8_lossy(&body);
-    let mut lines = body.lines();
-    if lines.nth(1) != Some(nonce) {
-        bail!("copy marker for {suffix} belongs to another run");
-    }
-    Ok(lines.next().and_then(|l| {
-        let (d, i) = l.split_once(':')?;
-        Some((d.parse().ok()?, i.parse().ok()?))
-    }))
+/// Remove this run's staged copy of `suffix`. An exposed copy has no stage,
+/// so it is never removed here.
+pub fn remove_staged(app: &Dir, nonce: &str, suffix: &str) -> Result<String> {
+    let stage = open_stage(app, nonce, suffix)?.ok_or_else(|| {
+        anyhow!(
+            "no staged copy for {}; an exposed copy is never removed",
+            app.path().join(suffix).display()
+        )
+    })?;
+    discard_stage(app, &stage, &stage_name(nonce, suffix))?;
+    Ok(format!("removed staged copy for {suffix}"))
 }
 
-/// Remove this run's copy `<name>/<suffix>` unless `mounted`. Only the very
-/// directory this run created is emptied, by descriptor.
-pub fn remove_copy(app: &Dir, suffix: &str, nonce: &str, mounted: &[String]) -> Result<String> {
-    let id = check_copy_marker(app, suffix, nonce)?;
-    let shown = app.path().join(suffix);
-    if !mounted.is_empty() {
-        bail!("{} is mounted ({})", shown.display(), mounted.join(", "));
-    }
-    if let Some(dest) = app.child_opt(suffix)? {
-        if Some(dest.identity()?) != id {
-            bail!("{} is not the directory this run created", shown.display());
-        }
-        dest.clear()?;
-        if Some(app.child(suffix)?.identity()?) != id {
-            bail!("{} was replaced during removal", shown.display());
-        }
-        app.remove_empty_dir(suffix)?;
-    }
-    app.remove_file(&marker_name(suffix))?;
-    Ok(format!("removed {}", shown.display()))
-}
-
-/// Accept this run's copy: drop its marker so it can no longer be removed.
-pub fn commit_copy(app: &Dir, suffix: &str, nonce: &str) -> Result<String> {
-    check_copy_marker(app, suffix, nonce)?;
-    app.remove_file(&marker_name(suffix))?;
-    Ok(format!("committed {suffix}"))
+/// Move this run's staged copy to `<name>/<suffix>` and drop the stage.
+pub fn expose_staged(app: &Dir, nonce: &str, suffix: &str) -> Result<String> {
+    let stage =
+        open_stage(app, nonce, suffix)?.ok_or_else(|| anyhow!("no staged copy for {suffix}"))?;
+    stage.rename_into(STAGE_DATA, app, suffix)?;
+    stage.remove_file(STAGE_TOKEN)?;
+    app.remove_empty_dir(&stage_name(nonce, suffix))?;
+    Ok(format!("exposed {}", app.path().join(suffix).display()))
 }
 
 fn appdata_dir() -> Result<Dir> {
@@ -310,10 +350,15 @@ fn app_dir(name: &str) -> Result<Dir> {
 /// Retire stack `dir_name` from the held stacks `root` into `retired`,
 /// both directories root-owned and not group/world-writable.
 pub fn retire_pinned(root: &Dir, dir_name: &str, retired: &Dir, to_name: &str) -> Result<()> {
-    for d in [root, retired] {
-        if let Some(why) = d.root_owned_problem()? {
-            bail!("refusing to retire a stack: {why}");
-        }
+    if let Some(why) = root.root_owned_problem()? {
+        bail!("refusing to retire a stack: {why}");
+    }
+    if let Some(why) = retired.root_owned_problem()? {
+        bail!(
+            "refusing to retire a stack into a pre-existing {}: {why}; remove it or fix its \
+             owner and mode",
+            retired.path().display()
+        );
     }
     root.rename_into(dir_name, retired, to_name)
 }
@@ -385,6 +430,17 @@ pub fn restore_template_in(dir: &Path, name: &str, backup_id: &str) -> Result<St
         "no backup for run {backup_id}; {} was not restored",
         path.display()
     )
+}
+
+async fn ensure_stopped(name: &str) -> Result<()> {
+    let (c, _) = host::inspect_container_raw(name).await?;
+    if c.short_name() != name {
+        bail!("{name} resolved to {}", c.short_name());
+    }
+    if c.state.running {
+        bail!("{name} is running; it must stay stopped while its volumes are copied");
+    }
+    Ok(())
 }
 
 async fn containers_using_volume(volume: &str) -> Result<Vec<String>> {
@@ -471,13 +527,7 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
             validate_name("volume", volume)?;
             validate_name("destination", dest_suffix)?;
             validate_nonce(nonce)?;
-            let (c, _) = host::inspect_container_raw(name).await?;
-            if c.short_name() != name {
-                bail!("{name} resolved to {}", c.short_name());
-            }
-            if c.state.running {
-                bail!("{name} is running; stop it before copying its volumes");
-            }
+            ensure_stopped(name).await?;
             let v = host::inspect_volume(volume).await?;
             let src_path = VolumeInspect::expected_mountpoint(volume);
             if v.driver != "local" || v.options.as_ref().is_some_and(|o| !o.is_empty()) {
@@ -501,27 +551,25 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
                     mounted.into_iter().collect::<Vec<_>>().join(", ")
                 );
             }
-            let cd = prepare_copy_dest(&appdata_dir()?, name, dest_suffix, volume, nonce)?;
-            copy_pinned(&src, &cd, volume).await
+            ensure_stopped(name).await?;
+            let appdata = appdata_dir()?;
+            let staged = stage_copy(&appdata, &src, name, dest_suffix, volume, nonce).await?;
+            if let Err(e) = ensure_stopped(name).await {
+                remove_staged(&appdata.child(name)?, nonce, dest_suffix).ok();
+                return Err(e.context("container started during the copy; copy discarded"));
+            }
+            Ok(staged)
         }
         PrivilegedOp::RemoveCopy {
             name,
             dest_suffix,
             nonce,
-        } => {
-            let app = app_dir(name)?;
-            let planned = Path::new(APPDATA).join(name).join(dest_suffix);
-            let mounted: Vec<String> =
-                orphans::binds_overlapping(&planned, &host::inspect_all().await?)
-                    .into_iter()
-                    .collect();
-            remove_copy(&app, dest_suffix, nonce, &mounted)
-        }
-        PrivilegedOp::CommitCopy {
+        } => remove_staged(&app_dir(name)?, nonce, dest_suffix),
+        PrivilegedOp::ExposeCopy {
             name,
             dest_suffix,
             nonce,
-        } => commit_copy(&app_dir(name)?, dest_suffix, nonce),
+        } => expose_staged(&app_dir(name)?, nonce, dest_suffix),
         PrivilegedOp::RetireStack {
             name,
             project,
@@ -589,7 +637,14 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
             if let Some(why) = root.root_owned_problem()? {
                 bail!("refusing to retire a stack: {why}");
             }
-            let retired = Dir::open(top)?.ensure_child(retired_name, 0o755)?;
+            let retired = Dir::open(top)?
+                .ensure_child(retired_name, 0o755)
+                .with_context(|| {
+                    format!(
+                        "pre-existing {} is not a usable directory; remove it",
+                        retired_path.display()
+                    )
+                })?;
             retire_pinned(&root, dir_name, &retired, to_name)?;
             Ok(format!("moved {} to {}", dir.display(), want.display()))
         }
@@ -785,54 +840,47 @@ mod tests {
         Dir::open(p).unwrap()
     }
 
-    #[test]
-    fn copy_destination_is_created_fresh_private_and_claimed() {
-        use std::os::unix::fs::PermissionsExt;
-        let (_d, root) = appdata();
-        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "pbs-config", NONCE).unwrap();
-        assert_eq!(cd.dest.path(), root.join("pbs/config"));
-        assert_eq!(
-            fs::metadata(root.join("pbs/config"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        let id = check_copy_marker(&cd.app, "config", NONCE).unwrap();
-        assert_eq!(id, Some(cd.dest.identity().unwrap()));
-        assert!(prepare_copy_dest(&open(&root), "pbs", "config", "pbs-config", NONCE).is_err());
-        for bad in ["..", "a/b", ".hidden", ""] {
-            assert!(
-                prepare_copy_dest(&open(&root), "pbs", bad, "v", NONCE).is_err(),
-                "{bad}"
-            );
-        }
-        assert!(prepare_copy_dest(&open(&root), "../etc", "x", "v", NONCE).is_err());
+    fn stage_of(root: &Path) -> PathBuf {
+        root.join("pbs").join(stage_name(NONCE, "config"))
     }
 
     #[test]
-    fn planted_symlinks_never_redirect_a_copy() {
+    fn stages_are_fresh_private_and_tokened() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, root) = appdata();
+        let (_app, stage) = create_stage(&open(&root), "pbs", "config", NONCE).unwrap();
+        assert_eq!(stage.path(), stage_of(&root));
+        assert_eq!(
+            fs::metadata(stage_of(&root)).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(!stage_of(&root).to_string_lossy().contains(NONCE));
+        assert!(create_stage(&open(&root), "pbs", "config", NONCE).is_err());
+        for bad in ["..", "a/b", ".hidden", ""] {
+            assert!(
+                create_stage(&open(&root), "pbs", bad, NONCE).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(create_stage(&open(&root), "../etc", "x", NONCE).is_err());
+        fs::create_dir(root.join("pbs/logs")).unwrap();
+        let e = create_stage(&open(&root), "pbs", "logs", NONCE).unwrap_err();
+        assert!(e.to_string().contains("already exists"), "{e}");
+    }
+
+    #[test]
+    fn planted_symlinks_never_redirect_a_stage() {
         use std::os::unix::fs::symlink;
         let (_d, root) = appdata();
-        let outside = root.join("outside");
-        fs::create_dir(&outside).unwrap();
+        let (_o, outside) = appdata();
         fs::create_dir(root.join("pbs")).unwrap();
-
-        symlink(&outside, root.join("pbs/config")).unwrap();
-        assert!(prepare_copy_dest(&open(&root), "pbs", "config", "v", NONCE).is_err());
-        fs::remove_file(root.join("pbs/.orca-copy-config")).ok();
-
-        let victim = outside.join("go");
-        fs::write(&victim, b"keep").unwrap();
-        symlink(&victim, root.join("pbs/.orca-copy-logs")).unwrap();
-        assert!(prepare_copy_dest(&open(&root), "pbs", "logs", "v", NONCE).is_err());
-        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        symlink(&outside, stage_of(&root)).unwrap();
+        assert!(create_stage(&open(&root), "pbs", "config", NONCE).is_err());
 
         let (_d2, root2) = appdata();
         symlink(&outside, root2.join("pbs")).unwrap();
-        assert!(prepare_copy_dest(&open(&root2), "pbs", "config", "v", NONCE).is_err());
-        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        assert!(create_stage(&open(&root2), "pbs", "config", NONCE).is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     /// The attack from the review: after every check, `<appdata>/<name>` is
@@ -846,89 +894,148 @@ mod tests {
     fn an_ancestor_swap_after_the_checks_cannot_redirect_writes() {
         let (_d, root) = appdata();
         let (_o, outside) = appdata();
-        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "v", NONCE).unwrap();
+        let (_app, stage) = create_stage(&open(&root), "pbs", "config", NONCE).unwrap();
         swap_app_for_symlink(&root, &outside);
-        // Writes go through the held descriptor, into the moved directory.
-        cd.dest.create_file("data", b"x", 0o600).unwrap();
-        assert!(root.join("pbs-moved/config/data").exists());
+        stage.create_child(STAGE_DATA, 0o700).unwrap();
+        assert!(
+            root.join("pbs-moved")
+                .join(stage_name(NONCE, "config"))
+                .join(STAGE_DATA)
+                .exists()
+        );
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(app_dir_at(&root, "pbs").is_err());
+    }
+
+    fn app_dir_at(root: &Path, name: &str) -> Result<Dir> {
+        open(root).child(name)
+    }
+
+    #[test]
+    fn a_swapped_in_stage_is_refused_and_left_alone() {
+        let (_d, root) = appdata();
+        fs::create_dir_all(root.join("pbs/secrets/data")).unwrap();
+        fs::write(root.join("pbs/secrets/data/key"), b"keep").unwrap();
+        // Someone renames another directory of `<name>` to the stage's name.
+        fs::rename(root.join("pbs/secrets"), stage_of(&root)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        // Same owner and mode as a real stage; only the token is missing.
+        fs::set_permissions(stage_of(&root), fs::Permissions::from_mode(0o700)).unwrap();
+        let app = app_dir_at(&root, "pbs").unwrap();
+        assert!(remove_staged(&app, NONCE, "config").is_err());
+        assert!(expose_staged(&app, NONCE, "config").is_err());
+        assert!(stage_of(&root).join("data/key").exists());
+        assert!(!root.join("pbs/config").exists());
+
+        // Right owner and token, wrong mode: still refused.
+        fs::remove_dir_all(stage_of(&root)).unwrap();
+        let (_a, _s) = create_stage(&open(&root), "pbs", "config", NONCE).unwrap();
+        fs::set_permissions(stage_of(&root), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(remove_staged(&app, NONCE, "config").is_err());
+    }
+
+    #[test]
+    fn staged_copies_are_removed_only_by_their_own_run() {
+        let (_d, root) = appdata();
+        let (app, stage) = create_stage(&open(&root), "pbs", "config", NONCE).unwrap();
+        let data = stage.create_child(STAGE_DATA, 0o755).unwrap();
+        data.create_child("a", 0o755)
+            .unwrap()
+            .create_file("f", b"x", 0o644)
+            .unwrap();
+        assert!(remove_staged(&app, "fedcba9876543210", "config").is_err());
+        assert!(stage_of(&root).exists());
+        remove_staged(&app, NONCE, "config").unwrap();
+        assert!(!stage_of(&root).exists());
+        assert!(remove_staged(&app, NONCE, "config").is_err());
+    }
+
+    #[test]
+    fn exposed_copies_cannot_be_removed() {
+        let (_d, root) = appdata();
+        let (app, stage) = create_stage(&open(&root), "pbs", "config", NONCE).unwrap();
+        stage
+            .create_child(STAGE_DATA, 0o755)
+            .unwrap()
+            .create_file("f", b"x", 0o644)
+            .unwrap();
+        expose_staged(&app, NONCE, "config").unwrap();
+        assert!(root.join("pbs/config/f").exists());
+        assert!(!stage_of(&root).exists());
+        let e = remove_staged(&app, NONCE, "config")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("never removed"), "{e}");
+        assert!(root.join("pbs/config/f").exists());
+    }
+
+    #[test]
+    fn expose_never_replaces_an_existing_destination() {
+        let (_d, root) = appdata();
+        let (app, stage) = create_stage(&open(&root), "pbs", "config", NONCE).unwrap();
+        stage.create_child(STAGE_DATA, 0o755).unwrap();
+        fs::create_dir(root.join("pbs/config")).unwrap();
+        assert!(expose_staged(&app, NONCE, "config").is_err());
+        assert!(stage_of(&root).join(STAGE_DATA).exists());
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn an_ancestor_swap_cannot_redirect_cp() {
+    async fn stage_copy_drops_extended_attributes() {
         let (_d, root) = appdata();
-        let (_o, outside) = appdata();
+        let (_s, src) = appdata();
+        fs::write(src.join("f"), b"x").unwrap();
+        let set = rustix::fs::setxattr(
+            src.join("f").as_path(),
+            "user.orca-test",
+            b"1",
+            rustix::fs::XattrFlags::empty(),
+        );
+        if set.is_err() {
+            return; // filesystem without user xattrs
+        }
+        stage_copy(&open(&root), &open(&src), "pbs", "config", "v", NONCE)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let got = rustix::fs::getxattr(
+            stage_of(&root).join("data/f").as_path(),
+            "user.orca-test",
+            &mut buf[..],
+        );
+        assert!(got.is_err(), "xattrs were carried into the copy");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stage_copy_copies_verifies_and_discards_on_refusal() {
+        let (_d, root) = appdata();
         let (_s, src) = appdata();
         fs::create_dir(src.join("sub")).unwrap();
         fs::write(src.join("sub/f"), b"payload").unwrap();
-        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "v", NONCE).unwrap();
-        swap_app_for_symlink(&root, &outside);
-        copy_pinned(&open(&src), &cd, "v").await.unwrap();
+        stage_copy(&open(&root), &open(&src), "pbs", "config", "v", NONCE)
+            .await
+            .unwrap();
         assert_eq!(
-            fs::read(root.join("pbs-moved/config/sub/f")).unwrap(),
+            fs::read(stage_of(&root).join("data/sub/f")).unwrap(),
             b"payload"
         );
-        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
-    }
 
-    #[test]
-    fn an_ancestor_swap_cannot_redirect_removal() {
-        let (_d, root) = appdata();
-        let (_o, outside) = appdata();
-        fs::write(outside.join("precious"), b"keep").unwrap();
-        fs::create_dir(outside.join("config")).unwrap();
-        fs::write(outside.join("config/precious"), b"keep").unwrap();
-        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "v", NONCE).unwrap();
-        cd.dest.create_file("f", b"x", 0o600).unwrap();
-        drop(cd);
-        swap_app_for_symlink(&root, &outside);
-        // A fresh open (the RemoveCopy op) refuses the symlinked <name>.
-        assert!(open(&root).child("pbs").is_err());
-        // A directory held from before the swap removes only its own copy.
-        let app = open(&root.join("pbs-moved"));
-        remove_copy(&app, "config", NONCE, &[]).unwrap();
-        assert!(!root.join("pbs-moved/config").exists());
-        assert!(outside.join("precious").exists());
-        assert!(outside.join("config/precious").exists());
-    }
-
-    #[test]
-    fn removal_refuses_a_directory_this_run_did_not_create() {
-        let (_d, root) = appdata();
-        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "v", NONCE).unwrap();
-        // Someone renames our copy away and moves other data into its name.
-        fs::rename(root.join("pbs/config"), root.join("pbs/ours")).unwrap();
-        fs::create_dir(root.join("pbs/config")).unwrap();
-        fs::write(root.join("pbs/config/theirs"), b"keep").unwrap();
-        assert!(remove_copy(&cd.app, "config", NONCE, &[]).is_err());
-        assert!(root.join("pbs/config/theirs").exists());
-    }
-
-    #[test]
-    fn copies_are_removed_only_by_their_own_run_and_when_unmounted() {
-        let (_d, root) = appdata();
-        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "pbs-config", NONCE).unwrap();
-        cd.dest.create_file("f", b"x", 0o600).unwrap();
-        fs::create_dir_all(root.join("pbs/config/a/b")).unwrap();
-        let app = &cd.app;
-        assert!(remove_copy(app, "config", "fedcba9876543210", &[]).is_err());
-        assert!(remove_copy(app, "config", NONCE, &["/mnt/user/appdata/pbs".into()]).is_err());
-        assert!(root.join("pbs/config").exists());
-        remove_copy(app, "config", NONCE, &[]).unwrap();
-        assert!(!root.join("pbs/config").exists());
-        assert!(!root.join("pbs/.orca-copy-config").exists());
-        assert!(remove_copy(app, "config", NONCE, &[]).is_err());
-    }
-
-    #[test]
-    fn committed_copies_cannot_be_removed() {
-        let (_d, root) = appdata();
-        let cd = prepare_copy_dest(&open(&root), "pbs", "config", "v", NONCE).unwrap();
-        assert!(commit_copy(&cd.app, "config", "fedcba9876543210").is_err());
-        commit_copy(&cd.app, "config", NONCE).unwrap();
-        assert!(remove_copy(&cd.app, "config", NONCE, &[]).is_err());
-        assert!(root.join("pbs/config").exists());
+        let (_d2, root2) = appdata();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(src.join("p"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let e = stage_copy(&open(&root2), &open(&src), "pbs", "config", "v", NONCE)
+            .await
+            .unwrap_err()
+            .to_string();
+        // Refused while scanning the source, before anything is copied.
+        assert!(e.contains(&src.join("p").display().to_string()), "{e}");
+        assert!(!root2.join("pbs").join(stage_name(NONCE, "config")).exists());
     }
 
     #[test]
@@ -942,6 +1049,17 @@ mod tests {
         if host::euid() == Some(0) {
             r.unwrap();
             assert!(root.join("stacks-retired/web-compose-20261004").exists());
+            use std::os::unix::fs::PermissionsExt;
+            fs::create_dir(root.join("stacks/api")).unwrap();
+            fs::set_permissions(
+                root.join("stacks-retired"),
+                fs::Permissions::from_mode(0o777),
+            )
+            .unwrap();
+            let e = retire_pinned(&stacks, "api", &retired, "api-x")
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("pre-existing"), "{e}");
         } else {
             let e = r.unwrap_err().to_string();
             assert!(e.contains("must be root-owned"), "{e}");

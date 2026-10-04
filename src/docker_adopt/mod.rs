@@ -126,8 +126,9 @@ pub enum Step {
     RemoveOwnAnonymousVolumes {
         candidates: Vec<String>,
     },
-    /// Accept a verified copy so it can no longer be rolled back.
-    CommitCopy {
+    /// Move a staged copy to where the template mounts it. Runs right
+    /// before `Rebuild`; an exposed copy is never rolled back.
+    ExposeCopy {
         suffix: String,
     },
     RemoveNetwork {
@@ -156,7 +157,7 @@ impl Step {
             Step::RefreshIcons => "refresh-icons",
             Step::RemoveVolume { .. } => "remove-volume",
             Step::RemoveOwnAnonymousVolumes { .. } => "remove-own-anonymous-volumes",
-            Step::CommitCopy { .. } => "commit-copy",
+            Step::ExposeCopy { .. } => "expose-copy",
             Step::RemoveNetwork { .. } => "remove-network",
             Step::RetireStack { .. } => "retire-stack",
         }
@@ -169,7 +170,8 @@ impl Step {
             Step::CopyVolume { volume, to, .. } => (
                 volume.clone(),
                 Some(format!(
-                    "cp -a into {to}; verify entries, bytes and manifest digest"
+                    "copy into a root-only stage for {to}; verify entries, bytes and manifest \
+                     digest"
                 )),
             ),
             Step::SaveInspect { .. } => (template::inspect_backup_path(name, run_id), None),
@@ -217,9 +219,9 @@ impl Step {
                 format!("[{}]", candidates.join(", ")),
                 Some("only those no container mounts after the rebuild".to_string()),
             ),
-            Step::CommitCopy { suffix } => (
+            Step::ExposeCopy { suffix } => (
                 format!("{}/{name}/{suffix}", host::APPDATA),
-                Some("drop this run's copy marker".to_string()),
+                Some("move the staged copy here".to_string()),
             ),
             Step::RemoveNetwork { network } => (
                 network.clone(),
@@ -261,8 +263,8 @@ async fn run_step(ops: &dyn HostOps, step: &Step, cx: &ApplyCtx) -> Result<Strin
             })
             .await
         }
-        Step::CommitCopy { suffix } => {
-            ops.privileged(&PrivilegedOp::CommitCopy {
+        Step::ExposeCopy { suffix } => {
+            ops.privileged(&PrivilegedOp::ExposeCopy {
                 name: name_s,
                 dest_suffix: suffix.clone(),
                 nonce: cx.nonce.clone(),
@@ -400,7 +402,7 @@ pub struct ApplyCtx {
     pub name: String,
     /// This run's id: names the template backup and saved inspect.
     pub run_id: String,
-    /// This run's copy-marker nonce.
+    /// This run's copy-stage nonce; never shown.
     pub nonce: String,
     pub was_running: bool,
     pub autostart_before: bool,
@@ -445,14 +447,14 @@ pub async fn apply(ops: &dyn HostOps, cx: &ApplyCtx, steps: &[Step]) -> Result<V
     let mut template_written = false;
     let mut autostart_changed = false;
     let mut copies: Vec<String> = Vec::new();
+    let mut exposed: Vec<String> = Vec::new();
     for step in steps {
         let change = step.change(name, &cx.run_id);
         // Marked before running: a failed rebuild leaves the container in an
-        // unknown state, so it is reported with recovery, not rolled back;
-        // a failed copy may leave a partial one. WriteTemplate replaces the
-        // file by rename, so it is marked only once it succeeded.
+        // unknown state, so it is reported with recovery, not rolled back.
+        // A failed copy discards its own stage and WriteTemplate replaces the
+        // file by rename, so both are marked only once they succeeded.
         match step {
-            Step::CopyVolume { suffix, .. } => copies.push(suffix.clone()),
             Step::SetAutostart { .. } if !rebuilt => autostart_changed = true,
             Step::Rebuild => rebuilt = true,
             _ => {}
@@ -465,6 +467,11 @@ pub async fn apply(ops: &dyn HostOps, cx: &ApplyCtx, steps: &[Step]) -> Result<V
                 }
                 if matches!(step, Step::WriteTemplate { .. }) {
                     template_written = true;
+                }
+                match step {
+                    Step::CopyVolume { suffix, .. } => copies.push(suffix.clone()),
+                    Step::ExposeCopy { suffix } => exposed.push(suffix.clone()),
+                    _ => {}
                 }
                 done.push(StepOutcome {
                     action: change.action,
@@ -518,7 +525,16 @@ pub async fn apply(ops: &dyn HostOps, cx: &ApplyCtx, steps: &[Step]) -> Result<V
                 .await;
             note("restore autostart".into(), r);
         }
-        for suffix in &copies {
+        for suffix in &exposed {
+            note(
+                format!(
+                    "left exposed copy {}/{name}/{suffix} in place",
+                    host::APPDATA
+                ),
+                Ok(String::new()),
+            );
+        }
+        for suffix in copies.iter().filter(|c| !exposed.contains(c)) {
             let r = ops
                 .privileged(&PrivilegedOp::RemoveCopy {
                     name: name.into(),
@@ -563,7 +579,7 @@ pub struct Snapshot {
     pub autostart: Vec<String>,
     /// This run's id (`YYYYMMDD-HHMMSS-<hex>`): backup names, retire date.
     pub run_id: String,
-    /// This run's copy-marker nonce.
+    /// This run's copy-stage nonce; never shown.
     pub nonce: String,
     /// Log options the docker daemon applies by default.
     pub daemon_log_opts: BTreeMap<String, String>,
@@ -819,6 +835,11 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
         xml: template_xml.clone(),
     });
     autostart_steps(&mut steps, in_autostart, was_running, autostart, |st| {
+        for m in &migrations {
+            st.push(Step::ExposeCopy {
+                suffix: m.suffix.clone(),
+            });
+        }
         st.push(Step::Rebuild)
     });
     steps.push(Step::EnsureState {
@@ -838,11 +859,6 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
     for m in &migrations {
         steps.push(Step::RemoveVolume {
             volume: m.volume.clone(),
-        });
-    }
-    for m in &migrations {
-        steps.push(Step::CommitCopy {
-            suffix: m.suffix.clone(),
         });
     }
     let anon: Vec<String> = orphans::own_anonymous_volumes(c, &s.volumes)
@@ -1201,13 +1217,30 @@ async fn snapshot(name: &str) -> Result<Snapshot> {
     })
 }
 
+/// Why root may not retire stacks from each root: the root, or a
+/// pre-existing `<root>-retired`, is not a root-owned, non-group/world-
+/// writable directory.
 fn stacks_root_problems(roots: &[PathBuf]) -> BTreeMap<PathBuf, String> {
     use std::os::unix::fs::MetadataExt;
     roots
         .iter()
         .filter_map(|r| {
             let md = std::fs::metadata(r).ok()?;
-            safefs::root_owned_problem(r, md.uid(), md.mode()).map(|w| (r.clone(), w))
+            if let Some(w) = safefs::root_owned_problem(r, md.uid(), md.mode()) {
+                return Some((r.clone(), w));
+            }
+            let retired = PathBuf::from(format!("{}-retired", r.display()));
+            let md = std::fs::symlink_metadata(&retired).ok()?;
+            let why = if !md.is_dir() {
+                Some(format!(
+                    "pre-existing {} is not a real directory; remove it",
+                    retired.display()
+                ))
+            } else {
+                safefs::root_owned_problem(&retired, md.uid(), md.mode())
+                    .map(|w| format!("pre-existing {w}"))
+            };
+            why.map(|w| (r.clone(), w))
         })
         .collect()
 }

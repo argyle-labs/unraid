@@ -51,8 +51,12 @@ pub async fn run(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// The Docker CLI on Unraid, by absolute path so a root caller never
+/// resolves it through `PATH`.
+pub const DOCKER: &str = "/usr/bin/docker";
+
 pub async fn docker(args: &[&str]) -> Result<String> {
-    run("docker", args).await
+    run(DOCKER, args).await
 }
 
 fn lines(s: &str) -> Vec<String> {
