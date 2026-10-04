@@ -21,6 +21,17 @@ use crate::{Client, Config, schema_pull};
 /// registry (`unraid.{list,create,...}`); otherwise, when `endpoint` is omitted
 /// and exactly one endpoint is registered, that sole endpoint. Anything else is
 /// an error naming the fix.
+/// [`Config`] for an explicit `from` override; carries this host's CSRF token
+/// only when `from` is loopback.
+fn from_config(from: &str, api_key: impl Into<String>, insecure: bool) -> Result<Config> {
+    if from.trim().is_empty() {
+        bail!("`from` must not be blank");
+    }
+    Ok(Config::new(from, api_key)
+        .insecure(insecure)
+        .csrf_token(endpoint::local_csrf(from)))
+}
+
 pub(crate) async fn surface_client(
     endpoint: Option<String>,
     from: Option<String>,
@@ -29,9 +40,11 @@ pub(crate) async fn surface_client(
 ) -> Result<Client> {
     if let Some(url) = from {
         let key = api_key.ok_or_else(|| anyhow!("`api_key` is required when `from` is set"))?;
-        return Ok(Client::new(
-            Config::new(url, key).insecure(insecure.unwrap_or(false)),
-        ));
+        return Ok(Client::new(from_config(
+            &url,
+            key,
+            insecure.unwrap_or(false),
+        )?));
     }
     let row = match endpoint {
         Some(name) => endpoint_db::get(&name)?
@@ -138,7 +151,7 @@ async fn unraid_schema(args: UnraidSchemaArgs, _ctx: &ToolCtx) -> Result<UnraidS
         .api_key
         .as_deref()
         .ok_or_else(|| anyhow!("`api_key` is required when `from` is set"))?;
-    let cfg = Config::new(from, api_key).insecure(args.insecure);
+    let cfg = from_config(from, api_key, args.insecure)?;
 
     if args.check_drift {
         if args.dir.is_some() {
@@ -296,6 +309,39 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("api_key"));
+    }
+
+    #[tokio::test]
+    async fn blank_from_is_rejected() {
+        let err = unraid_schema(
+            UnraidSchemaArgs {
+                from: Some("  ".into()),
+                api_key: Some("tok".into()),
+                check_drift: true,
+                ..Default::default()
+            },
+            &empty_ctx(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("`from` must not be blank"),
+            "{err}"
+        );
+        let err = surface_client(None, Some(String::new()), Some("tok".into()), None)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("`from` must not be blank"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn remote_from_carries_no_csrf_token() {
+        let cfg = from_config("http://10.0.0.5", "tok", false).unwrap();
+        assert!(cfg.csrf_token.is_none());
     }
 
     #[tokio::test]

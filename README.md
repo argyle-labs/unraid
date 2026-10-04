@@ -36,7 +36,7 @@ Every `.graphql` operation in `queries/` becomes an `#[orca_tool]` at build time
 
 Each tool resolves its connection in this order: an explicit `from` + `api_key` override wins; otherwise the named `endpoint` from the registry; otherwise, the sole registered endpoint when exactly one exists.
 
-A registered endpoint is addressed by its `routes`, tried in order (enabled ones only, last-good first). An endpoint with no routes is treated as colocated and reached on loopback (`http://127.0.0.1`, nginx in front of the API's unix socket). When `/var/local/emhttp/var.ini` is readable, its `csrf_token` is sent as `x-csrf-token` alongside `x-api-key`.
+A registered endpoint is addressed by its `routes`, tried in order (enabled ones only, last-good first). An endpoint with no routes at all is treated as colocated and reached on loopback (`http://127.0.0.1`, nginx in front of the API's unix socket) — only when this host is itself Unraid (`/var/local/emhttp/var.ini` exists); otherwise resolution errors. An endpoint whose routes are all disabled or not URL-addressable errors rather than falling back to loopback. The `csrf_token` from `var.ini` is sent as `x-csrf-token` alongside `x-api-key` only when the resolved URL is loopback. Endpoint names must match `^[A-Za-z0-9_-]{1,64}$`.
 
 ```sh
 orca unraid.create --name tower --api-key "$KEY"                                  # colocated

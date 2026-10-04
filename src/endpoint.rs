@@ -8,10 +8,12 @@
 //! `unraid.<endpoint>.api_key` instead.
 //!
 //! Addressing is the endpoint's `routes`, tried in order by
-//! [`route::resolve_reachable`]. An endpoint with no URL-addressable route is
-//! colocated: the daemon reaches the API through nginx on loopback, which
-//! proxies the root-owned unix socket — see
+//! [`route::resolve_reachable`]. An endpoint with no routes at all, on a host
+//! that is itself Unraid, is colocated: the daemon reaches the API through
+//! nginx on loopback, which proxies the root-owned unix socket — see
 //! [[project-unraid-graphql-unix-socket-endpoint]].
+
+use std::path::Path;
 
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::secrets;
@@ -66,24 +68,83 @@ fn csrf_from_var_ini(contents: &str) -> Option<String> {
     })
 }
 
-/// Resolve a registered endpoint into a ready [`Config`]: the first reachable
-/// route (loopback when none is registered), the API key from the secrets
-/// domain, and this host's CSRF token when readable.
-pub async fn resolve_config(row: &EndpointRow) -> Result<Config> {
-    let api_key = api_key(&row.name)?;
-    let url = if row.routes.enabled().any(|r| r.base_url().is_some()) {
-        route::resolve_reachable(&row.name, &row.routes, row.insecure).await?
-    } else {
-        LOCAL_URL.to_string()
+/// Host of `scheme://[userinfo@]host[:port][/…]`, brackets stripped from IPv6.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.trim().split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split_once(']')?.0,
+        None => host_port.split(':').next()?,
     };
-    // The plugin runs on the Unraid host it manages, so the local token is the
-    // one the API expects.
-    let csrf = std::fs::read_to_string(VAR_INI)
+    (!host.is_empty()).then_some(host)
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    url_host(url).is_some_and(|h| {
+        h.eq_ignore_ascii_case("localhost")
+            || h.parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
+/// This host's emhttp CSRF token, only for a loopback `url`: the token is a
+/// local browser-session credential and must never leave the box.
+pub(crate) fn local_csrf(url: &str) -> Option<String> {
+    local_csrf_from(url, Path::new(VAR_INI))
+}
+
+fn local_csrf_from(url: &str, var_ini: &Path) -> Option<String> {
+    if !is_loopback_url(url) {
+        return None;
+    }
+    std::fs::read_to_string(var_ini)
         .ok()
-        .and_then(|s| csrf_from_var_ini(&s));
+        .and_then(|s| csrf_from_var_ini(&s))
+}
+
+/// Resolve a registered endpoint into a ready [`Config`]: the first reachable
+/// route (loopback only when no route is registered and this host is Unraid),
+/// the API key from the secrets domain, and this host's CSRF token when the
+/// resolved URL is loopback.
+pub async fn resolve_config(row: &EndpointRow) -> Result<Config> {
+    resolve_config_with(row, Path::new(VAR_INI)).await
+}
+
+async fn resolve_config_with(row: &EndpointRow, var_ini: &Path) -> Result<Config> {
+    let api_key = api_key(&row.name)?;
+    // Registered-but-unusable routes must error rather than fall back to
+    // loopback, or a remote endpoint's key would be sent to this host.
+    let url = if row.routes.is_empty() {
+        if !var_ini.exists() {
+            bail!(
+                "endpoint '{}' has no routes and this host is not an Unraid server; \
+                 register one with `unraid.update --name {} --route kind=scheme://host`",
+                row.name,
+                row.name
+            );
+        }
+        LOCAL_URL.to_string()
+    } else {
+        route::resolve_reachable(&row.name, &row.routes, row.insecure).await?
+    };
+    let csrf = local_csrf_from(&url, var_ini);
     Ok(Config::new(url, api_key)
         .insecure(row.insecure)
         .csrf_token(csrf))
+}
+
+/// Endpoint names become the middle segment of `unraid.<name>.api_key`; a `.`
+/// or other separator would split into a different secret scope.
+fn validate_name(name: &str) -> Result<()> {
+    let ok = (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if !ok {
+        bail!("invalid endpoint name '{name}': must match ^[A-Za-z0-9_-]{{1,64}}$");
+    }
+    Ok(())
 }
 
 fn entry(row: &EndpointRow) -> EndpointEntry {
@@ -127,6 +188,7 @@ pub struct UnraidCreateOutput {
 /// the endpoint row.
 #[orca_tool(domain = "unraid", verb = "create")]
 async fn unraid_create(args: UnraidCreateArgs, _ctx: &ToolCtx) -> Result<UnraidCreateOutput> {
+    validate_name(&args.name)?;
     if args.api_key.trim().is_empty() {
         bail!("api_key must not be empty");
     }
@@ -137,7 +199,12 @@ async fn unraid_create(args: UnraidCreateArgs, _ctx: &ToolCtx) -> Result<UnraidC
         enabled: true,
     };
     endpoint_db::insert(&row).map_err(|e| runtime::map_insert_conflict(e, PROVIDER, &row.name))?;
-    set_api_key(&row.name, &args.api_key)?;
+    if let Err(e) = set_api_key(&row.name, &args.api_key) {
+        if let Err(rollback) = endpoint_db::remove(&row.name) {
+            tracing::warn!(endpoint = %row.name, error = %rollback, "rollback of endpoint row failed");
+        }
+        return Err(e);
+    }
     Ok(UnraidCreateOutput {
         endpoint: entry(&row),
     })
@@ -173,6 +240,7 @@ pub struct UnraidUpdateOutput {
 /// Patch an Unraid endpoint. `api_key` is written to the secrets domain.
 #[orca_tool(domain = "unraid", verb = "update")]
 async fn unraid_update(args: UnraidUpdateArgs, _ctx: &ToolCtx) -> Result<UnraidUpdateOutput> {
+    validate_name(&args.name)?;
     if args.api_key.as_deref().is_some_and(|k| k.trim().is_empty()) {
         bail!("api_key must not be empty");
     }
@@ -219,16 +287,19 @@ pub struct UnraidDeleteArgs {
 pub struct UnraidDeleteOutput {
     pub name: String,
     pub changed: bool,
+    pub secret_removed: bool,
 }
 
 /// Remove an Unraid endpoint and its stored API key.
 #[orca_tool(domain = "unraid", verb = "delete")]
 async fn unraid_delete(args: UnraidDeleteArgs, _ctx: &ToolCtx) -> Result<UnraidDeleteOutput> {
+    validate_name(&args.name)?;
     let changed = endpoint_db::remove(&args.name)?;
-    secrets::delete(&api_key_secret(&args.name))?;
+    let secret_removed = secrets::delete(&api_key_secret(&args.name))?;
     Ok(UnraidDeleteOutput {
         name: args.name,
         changed,
+        secret_removed,
     })
 }
 
@@ -253,6 +324,7 @@ mod tests {
     struct Store {
         rows: Vec<DbRow>,
         secrets: HashMap<String, String>,
+        fail_secret_set: bool,
     }
 
     fn handle(store: &mut Store, cap: &str, json: &str) -> Result<String, String> {
@@ -292,6 +364,9 @@ mod tests {
                 let mut reply = SecretReply::default();
                 match op {
                     SecretOp::Get { name } => reply.value = store.secrets.get(&name).cloned(),
+                    SecretOp::Set { .. } if store.fail_secret_set => {
+                        return Err("secret backend unavailable".into());
+                    }
                     SecretOp::Set { name, value, .. } => {
                         store.secrets.insert(name, value);
                     }
@@ -335,6 +410,14 @@ mod tests {
             db_path: PathBuf::from("/tmp/orca-unraid-endpoint-test.db"),
             ports: Default::default(),
         }))
+    }
+
+    /// A `var.ini` marking this host as Unraid, carrying `token` as its CSRF.
+    fn var_ini(token: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("var.ini");
+        std::fs::write(&path, format!("csrf_token=\"{token}\"\n")).unwrap();
+        (dir, path)
     }
 
     fn create_args(name: &str, api_key: &str, routes: Vec<Route>) -> UnraidCreateArgs {
@@ -414,7 +497,8 @@ mod tests {
                 .await
                 .unwrap();
                 let row = endpoint_db::require("tower-b").unwrap();
-                (out, resolve_config(&row).await.unwrap())
+                let (_dir, ini) = var_ini("t");
+                (out, resolve_config_with(&row, &ini).await.unwrap())
             })
         });
         assert_eq!(out.applied, vec!["api_key".to_string()]);
@@ -426,19 +510,136 @@ mod tests {
     }
 
     #[test]
-    fn no_routes_resolves_to_loopback() {
+    fn no_routes_on_an_unraid_host_resolves_to_loopback_with_csrf() {
         let rt = rt();
         let store = Rc::new(RefCell::new(Store::default()));
+        let (_dir, ini) = var_ini("LOCAL-CSRF");
         let cfg = with_store(&store, || {
             rt.block_on(async {
                 unraid_create(create_args("tower-c", "k", Vec::new()), &ctx())
                     .await
                     .unwrap();
                 let row = endpoint_db::require("tower-c").unwrap();
-                resolve_config(&row).await.unwrap()
+                resolve_config_with(&row, &ini).await.unwrap()
             })
         });
         assert_eq!(cfg.url, LOCAL_URL);
+        assert_eq!(
+            cfg.headers().get("x-csrf-token").map(String::as_str),
+            Some("LOCAL-CSRF")
+        );
+    }
+
+    #[test]
+    fn no_routes_off_an_unraid_host_errors() {
+        let rt = rt();
+        let store = Rc::new(RefCell::new(Store::default()));
+        let dir = tempfile::tempdir().unwrap();
+        let err = with_store(&store, || {
+            rt.block_on(async {
+                unraid_create(create_args("tower-g", "k", Vec::new()), &ctx())
+                    .await
+                    .unwrap();
+                let row = endpoint_db::require("tower-g").unwrap();
+                resolve_config_with(&row, &dir.path().join("var.ini"))
+                    .await
+                    .unwrap_err()
+            })
+        });
+        assert!(
+            err.to_string()
+                .contains("this host is not an Unraid server"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn only_route_disabled_errors_instead_of_falling_back_to_loopback() {
+        let rt = rt();
+        let store = Rc::new(RefCell::new(Store::default()));
+        let (_dir, ini) = var_ini("LOCAL-CSRF");
+        let mut route = route::parse_route("lan_v4=http://10.0.0.5").unwrap();
+        route.enabled = false;
+        let err = with_store(&store, || {
+            rt.block_on(async {
+                unraid_create(create_args("tower-h", "k", vec![route]), &ctx())
+                    .await
+                    .unwrap();
+                let row = endpoint_db::require("tower-h").unwrap();
+                resolve_config_with(&row, &ini).await.unwrap_err()
+            })
+        });
+        assert!(
+            err.to_string()
+                .contains("no enabled URL-addressable routes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn csrf_token_only_attaches_to_loopback_urls() {
+        let (_dir, ini) = var_ini("LOCAL-CSRF");
+        for url in [
+            LOCAL_URL,
+            "http://127.0.0.1:8080/",
+            "https://localhost",
+            "http://[::1]:80",
+        ] {
+            assert_eq!(
+                local_csrf_from(url, &ini).as_deref(),
+                Some("LOCAL-CSRF"),
+                "{url}"
+            );
+        }
+        for url in [
+            "http://10.0.0.5",
+            "https://tower.example:443",
+            "http://127.0.0.1.example",
+            "http://localhost@10.0.0.5",
+            "http://10.0.0.5/127.0.0.1",
+        ] {
+            assert_eq!(local_csrf_from(url, &ini), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn invalid_names_are_rejected_before_any_write() {
+        let rt = rt();
+        let store = Rc::new(RefCell::new(Store::default()));
+        let long = "a".repeat(65);
+        for name in ["", "a.b", "a b", "a/b", long.as_str()] {
+            let err = with_store(&store, || {
+                rt.block_on(unraid_create(create_args(name, "k", Vec::new()), &ctx()))
+                    .err()
+                    .unwrap()
+            });
+            assert!(err.to_string().contains("invalid endpoint name"), "{err}");
+        }
+        let s = store.borrow();
+        assert!(s.rows.is_empty());
+        assert!(s.secrets.is_empty());
+    }
+
+    #[test]
+    fn failed_secret_write_rolls_back_the_row() {
+        let rt = rt();
+        let store = Rc::new(RefCell::new(Store {
+            fail_secret_set: true,
+            ..Default::default()
+        }));
+        let err = with_store(&store, || {
+            rt.block_on(unraid_create(
+                create_args("tower-i", "k", Vec::new()),
+                &ctx(),
+            ))
+            .err()
+            .unwrap()
+        });
+        assert!(
+            format!("{err:#}").contains("secret backend unavailable"),
+            "{err:#}"
+        );
+        assert!(store.borrow().rows.is_empty());
     }
 
     #[test]
@@ -498,6 +699,7 @@ mod tests {
             })
         });
         assert!(out.changed);
+        assert!(out.secret_removed);
         let s = store.borrow();
         assert!(s.rows.is_empty());
         assert!(s.secrets.is_empty());
