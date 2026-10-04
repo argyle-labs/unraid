@@ -1,0 +1,71 @@
+{
+  "Id": "5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b",
+  "Name": "/dockge",
+  "Image": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+  "State": { "Status": "running", "Running": true },
+  "Config": {
+    "Hostname": "5a4b3c2d1e0f",
+    "User": "",
+    "WorkingDir": "/app",
+    "Env": [
+      "DOCKGE_STACKS_DIR=/opt/stacks",
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "NODE_VERSION=22.12.0",
+      "YARN_VERSION=1.22.22"
+    ],
+    "Cmd": ["node", "./extra/healthcheck.js"],
+    "Entrypoint": ["/usr/bin/dumb-init", "--"],
+    "Image": "louislam/dockge:1",
+    "Labels": {
+      "com.docker.compose.config-hash": "8e1f2b3c",
+      "com.docker.compose.container-number": "1",
+      "com.docker.compose.depends_on": "",
+      "com.docker.compose.image": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "com.docker.compose.oneoff": "False",
+      "com.docker.compose.project": "dockge",
+      "com.docker.compose.project.config_files": "/opt/stacks/dockge/compose.yaml",
+      "com.docker.compose.project.working_dir": "/opt/stacks/dockge",
+      "com.docker.compose.service": "dockge",
+      "com.docker.compose.version": "2.29.7"
+    }
+  },
+  "HostConfig": {
+    "NetworkMode": "dockge_default",
+    "Privileged": false,
+    "PortBindings": { "5001/tcp": [{ "HostIp": "", "HostPort": "5001" }] },
+    "RestartPolicy": { "Name": "unless-stopped", "MaximumRetryCount": 0 },
+    "LogConfig": { "Type": "json-file", "Config": {} },
+    "ShmSize": 67108864,
+    "IpcMode": "private",
+    "Runtime": "runc"
+  },
+  "Mounts": [
+    {
+      "Type": "bind",
+      "Source": "/var/run/docker.sock",
+      "Destination": "/var/run/docker.sock",
+      "Mode": "rw",
+      "RW": true,
+      "Propagation": "rprivate"
+    },
+    {
+      "Type": "bind",
+      "Source": "/opt/stacks",
+      "Destination": "/opt/stacks",
+      "Mode": "rw",
+      "RW": true,
+      "Propagation": "rprivate"
+    },
+    {
+      "Type": "volume",
+      "Name": "dockge_data",
+      "Source": "/var/lib/docker/volumes/dockge_data/_data",
+      "Destination": "/app/data",
+      "Driver": "local",
+      "Mode": "z",
+      "RW": true,
+      "Propagation": ""
+    }
+  ],
+  "NetworkSettings": { "Networks": { "dockge_default": { "IPAMConfig": null } } }
+}

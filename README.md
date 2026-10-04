@@ -29,6 +29,7 @@ orca talks to a live Unraid host through its **GraphQL API** (typed queries, no 
 | `unraid.schema` | Inspect the embedded GraphQL schemas, pull a fresh introspection from a live host, or check drift between live and committed. |
 | `unraid.<operation>` | **Auto-generated, one per GraphQL operation** — e.g. `unraid.array_status`, `unraid.shares`, `unraid.docker_containers`, `unraid.parity_history`. Args carry the operation's typed variables; the return is its typed response. Mutations require `role = "admin"`. See below. |
 | `unraid.plugins` / `unraid.installed_plugins` / `unraid.add_plugin` / `unraid.remove_plugin` / `unraid.install_plugin` / `unraid.plugin_install_operations` | **Plugin management** over the Unraid plugin manager: list (with versions), add, remove, and install/update by `.plg` URL. `unraid.install_plugin` with `forced: true` is the update path — because the plugin manager runs as root and owns the USB `/boot` write, routing orca's **own** update through it is what makes a self-update survive reboot (vs. the unprivileged daemon, which can't write flash). Installs are async — poll `unraid.plugin_install_operations` for `QUEUED → RUNNING → SUCCEEDED`. |
+| `unraid.docker.status` / `unraid.docker.set_icon` / `unraid.docker.adopt` | **Unraid-native Docker containers** on the host the plugin runs on — see below. |
 
 ### Auto-generated operation tools
 
@@ -44,6 +45,16 @@ orca unraid.create --name tower --api-key "$KEY" --route lan_v4=http://10.0.0.5 
 orca unraid.update --name tower --api-key "$NEW_KEY"                               # rotate the key
 ```
 
+### Unraid-native Docker containers
+
+A container created with `docker run` or compose shows as "3rd Party" in Unraid's Docker tab. These verbs run on the Unraid host itself and drive the local `docker` CLI plus dockerMan's own PHP renderer and `rebuild_container` script.
+
+- `unraid.docker.status` (read-only) — per container: whether `my-<name>.xml` exists, the `net.unraid.docker.managed` label, the icon (and whether it is an argyle-labs repo icon), autostart membership, and the docker volumes it mounts; plus host-wide dangling volume/image counts.
+- `unraid.docker.set_icon --name <c> --repo <r>` — sets an existing template's `<Icon>` to `<icon_base>/<r>/raw/branch/main/assets/icon-256.png` (default base `https://gitea.scottkey.me/argyle-labs`), rebuilds the container keeping its running/stopped state, clears both icon caches and refreshes them.
+- `unraid.docker.adopt --name <c> [--repo <r>] [--migrate-volumes] [--autostart <bool>]` — builds a dockerMan template from `docker inspect` (ports, env minus image-baked values, binds, named volumes, GPU requests, hostname, tmpfs, log options, restart policy, labels, non-default bind propagation as `--mount`), renders it with dockerMan's `xmlToCommand`, and **refuses unless the rendered command reproduces the live container** apart from what Unraid injects (`TZ`/`HOST_*` env, `--pids-limit`, `net.unraid.docker.*` labels). Facets a template cannot carry (capabilities, devices, entrypoint overrides, static IPs, …) are reported and block execute. It then backs up any existing template to `my-<name>.xml.bak-<YYYYMMDD>`, writes the template (marked `<!-- managed-by: orca -->`), adds the name to `/var/lib/docker/unraid-autostart` when autostart is on, recreates through `rebuild_container`, verifies the container is `dockerman`-managed and unchanged, and removes leftovers: unused dangling anonymous volumes, dangling images, a compose container's `<project>_default` network, and its own compose stack directory (moved to `stacks-retired/<name>-compose-<date>` unless another container still uses or mounts it). A compose container moves to the `bridge` network. `--migrate-volumes` stops the container, copies each docker volume into `/mnt/user/appdata/<name>/<suffix>` with `cp -a`, verifies file count and bytes, mounts those paths instead, and removes the old volumes once the recreated container is running.
+
+`set_icon` and `adopt` are **dry-run by default**: without `--execute` they return the template XML, the rendered command, the fidelity diff, and the ordered step list, and change nothing. `--execute` requires an admin caller.
+
 **Topology backend** — a `topology` collector (registered via the toolkit's `topology_backend_def`) emits one `container` claim per Docker workload per enabled endpoint, so Unraid hosts and the containers they run surface in orca's systems graph. The GraphQL API is the read path because Unraid's Docker socket is `root:docker`-only.
 
 Because the client pins a committed schema per Unraid version, it detects **schema drift**: when a live host's introspection diverges from the embedded schema (or its version has no committed schema at all), it warns once per host so stale generated queries surface early.
@@ -57,6 +68,7 @@ Mint one on the host — `unraid-api apikey --create --name "orca collector"` �
 - `src/lib.rs` — typed GraphQL client facade (per-version schema routing, drift detection).
 - `src/endpoint.rs` — `#[endpoint_resource]` registry (`unraid.{list,detail,create,update,delete}`) and route + secret resolution into a client `Config`.
 - `src/tools.rs` — the `unraid.schema` tool (pull / drift-check).
+- `src/docker_adopt/` — the `unraid.docker.*` verbs: inspect → template mapping, dockerMan command parsing + fidelity diff, leftover selection (pure, fixture-tested), and the host side effects.
 - `src/topology.rs` — the `TopologyClaim` collector (Docker workloads via GraphQL).
 - `src/registration.rs` — advertises the `topology` backend and dispatches its `collect_claims` op.
 - `src/schema_pull.rs` / `src/version.rs` — introspection pull + version parsing.

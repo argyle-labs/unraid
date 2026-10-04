@@ -1,0 +1,16 @@
+{
+  "Id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "Config": {
+    "Env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "LANG=C.UTF-8"
+    ],
+    "Cmd": null,
+    "Entrypoint": ["/init"],
+    "User": "",
+    "WorkingDir": "",
+    "Labels": {
+      "org.opencontainers.image.source": "https://github.com/ayufan/pve-backup-server-dockerfiles"
+    }
+  }
+}
