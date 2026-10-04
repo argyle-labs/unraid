@@ -618,6 +618,22 @@ pub(crate) mod tests {
         assert!(e.contains("deeper than"), "{e}");
     }
 
+    #[test]
+    fn copy_check_refuses_fifos() {
+        let (_d, r) = root();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(r.join("pipe"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let e = check_copyable(&Dir::open(&r).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("Fifo"), "{e}");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn copy_check_refuses_device_nodes() {
@@ -625,14 +641,18 @@ pub(crate) mod tests {
             return;
         }
         let (_d, r) = root();
-        assert!(
-            std::process::Command::new("mknod")
-                .arg(r.join("null"))
-                .args(["c", "1", "3"])
-                .status()
-                .unwrap()
-                .success()
-        );
+        // Root inside a user namespace (an unprivileged LXC, or a CI job in one) may not create devices.
+        if rustix::fs::mknodat(
+            rustix::fs::CWD,
+            r.join("null"),
+            FileType::CharacterDevice,
+            Mode::from_raw_mode(0o600),
+            rustix::fs::makedev(1, 3),
+        )
+        .is_err()
+        {
+            return;
+        }
         let e = check_copyable(&Dir::open(&r).unwrap())
             .unwrap_err()
             .to_string();
