@@ -28,8 +28,8 @@ use plugin_toolkit::contract::diagnostics::{
 use plugin_toolkit::reactor;
 use plugin_toolkit::serde_json;
 
-use crate::endpoint::{EndpointRow, endpoint_db};
-use crate::{Client, Config};
+use crate::Client;
+use crate::endpoint::{EndpointRow, endpoint_db, resolve_config};
 
 /// Unraid flash config that holds `shutdownTimeout`.
 const DISK_CFG: &str = "/boot/config/disk.cfg";
@@ -114,7 +114,17 @@ async fn check_vm_manager() -> Vec<Finding> {
     };
     let mut out = Vec::new();
     for ep in rows {
-        let cfg = Config::new(ep.base_url.clone(), ep.api_key.clone()).insecure(ep.insecure);
+        let cfg = match resolve_config(&ep).await {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                out.push(finding_vm_manager(
+                    &ep.name,
+                    crate::vm_manager::VmManager::Unavailable,
+                    Some(&format!("{e:#}")),
+                ));
+                continue;
+            }
+        };
         let client = Client::new(cfg);
         let result = client.vms().await;
         let state = crate::vm_manager::classify(&result);
@@ -410,7 +420,7 @@ fn check_unclean_shutdown() -> Option<Finding> {
     };
     let row = rows.into_iter().next()?;
     let running = reactor::block_on(async move {
-        let cfg = Config::new(row.base_url, row.api_key).insecure(row.insecure);
+        let cfg = resolve_config(&row).await.ok()?;
         Client::new(cfg)
             .parity_history()
             .await
@@ -896,7 +906,13 @@ async fn collect_autostart(rows: &[EndpointRow]) -> (Vec<String>, Vec<String>) {
     let mut offenders = Vec::new();
     let mut errors = Vec::new();
     for ep in rows {
-        let cfg = Config::new(ep.base_url.clone(), ep.api_key.clone()).insecure(ep.insecure);
+        let cfg = match resolve_config(ep).await {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                errors.push(format!("{}: {e:#}", ep.name));
+                continue;
+            }
+        };
         let client = Client::new(cfg);
         match client.docker_containers().await {
             Ok(d) => {

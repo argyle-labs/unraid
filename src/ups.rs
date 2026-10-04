@@ -9,21 +9,26 @@
 
 use plugin_toolkit::contract::ups::{UpsConfig, UpsConfigOutcome, UpsQueryArgs, UpsState};
 
-use crate::endpoint::endpoint_db;
+use crate::endpoint::{endpoint_db, resolve_config};
 use crate::generated::v7_3_1::configure_ups::{UPSConfigInput, UPSKillPower};
-use crate::{Client, Config, PROVIDER};
+use crate::{Client, PROVIDER};
 
-/// First enabled endpoint's client config, or `None` (not on the peer / not
-/// configured). UPS management is host-local to the Unraid box.
-fn first_client() -> Option<Client> {
-    let row = endpoint_db::list().ok()?.into_iter().find(|e| e.enabled)?;
-    let cfg = Config::new(row.base_url, row.api_key).insecure(row.insecure);
-    Some(Client::new(cfg))
+/// First enabled endpoint's client, or `None` when none is registered (not on
+/// the peer / not configured). UPS management is host-local to the Unraid box.
+async fn first_client() -> Result<Option<Client>, String> {
+    let Some(row) = endpoint_db::list()
+        .ok()
+        .and_then(|rows| rows.into_iter().find(|e| e.enabled))
+    else {
+        return Ok(None);
+    };
+    let cfg = resolve_config(&row).await.map_err(|e| format!("{e:#}"))?;
+    Ok(Some(Client::new(cfg)))
 }
 
 /// `state` op — live UPS readings via `upsDevices`.
 pub async fn state_typed(args: UpsQueryArgs) -> Result<Vec<UpsState>, String> {
-    let Some(client) = first_client() else {
+    let Some(client) = first_client().await? else {
         return Ok(Vec::new());
     };
     let states: Vec<UpsState> = client
@@ -60,7 +65,7 @@ pub async fn state_typed(args: UpsQueryArgs) -> Result<Vec<UpsState>, String> {
 
 /// `config_get` op — apcupsd thresholds + kill-power via `upsConfiguration`.
 pub async fn config_get_typed(args: UpsQueryArgs) -> Result<Vec<UpsConfig>, String> {
-    let Some(client) = first_client() else {
+    let Some(client) = first_client().await? else {
         return Ok(Vec::new());
     };
     let c = client
@@ -88,7 +93,7 @@ pub async fn config_get_typed(args: UpsQueryArgs) -> Result<Vec<UpsConfig>, Stri
 /// mutation. Only the fields present in the incoming config are sent; the rest
 /// are left `None` so Unraid preserves them.
 pub async fn config_set_typed(cfg: UpsConfig) -> Result<UpsConfigOutcome, String> {
-    let Some(client) = first_client() else {
+    let Some(client) = first_client().await? else {
         return Err("no Unraid endpoint registered (not on the peer?)".to_string());
     };
     // `UPSConfigInput` fields (`minutes`, `timeout`) are Unraid's own API units,
