@@ -129,6 +129,8 @@ pub enum Step {
     RemoveOwnAnonymousVolumes {
         candidates: Vec<String>,
     },
+    /// Refuse to rebuild over copies if the container started since.
+    EnsureStopped,
     /// Create an empty volume carrying `labels`; refuses one that exists.
     CreateVolume {
         volume: String,
@@ -170,6 +172,7 @@ impl Step {
             Step::RefreshIcons => "refresh-icons",
             Step::RemoveVolume { .. } => "remove-volume",
             Step::RemoveOwnAnonymousVolumes { .. } => "remove-own-anonymous-volumes",
+            Step::EnsureStopped => "ensure-stopped",
             Step::CreateVolume { .. } => "create-volume",
             Step::CopyIntoVolume { .. } => "copy-into-volume",
             Step::ExposeCopy { .. } => "expose-copy",
@@ -228,11 +231,23 @@ impl Step {
             ),
             Step::RemoveVolume { volume } => (
                 volume.clone(),
-                Some("only once the copy verified and the container runs".to_string()),
+                Some(
+                    "only once the copy verified, the container runs and the volume still \
+                     matches the copy's manifest"
+                        .to_string(),
+                ),
             ),
             Step::RemoveOwnAnonymousVolumes { candidates } => (
                 format!("[{}]", candidates.join(", ")),
-                Some("only those no container mounts after the rebuild".to_string()),
+                Some(
+                    "only those no container mounts after the rebuild and that still match \
+                     their copy's manifest"
+                        .to_string(),
+                ),
+            ),
+            Step::EnsureStopped => (
+                name.to_string(),
+                Some("still stopped since its volumes were copied".to_string()),
             ),
             Step::CreateVolume { volume, labels } => (
                 volume.clone(),
@@ -277,6 +292,47 @@ async fn volume_exists(ops: &dyn HostOps, name: &str) -> Result<bool> {
         .docker(&["volume", "ls", "-q", "--filter", &format!("name={name}")])
         .await?;
     Ok(out.lines().any(|l| l.trim() == name))
+}
+
+async fn inspect_volume(ops: &dyn HostOps, name: &str) -> Result<VolumeInspect> {
+    let out = ops.docker(&["volume", "inspect", name]).await?;
+    let all: Vec<VolumeInspect> =
+        serde_json::from_str(&out).context("decode docker volume inspect")?;
+    all.into_iter()
+        .find(|v| v.name == name)
+        .ok_or_else(|| anyhow!("volume {name} not found"))
+}
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Why `volume` may not be removed: no verified copy of it was recorded this
+/// run, or its content (re-read as root) no longer matches that copy.
+async fn changed_since_copy(
+    ops: &dyn HostOps,
+    cx: &ApplyCtx,
+    volume: &str,
+    xattrs: bool,
+) -> Result<Option<String>> {
+    let Some(copied) = lock(&cx.state).manifests.get(volume).cloned() else {
+        return Ok(Some("no verified copy of it was recorded".to_string()));
+    };
+    let now = ops
+        .privileged(&PrivilegedOp::ManifestVolume {
+            volume: volume.to_string(),
+            xattrs,
+        })
+        .await?;
+    Ok(match privileged::manifest_digest(&now) {
+        Some(d) if d == copied => None,
+        Some(d) => Some(format!(
+            "changed since it was copied (manifest {} then, {} now)",
+            &copied[..12],
+            &d[..12]
+        )),
+        None => Some(format!("its manifest could not be read: {now}")),
+    })
 }
 
 #[orca_struct]
@@ -396,6 +452,9 @@ async fn run_step(ops: &dyn HostOps, step: &Step, cx: &ApplyCtx) -> Result<Strin
             if !ops.inspect_container(name).await?.state.running {
                 return Ok(format!("kept {volume}: container is not running"));
             }
+            if let Some(why) = changed_since_copy(ops, cx, volume, false).await? {
+                return Ok(format!("kept {volume}: {why}"));
+            }
             ops.docker(&["volume", "rm", volume])
                 .await
                 .map(|_| format!("removed {volume}"))
@@ -405,13 +464,16 @@ async fn run_step(ops: &dyn HostOps, step: &Step, cx: &ApplyCtx) -> Result<Strin
             let free = orphans::unmounted(candidates, &all);
             let mut removed = Vec::new();
             let mut gone = Vec::new();
+            let mut changed = Vec::new();
             for v in &free {
                 // dockerMan's rebuild may already have removed them.
-                if volume_exists(ops, v).await? {
-                    ops.docker(&["volume", "rm", v]).await?;
-                    removed.push(v.as_str());
+                if !volume_exists(ops, v).await? {
+                    gone.push(v.clone());
+                } else if let Some(why) = changed_since_copy(ops, cx, v, true).await? {
+                    changed.push(format!("{v} ({why})"));
                 } else {
-                    gone.push(v.as_str());
+                    ops.docker(&["volume", "rm", v]).await?;
+                    removed.push(v.clone());
                 }
             }
             let kept: Vec<&str> = candidates
@@ -420,11 +482,19 @@ async fn run_step(ops: &dyn HostOps, step: &Step, cx: &ApplyCtx) -> Result<Strin
                 .map(String::as_str)
                 .collect();
             Ok(format!(
-                "removed [{}]; already gone [{}]; kept (still mounted) [{}]",
+                "removed [{}]; already gone [{}]; kept (still mounted) [{}]; kept (not \
+                 proven unchanged) [{}]",
                 removed.join(", "),
                 gone.join(", "),
-                kept.join(", ")
+                kept.join(", "),
+                changed.join(", ")
             ))
+        }
+        Step::EnsureStopped => {
+            if ops.inspect_container(name).await?.state.running {
+                bail!("{name} started after its volumes were copied; not rebuilding over the copy");
+            }
+            Ok("stopped".into())
         }
         Step::CreateVolume { volume, labels } => {
             if volume_exists(ops, volume).await? {
@@ -437,9 +507,33 @@ async fn run_step(ops: &dyn HostOps, step: &Step, cx: &ApplyCtx) -> Result<Strin
             }
             args.push(volume.clone());
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            ops.docker(&args)
-                .await
-                .map(|_| format!("created {volume} with {}", label_list(labels)))
+            ops.docker(&args).await?;
+            // `docker volume create` succeeds on an existing name, so the
+            // volume is only this run's if it has exactly these labels and
+            // nothing in it.
+            let v = inspect_volume(ops, volume).await?;
+            if &v.labels() != labels {
+                bail!(
+                    "volume {volume} has labels [{}], not the requested ones; it is not this run's",
+                    label_list(&v.labels())
+                );
+            }
+            let empty = ops
+                .privileged(&PrivilegedOp::VolumeEmpty {
+                    volume: volume.clone(),
+                })
+                .await?;
+            if empty != privileged::VOLUME_EMPTY {
+                bail!("volume {volume} is not empty; it is not this run's");
+            }
+            lock(&cx.state)
+                .created
+                .push((volume.clone(), v.created_at.clone()));
+            Ok(format!(
+                "created {volume} at {} with {}",
+                v.created_at,
+                label_list(labels)
+            ))
         }
         Step::CopyIntoVolume { from, to } => {
             ops.privileged(&PrivilegedOp::CopyIntoVolume {
@@ -484,7 +578,19 @@ pub struct ApplyCtx {
     pub had_template: bool,
     /// The live container before anything changed, for recovery commands.
     pub original: RunSpec,
+    /// Anonymous volumes this run converts, named in recovery commands.
+    pub conversions: Vec<Conversion>,
     pub redactor: Redactor,
+    pub state: std::sync::Mutex<ApplyState>,
+}
+
+/// What the apply path learns as it goes.
+#[derive(Debug, Default)]
+pub struct ApplyState {
+    /// Source volume -> its manifest digest when it was copied.
+    pub manifests: BTreeMap<String, String>,
+    /// `(volume, CreatedAt)` of each volume this run created.
+    pub created: Vec<(String, String)>,
 }
 
 impl ApplyCtx {
@@ -507,6 +613,12 @@ impl ApplyCtx {
              values are in the saved inspect).",
             spec::docker_run_command(&self.original)
         ));
+        for c in &self.conversions {
+            r.push_str(&format!(
+                " Data for {} is in volume {}; use -v {}:{} in place of the {} mount.",
+                c.target, c.new, c.new, c.target, c.old
+            ));
+        }
         r
     }
 }
@@ -523,7 +635,6 @@ pub async fn apply(ops: &dyn HostOps, cx: &ApplyCtx, steps: &[Step]) -> Result<V
     let mut autostart_changed = false;
     let mut copies: Vec<String> = Vec::new();
     let mut exposed: Vec<String> = Vec::new();
-    let mut created: Vec<String> = Vec::new();
     for step in steps {
         let change = step.change(name, &cx.run_id);
         // Marked before running: a failed rebuild leaves the container in an
@@ -547,8 +658,13 @@ pub async fn apply(ops: &dyn HostOps, cx: &ApplyCtx, steps: &[Step]) -> Result<V
                 match step {
                     Step::CopyVolume { suffix, .. } => copies.push(suffix.clone()),
                     Step::ExposeCopy { suffix } => exposed.push(suffix.clone()),
-                    Step::CreateVolume { volume, .. } => created.push(volume.clone()),
                     _ => {}
+                }
+                if let Step::CopyVolume { volume: v, .. } | Step::CopyIntoVolume { from: v, .. } =
+                    step
+                    && let Some(d) = privileged::manifest_digest(&detail)
+                {
+                    lock(&cx.state).manifests.insert(v.clone(), d);
                 }
                 done.push(StepOutcome {
                     action: change.action,
@@ -621,8 +737,13 @@ pub async fn apply(ops: &dyn HostOps, cx: &ApplyCtx, steps: &[Step]) -> Result<V
                 .await;
             note(format!("remove copy {suffix}"), r);
         }
-        for v in &created {
-            let r = ops.docker(&["volume", "rm", v]).await;
+        let created = lock(&cx.state).created.clone();
+        for (v, at) in &created {
+            let r = match inspect_volume(ops, v).await {
+                Ok(now) if &now.created_at == at => ops.docker(&["volume", "rm", v]).await,
+                Ok(_) => Err(anyhow!("it is no longer the volume this run created; kept")),
+                Err(e) => Err(e),
+            };
             note(format!("remove volume {v}"), r);
         }
         if stopped && cx.was_running {
@@ -657,6 +778,8 @@ pub struct Snapshot {
     /// Volumes that already exist under a name an anonymous volume would
     /// convert to.
     pub conversion_targets: BTreeMap<String, VolumeInspect>,
+    /// The container's anonymous volumes the root path found empty.
+    pub empty_volumes: BTreeSet<String>,
     pub existing_template: Option<String>,
     /// `(file, <Name>)` of every template in templates-user.
     pub templates: Vec<(String, Option<String>)>,
@@ -865,8 +988,14 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
     }
 
     let migrated: Vec<String> = migrations.iter().map(|m| m.volume.clone()).collect();
-    let (conversions, conversion_blockers) =
-        ownership::plan_conversions(c, &s.volumes, &s.conversion_targets, &s.all, &migrated);
+    let (conversions, conversion_blockers) = ownership::plan_conversions(
+        c,
+        &s.volumes,
+        &s.conversion_targets,
+        &s.empty_volumes,
+        &s.all,
+        &migrated,
+    );
     blockers.extend(conversion_blockers);
     for cv in &conversions {
         convert_mount(&mut target, cv);
@@ -892,7 +1021,7 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
             .or_else(|| c.label(ICON_LABEL).map(str::to_string))
             .unwrap_or_default(),
     };
-    let template = Template::from_spec(&target, &icon, &volume_labels(&conversions));
+    let template = Template::from_spec(&target, &icon, &labeled_volumes(&conversions));
     let template_xml = template.render();
 
     let was_running = c.state.running;
@@ -922,6 +1051,9 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
             st.push(Step::ExposeCopy {
                 suffix: m.suffix.clone(),
             });
+        }
+        if !migrations.is_empty() || !conversions.is_empty() {
+            st.push(Step::EnsureStopped);
         }
         st.push(Step::Rebuild)
     });
@@ -1001,10 +1133,10 @@ fn convert_mount(spec: &mut RunSpec, cv: &Conversion) {
     }
 }
 
-fn volume_labels(conversions: &[Conversion]) -> BTreeMap<String, BTreeMap<String, String>> {
+fn labeled_volumes(conversions: &[Conversion]) -> BTreeMap<String, template::LabeledVolume> {
     conversions
         .iter()
-        .map(|c| (c.new.clone(), c.labels.clone()))
+        .map(|c| (c.new.clone(), c.mount()))
         .collect()
 }
 
@@ -1372,17 +1504,19 @@ pub fn label_writes(
     labels: &BTreeMap<String, String>,
     conversions: &[Conversion],
 ) -> Vec<LabelWrite> {
-    std::iter::once(LabelWrite {
-        kind: "container".to_string(),
-        name: name.to_string(),
-        labels: labels.clone(),
-    })
-    .chain(conversions.iter().map(|c| LabelWrite {
-        kind: "volume".to_string(),
-        name: c.new.clone(),
-        labels: c.labels.clone(),
-    }))
-    .collect()
+    (!labels.is_empty())
+        .then(|| LabelWrite {
+            kind: "container".to_string(),
+            name: name.to_string(),
+            labels: labels.clone(),
+        })
+        .into_iter()
+        .chain(conversions.iter().map(|c| LabelWrite {
+            kind: "volume".to_string(),
+            name: c.new.clone(),
+            labels: c.labels.clone(),
+        }))
+        .collect()
 }
 
 fn execution_plan<A: Serialize>(
@@ -1423,15 +1557,28 @@ async fn snapshot(name: &str) -> Result<Snapshot> {
         }
     }
     let mut conversion_targets = BTreeMap::new();
+    let mut empty_volumes = BTreeSet::new();
+    let runner = privileged::runner();
     for m in container.volumes() {
-        if m.name
+        let Some(old) = m
+            .name
             .as_ref()
-            .is_some_and(|n| volumes.get(n).is_some_and(VolumeInspect::is_anonymous))
+            .filter(|n| volumes.get(*n).is_some_and(VolumeInspect::is_anonymous))
+        else {
+            continue;
+        };
+        let new = ownership::converted_name(name, &m.destination);
+        if let Ok(v) = host::inspect_volume(&new).await {
+            conversion_targets.insert(new, v);
+        }
+        if let Some(r) = &runner
+            && r.run(&PrivilegedOp::VolumeEmpty {
+                volume: old.clone(),
+            })
+            .await
+            .is_ok_and(|e| e == privileged::VOLUME_EMPTY)
         {
-            let new = ownership::converted_name(name, &m.destination);
-            if let Ok(v) = host::inspect_volume(&new).await {
-                conversion_targets.insert(new, v);
-            }
+            empty_volumes.insert(old.clone());
         }
     }
     let compose_file = container
@@ -1444,6 +1591,7 @@ async fn snapshot(name: &str) -> Result<Snapshot> {
         all: host::inspect_all().await?,
         volumes,
         conversion_targets,
+        empty_volumes,
         existing_template: std::fs::read_to_string(template::template_path(name)).ok(),
         templates: host::list_templates(),
         autostart: host::read_autostart(),
@@ -1539,6 +1687,9 @@ pub fn set_icon_steps(
         xml: xml.to_string(),
     });
     autostart_steps(&mut steps, in_autostart, was_running, in_autostart, |st| {
+        if !conversions.is_empty() {
+            st.push(Step::EnsureStopped);
+        }
         st.push(Step::Rebuild)
     });
     steps.push(Step::EnsureState {
@@ -1618,6 +1769,7 @@ async fn unraid_docker_set_icon(
         labels,
         intended: patch_intended,
         blockers: patch_blockers,
+        not_applied,
     } = set_icon_patch(&s, &live, &with_icon);
     blockers.extend(patch_blockers.into_iter().map(|b| format!("{path}: {b}")));
     let unchanged = xml == current
@@ -1680,17 +1832,21 @@ async fn unraid_docker_set_icon(
         notes: runner
             .iter()
             .map(|x| format!("root path: {}", x.kind()))
-            .chain(unchanged.then(|| {
-                "already up to date: icon, ownership labels and volumes; nothing to apply"
-                    .to_string()
-            }))
+            .chain(
+                not_applied
+                    .iter()
+                    .map(|n| format!("{}: {n}", template::template_path(name))),
+            )
+            .chain(unchanged.then(|| "nothing to apply".to_string()))
             .collect(),
         plan: None,
         steps: Vec::new(),
     };
     if !args.execute {
         let summary = if unchanged {
-            format!("{name} already has icon {url} and orca's labels; nothing to change")
+            format!(
+                "{name} already has icon {url} and what the template can carry; nothing to change"
+            )
         } else {
             format!("set {name}'s icon to {url}, write orca's ownership labels and rebuild")
         };
@@ -1714,7 +1870,9 @@ async fn unraid_docker_set_icon(
         autostart_before: s.autostart.iter().any(|n| n == name),
         had_template: true,
         original: live,
+        conversions,
         redactor: r,
+        state: Default::default(),
     };
     out.steps = apply(&host::LiveOps { runner }, &cx, &steps).await?;
     Ok(out)
@@ -1729,38 +1887,59 @@ pub struct SetIconPatch {
     pub labels: BTreeMap<String, String>,
     pub intended: Vec<String>,
     pub blockers: Vec<String>,
+    /// What the template cannot take, and why; the icon is still set.
+    pub not_applied: Vec<String>,
 }
 
 /// Add orca's ownership labels to the template's ExtraParams and turn each
-/// anonymous volume's Path entry into a labeled `--mount`.
+/// anonymous volume's Path entry into a labeled `--mount`. A template whose
+/// ExtraParams cannot be rewritten keeps the icon-only patch.
 pub fn set_icon_patch(s: &Snapshot, live: &RunSpec, xml: &str) -> SetIconPatch {
     let name = s.container.short_name();
-    let mut blockers = Vec::new();
-    let (conversions, b) =
-        ownership::plan_conversions(&s.container, &s.volumes, &s.conversion_targets, &s.all, &[]);
-    blockers.extend(b);
     let labels = ownership::container_labels(name);
     let mut xml = match template::set_labels(xml, &labels) {
         Ok(x) => x,
         Err(e) => {
-            blockers.push(e);
-            xml.to_string()
+            return SetIconPatch {
+                xml: xml.to_string(),
+                target: live.clone(),
+                conversions: Vec::new(),
+                labels: BTreeMap::new(),
+                intended: Vec::new(),
+                blockers: Vec::new(),
+                not_applied: vec![format!(
+                    "ownership labels and anonymous-volume conversions not applied: {e}"
+                )],
+            };
         }
     };
+    let (planned, blockers) = ownership::plan_conversions(
+        &s.container,
+        &s.volumes,
+        &s.conversion_targets,
+        &s.empty_volumes,
+        &s.all,
+        &[],
+    );
     let mut target = live.clone();
     target.labels.extend(labels.clone());
     let mut intended =
         ownership::label_changes(&format!("container {name}"), &live.labels, &labels);
-    for cv in &conversions {
+    let mut conversions = Vec::new();
+    let mut not_applied = Vec::new();
+    for cv in planned {
         match template::path_to_mount(&xml, &cv.old, &cv.mount_arg()) {
-            Ok(x) => xml = x,
-            Err(e) => blockers.push(format!("anonymous volume {}: {e}", cv.old)),
+            Ok(x) => {
+                xml = x;
+                convert_mount(&mut target, &cv);
+                intended.push(format!(
+                    "anonymous volume {} at {} -> volume {}",
+                    cv.old, cv.target, cv.new
+                ));
+                conversions.push(cv);
+            }
+            Err(e) => not_applied.push(format!("anonymous volume {} not converted: {e}", cv.old)),
         }
-        convert_mount(&mut target, cv);
-        intended.push(format!(
-            "anonymous volume {} at {} -> volume {}",
-            cv.old, cv.target, cv.new
-        ));
     }
     SetIconPatch {
         xml,
@@ -1769,6 +1948,7 @@ pub fn set_icon_patch(s: &Snapshot, live: &RunSpec, xml: &str) -> SetIconPatch {
         labels,
         intended,
         blockers,
+        not_applied,
     }
 }
 
@@ -1941,7 +2121,9 @@ async fn unraid_docker_adopt(args: UnraidDockerAdoptArgs, ctx: &ToolCtx) -> Resu
         autostart_before: s.autostart.iter().any(|n| n == name),
         had_template: s.existing_template.is_some(),
         original: plan.live.clone(),
+        conversions: plan.conversions.clone(),
         redactor: r,
+        state: Default::default(),
     };
     out.steps = apply(&host::LiveOps { runner }, &cx, &plan.steps).await?;
     Ok(out)

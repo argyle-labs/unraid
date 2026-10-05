@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::inspect::{self, ContainerInspect, VolumeInspect};
-use super::template;
+use super::template::{self, LabeledVolume};
 use super::validate_name;
 use crate::labels::{Labels, MANAGED, MOUNT, OWNER, OWNER_UNRAID, SERVICE, STACK};
 
@@ -65,11 +65,20 @@ pub struct Conversion {
     /// `new` already exists with exactly these labels and no container
     /// uses it (a re-run after a failed one), so it is not created again.
     pub reuse: bool,
+    /// `old` is empty, so the mount sets `volume-nocopy`.
+    pub nocopy: bool,
 }
 
 impl Conversion {
+    pub fn mount(&self) -> LabeledVolume {
+        LabeledVolume {
+            labels: self.labels.clone(),
+            nocopy: self.nocopy,
+        }
+    }
+
     pub fn mount_arg(&self) -> String {
-        template::volume_mount_arg(&self.new, &self.target, self.read_only, &self.labels)
+        template::volume_mount_arg(&self.new, &self.target, self.read_only, &self.mount())
     }
 }
 
@@ -80,11 +89,12 @@ pub fn converted_name(name: &str, target: &str) -> String {
 
 /// Conversions for `c`'s anonymous volumes except `skip`, and why any of
 /// them cannot be converted. `existing` holds the planned names that
-/// already exist as volumes.
+/// already exist as volumes; `empty` the anonymous volumes found empty.
 pub fn plan_conversions(
     c: &ContainerInspect,
     volumes: &BTreeMap<String, VolumeInspect>,
     existing: &BTreeMap<String, VolumeInspect>,
+    empty: &BTreeSet<String>,
     all: &[ContainerInspect],
     skip: &[String],
 ) -> (Vec<Conversion>, Vec<String>) {
@@ -142,6 +152,7 @@ pub fn plan_conversions(
         };
         blockers.extend(problems);
         out.push(Conversion {
+            nocopy: empty.contains(&old),
             old,
             new,
             target,
@@ -194,6 +205,7 @@ mod tests {
                 String::new(),
             )])),
             options: None,
+            created_at: String::new(),
         }
     }
 
@@ -228,8 +240,14 @@ mod tests {
                 },
             ),
         ]);
-        let (conv, blockers) =
-            plan_conversions(&c, &vols, &BTreeMap::new(), std::slice::from_ref(&c), &[]);
+        let (conv, blockers) = plan_conversions(
+            &c,
+            &vols,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            std::slice::from_ref(&c),
+            &[],
+        );
         assert!(blockers.is_empty(), "{blockers:?}");
         assert_eq!(conv.len(), 1, "only the anonymous volume converts");
         let cv = &conv[0];
@@ -257,17 +275,38 @@ mod tests {
         let mut ours = anon_volume("app_data");
         ours.labels = Some(volume_labels("app", "/data"));
         let existing = BTreeMap::from([("app_data".to_string(), ours.clone())]);
-        let (conv, b) = plan_conversions(&c, &vols, &existing, std::slice::from_ref(&c), &[]);
+        let (conv, b) = plan_conversions(
+            &c,
+            &vols,
+            &existing,
+            &BTreeSet::new(),
+            std::slice::from_ref(&c),
+            &[],
+        );
         assert!(b.is_empty(), "{b:?}");
         assert!(conv[0].reuse);
 
         let user = container(&[("app_data", "/x")]);
-        let (_, b) = plan_conversions(&c, &vols, &existing, &[c.clone(), user], &[]);
+        let (_, b) = plan_conversions(
+            &c,
+            &vols,
+            &existing,
+            &BTreeSet::new(),
+            &[c.clone(), user],
+            &[],
+        );
         assert!(b[0].contains("already exists"), "{b:?}");
 
         ours.labels = None;
         let existing = BTreeMap::from([("app_data".to_string(), ours)]);
-        let (_, b) = plan_conversions(&c, &vols, &existing, std::slice::from_ref(&c), &[]);
+        let (_, b) = plan_conversions(
+            &c,
+            &vols,
+            &existing,
+            &BTreeSet::new(),
+            std::slice::from_ref(&c),
+            &[],
+        );
         assert!(b[0].contains("already exists"), "{b:?}");
     }
 
@@ -283,7 +322,14 @@ mod tests {
             (other.clone(), anon_volume(&other)),
         ]);
         vols.get_mut(&other).unwrap().driver = "nfs".into();
-        let (_, b) = plan_conversions(&c, &vols, &BTreeMap::new(), &[c.clone(), shared], &[]);
+        let (_, b) = plan_conversions(
+            &c,
+            &vols,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &[c.clone(), shared],
+            &[],
+        );
         let all = b.join(" | ");
         assert!(all.contains("cannot be a --mount field"), "{all}");
         assert!(all.contains("also mounted by [sidecar]"), "{all}");
@@ -299,6 +345,7 @@ mod tests {
             &c,
             &vols,
             &BTreeMap::new(),
+            &BTreeSet::new(),
             std::slice::from_ref(&c),
             &[ANON.to_string()],
         );

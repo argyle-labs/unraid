@@ -83,6 +83,7 @@ fn local_volume(name: &str) -> VolumeInspect {
         mountpoint: VolumeInspect::expected_mountpoint(name),
         labels: None,
         options: None,
+        created_at: String::new(),
     }
 }
 
@@ -659,6 +660,7 @@ fn migrate_rewrites_paths_and_orders_steps() {
             "set-autostart",
             "expose-copy",
             "expose-copy",
+            "ensure-stopped",
             "rebuild",
             "ensure-state",
             "verify-managed",
@@ -785,7 +787,8 @@ struct Mock {
     calls: Mutex<Vec<String>>,
     ops: Mutex<Vec<PrivilegedOp>>,
     fail_on: Option<&'static str>,
-    container: ContainerInspect,
+    /// `docker stop`/`start` flip its running state.
+    container: Mutex<ContainerInspect>,
     image: ImageInspect,
     /// Output of a call with this prefix.
     outputs: Vec<(String, String)>,
@@ -801,7 +804,7 @@ impl Mock {
             calls: Mutex::new(Vec::new()),
             ops: Mutex::new(Vec::new()),
             fail_on,
-            container,
+            container: Mutex::new(container),
             image,
             outputs: Vec::new(),
         }
@@ -836,16 +839,24 @@ fn op_name(op: &PrivilegedOp) -> String {
 
 impl HostOps for Mock {
     fn docker<'a>(&'a self, args: &'a [&'a str]) -> BoxFuture<'a, Result<String>> {
-        Box::pin(async move { self.record(format!("docker {}", args.join(" "))) })
+        Box::pin(async move {
+            let out = self.record(format!("docker {}", args.join(" ")))?;
+            match args.first() {
+                Some(&"stop") => self.container.lock().unwrap().state.running = false,
+                Some(&"start") => self.container.lock().unwrap().state.running = true,
+                _ => {}
+            }
+            Ok(out)
+        })
     }
     fn inspect_container<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, Result<ContainerInspect>> {
-        Box::pin(async move { Ok(self.container.clone()) })
+        Box::pin(async move { Ok(self.container.lock().unwrap().clone()) })
     }
     fn inspect_image<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<ImageInspect>> {
         Box::pin(async move { Ok(self.image.clone()) })
     }
     fn inspect_all(&self) -> BoxFuture<'_, Result<Vec<ContainerInspect>>> {
-        Box::pin(async move { Ok(vec![self.container.clone()]) })
+        Box::pin(async move { Ok(vec![self.container.lock().unwrap().clone()]) })
     }
     fn privileged<'a>(&'a self, op: &'a PrivilegedOp) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
@@ -865,7 +876,9 @@ fn ctx(plan: &AdoptPlan, f: &Fx) -> ApplyCtx {
         autostart_before: false,
         had_template: false,
         original: plan.live.clone(),
+        conversions: plan.conversions.clone(),
         redactor: redactor_for(&f.c, &[&plan.target]),
+        state: Default::default(),
     }
 }
 
@@ -1016,7 +1029,9 @@ async fn verify_enforces_restart_for_adopt_but_not_set_icon() {
         autostart_before: true,
         had_template: true,
         original: got.clone(),
+        conversions: Vec::new(),
         redactor: Redactor::default(),
+        state: Default::default(),
     };
     let verify = |mode| Step::VerifyManaged {
         running: false,
@@ -1116,7 +1131,9 @@ async fn set_icon_applies_end_to_end_on_a_managed_container() {
         autostart_before: false,
         had_template: true,
         original: live,
+        conversions: Vec::new(),
         redactor: Redactor::default(),
+        state: Default::default(),
     };
     let out = apply(&mock, &cx, &steps).await.unwrap();
     assert_eq!(out.len(), steps.len());
@@ -1323,6 +1340,7 @@ fn adopt_labels_the_container_and_converts_anonymous_volumes() {
             "save-inspect",
             "write-template",
             "set-autostart",
+            "ensure-stopped",
             "rebuild",
             "ensure-state",
             "verify-managed",
@@ -1507,6 +1525,7 @@ fn set_icon_steps_stop_copy_and_clean_up_for_conversions() {
             "save-inspect",
             "write-template",
             "set-autostart",
+            "ensure-stopped",
             "rebuild",
             "set-autostart",
             "ensure-state",
@@ -1519,26 +1538,55 @@ fn set_icon_steps_stop_copy_and_clean_up_for_conversions() {
 }
 
 #[test]
-fn a_set_icon_template_that_cannot_be_patched_blocks() {
+fn a_template_that_cannot_take_labels_still_gets_its_icon() {
     let (f, s) = dockge_with_anonymous();
     let (live, _) = live_spec(&f.c, &f.img);
     let xml = dockge_template().replace(ANON, "/mnt/user/appdata/dockge/cache");
     let p = set_icon_patch(&s, &live, &xml);
+    assert!(p.blockers.is_empty(), "{:?}", p.blockers);
+    assert!(p.conversions.is_empty());
     assert!(
-        p.blockers.iter().any(|b| b.contains("no Path entry")),
+        p.not_applied[0].contains("not converted: no Path entry"),
         "{:?}",
-        p.blockers
+        p.not_applied
     );
+    assert!(p.xml.contains("orca.owner=unraid"), "labels still written");
+
     let amp = dockge_template().replace(
         "<ExtraParams/>",
         "<ExtraParams>-e A=&amp;amp;</ExtraParams>",
     );
     let p = set_icon_patch(&s, &live, &amp);
+    assert!(p.blockers.is_empty(), "{:?}", p.blockers);
+    assert_eq!(p.xml, amp, "the icon-only patch is kept");
+    assert_eq!(p.target, live);
+    assert!(p.labels.is_empty() && p.conversions.is_empty());
     assert!(
-        p.blockers.iter().any(|b| b.contains("'&'")),
+        p.not_applied[0]
+            .starts_with("ownership labels and anonymous-volume conversions not applied")
+            && p.not_applied[0].contains("'&'"),
         "{:?}",
-        p.blockers
+        p.not_applied
     );
+    assert!(label_writes("dockge", &p.labels, &p.conversions).is_empty());
+}
+
+/// `docker volume inspect` output for a volume carrying `labels`.
+fn volume_json(name: &str, labels: &BTreeMap<String, String>, created: &str) -> String {
+    serde_json::json!([{
+        "Name": name, "Driver": "local",
+        "Mountpoint": VolumeInspect::expected_mountpoint(name),
+        "Labels": labels, "CreatedAt": created,
+    }])
+    .to_string()
+}
+
+fn digest_reply(d: char) -> String {
+    format!(
+        "v: 1 entries, 1 bytes, {}{}",
+        privileged::MANIFEST_TAG,
+        d.to_string().repeat(64)
+    )
 }
 
 #[tokio::test]
@@ -1547,7 +1595,13 @@ async fn a_failed_copy_removes_the_volume_this_run_created() {
     f.c.state.running = true;
     let s = with_anonymous(&mut f);
     let plan = plan_adopt(&s, &opts(None, false));
-    let mock = Mock::new(f.c.clone(), f.img.clone(), Some("priv copy_into_volume"));
+    let labels = ownership::volume_labels("pbs", "/var/cache/pbs");
+    let mock = Mock::new(f.c.clone(), f.img.clone(), Some("priv copy_into_volume"))
+        .with_output(
+            "docker volume inspect",
+            &volume_json("pbs_var_cache_pbs", &labels, "2026-10-04T12:00:00Z"),
+        )
+        .with_output("priv volume_empty", privileged::VOLUME_EMPTY);
     let err = apply(&mock, &ctx(&plan, &f), &plan.steps)
         .await
         .unwrap_err()
@@ -1561,7 +1615,10 @@ async fn a_failed_copy_removes_the_volume_this_run_created() {
             "docker volume create --label orca.managed=true --label orca.mount=/var/cache/pbs \
              --label orca.owner=unraid --label orca.service=pbs --label orca.stack=pbs \
              pbs_var_cache_pbs",
+            "docker volume inspect pbs_var_cache_pbs",
+            "priv volume_empty",
             "priv copy_into_volume",
+            "docker volume inspect pbs_var_cache_pbs",
             "docker volume rm pbs_var_cache_pbs",
             "docker start pbs",
         ]
@@ -1583,6 +1640,77 @@ async fn a_failed_copy_removes_the_volume_this_run_created() {
 }
 
 #[tokio::test]
+async fn rollback_keeps_a_volume_recreated_by_someone_else() {
+    let f = pbs();
+    let plan = plan_adopt(&snapshot(&f), &opts(None, false));
+    let mock = Mock::new(f.c.clone(), f.img.clone(), Some("docker stop pbs")).with_output(
+        "docker volume inspect",
+        &volume_json("v", &BTreeMap::new(), "2026-10-04T13:00:00Z"),
+    );
+    let cx = ctx(&plan, &f);
+    cx.state
+        .lock()
+        .unwrap()
+        .created
+        .push(("v".into(), "2026-10-04T12:00:00Z".into()));
+    let err = apply(&mock, &cx, &[Step::Stop])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("remove volume v FAILED"), "{err}");
+    assert!(
+        err.contains("no longer the volume this run created"),
+        "{err}"
+    );
+    assert!(!mock.calls().contains(&"docker volume rm v".to_string()));
+}
+
+#[tokio::test]
+async fn a_created_volume_must_be_this_runs() {
+    let f = pbs();
+    let plan = plan_adopt(&snapshot(&f), &opts(None, false));
+    let step = || Step::CreateVolume {
+        volume: "v".into(),
+        labels: pbs_labels(),
+    };
+    // Someone else created `v` first; `docker volume create` still succeeds.
+    let mock = Mock::new(f.c.clone(), f.img.clone(), None).with_output(
+        "docker volume inspect",
+        &volume_json("v", &BTreeMap::new(), "t"),
+    );
+    let cx = ctx(&plan, &f);
+    let err = apply(&mock, &cx, &[step()]).await.unwrap_err().to_string();
+    assert!(err.contains("not the requested ones"), "{err}");
+    assert!(cx.state.lock().unwrap().created.is_empty());
+    assert!(!err.contains("remove volume"), "{err}");
+
+    // Right labels but data in it: also not this run's.
+    let mock = Mock::new(f.c.clone(), f.img.clone(), None)
+        .with_output(
+            "docker volume inspect",
+            &volume_json("v", &pbs_labels(), "t"),
+        )
+        .with_output("priv volume_empty", "not empty");
+    let cx = ctx(&plan, &f);
+    let err = apply(&mock, &cx, &[step()]).await.unwrap_err().to_string();
+    assert!(err.contains("is not empty"), "{err}");
+    assert!(cx.state.lock().unwrap().created.is_empty());
+
+    let mock = Mock::new(f.c.clone(), f.img.clone(), None)
+        .with_output(
+            "docker volume inspect",
+            &volume_json("v", &pbs_labels(), "t0"),
+        )
+        .with_output("priv volume_empty", privileged::VOLUME_EMPTY);
+    let cx = ctx(&plan, &f);
+    apply(&mock, &cx, &[step()]).await.unwrap();
+    assert_eq!(
+        cx.state.lock().unwrap().created,
+        vec![("v".to_string(), "t0".to_string())]
+    );
+}
+
+#[tokio::test]
 async fn create_volume_refuses_an_existing_volume() {
     let f = pbs();
     let mock = Mock::new(f.c.clone(), f.img.clone(), None)
@@ -1600,7 +1728,12 @@ async fn create_volume_refuses_an_existing_volume() {
     assert!(!mock.calls().iter().any(|c| c.contains("volume create")));
     // Only an exact name match counts.
     let mock = Mock::new(f.c.clone(), f.img.clone(), None)
-        .with_output("docker volume ls", "pbs_data_other\n");
+        .with_output("docker volume ls", "pbs_data_other\n")
+        .with_output(
+            "docker volume inspect",
+            &volume_json("pbs_data", &pbs_labels(), "t"),
+        )
+        .with_output("priv volume_empty", privileged::VOLUME_EMPTY);
     let step = Step::CreateVolume {
         volume: "pbs_data".into(),
         labels: pbs_labels(),
@@ -1609,31 +1742,189 @@ async fn create_volume_refuses_an_existing_volume() {
 }
 
 #[tokio::test]
-async fn anonymous_volume_cleanup_tolerates_ones_already_gone() {
+async fn old_volumes_are_removed_only_when_unchanged_since_their_copy() {
     let f = pbs();
     let plan = plan_adopt(&snapshot(&f), &opts(None, false));
-    let gone = "1".repeat(64);
+    let (same, changed, unrecorded, gone) = (
+        "a".repeat(64),
+        "b".repeat(64),
+        "c".repeat(64),
+        "d".repeat(64),
+    );
     let mock = Mock::new(f.c.clone(), f.img.clone(), None)
-        .with_output("docker volume ls", &format!("{ANON}\n"));
+        .with_output(
+            "docker volume ls",
+            &format!("{same}\n{changed}\n{unrecorded}\n"),
+        )
+        .with_output("priv manifest_volume", &digest_reply('1'));
+    let cx = ctx(&plan, &f);
+    {
+        let mut st = cx.state.lock().unwrap();
+        st.manifests.insert(same.clone(), "1".repeat(64));
+        st.manifests.insert(changed.clone(), "2".repeat(64));
+    }
     let out = apply(
         &mock,
-        &ctx(&plan, &f),
+        &cx,
         &[Step::RemoveOwnAnonymousVolumes {
-            candidates: vec![ANON.into(), gone.clone()],
+            candidates: vec![
+                same.clone(),
+                changed.clone(),
+                unrecorded.clone(),
+                gone.clone(),
+            ],
+        }],
+    )
+    .await
+    .unwrap();
+    let rm: Vec<String> = mock
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("docker volume rm"))
+        .collect();
+    assert_eq!(rm, vec![format!("docker volume rm {same}")]);
+    let detail = out[0].detail.clone().unwrap();
+    assert!(detail.contains(&format!("removed [{same}]")), "{detail}");
+    assert!(
+        detail.contains(&format!("already gone [{gone}]")),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(&format!(
+            "{changed} (changed since it was copied (manifest 222222222222 then, 111111111111 now))"
+        )),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(&format!(
+            "{unrecorded} (no verified copy of it was recorded)"
+        )),
+        "{detail}"
+    );
+    // Converted volumes are compared with their extended attributes.
+    assert!(
+        mock.ops
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| matches!(o, PrivilegedOp::ManifestVolume { xattrs: true, .. }))
+    );
+}
+
+#[tokio::test]
+async fn a_migrated_volume_changed_since_its_copy_is_kept() {
+    let mut f = pbs();
+    f.c.state.running = true;
+    let plan = plan_adopt(&snapshot(&f), &opts(None, true));
+    let mock = Mock::new(f.c.clone(), f.img.clone(), None)
+        .with_output("priv manifest_volume", &digest_reply('9'));
+    let cx = ctx(&plan, &f);
+    cx.state
+        .lock()
+        .unwrap()
+        .manifests
+        .insert("pbs-config".into(), "1".repeat(64));
+    let out = apply(
+        &mock,
+        &cx,
+        &[Step::RemoveVolume {
+            volume: "pbs-config".into(),
         }],
     )
     .await
     .unwrap();
     assert!(
-        mock.calls().contains(&format!("docker volume rm {ANON}")),
-        "{:?}",
-        mock.calls()
+        out[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .starts_with("kept pbs-config: changed since"),
+        "{out:?}"
     );
-    assert!(!mock.calls().contains(&format!("docker volume rm {gone}")));
+    assert!(!mock.calls().iter().any(|c| c.contains("volume rm")));
+    assert!(
+        mock.ops
+            .lock()
+            .unwrap()
+            .contains(&PrivilegedOp::ManifestVolume {
+                volume: "pbs-config".into(),
+                xattrs: false
+            })
+    );
+}
+
+#[tokio::test]
+async fn copies_record_their_manifest_for_the_later_removal() {
+    let mut f = pbs();
+    f.c.state.running = true;
+    let plan = plan_adopt(&snapshot(&f), &opts(None, true));
+    let mock = Mock::new(f.c.clone(), f.img.clone(), None)
+        .with_output("priv copy_volume", &digest_reply('7'));
+    let cx = ctx(&plan, &f);
+    let steps = [Step::CopyVolume {
+        volume: "pbs-config".into(),
+        suffix: "config".into(),
+        to: "/mnt/user/appdata/pbs/config".into(),
+    }];
+    apply(&mock, &cx, &steps).await.unwrap();
     assert_eq!(
-        out[0].detail.as_deref(),
-        Some(format!("removed [{ANON}]; already gone [{gone}]; kept (still mounted) []").as_str())
+        cx.state.lock().unwrap().manifests.get("pbs-config"),
+        Some(&"7".repeat(64))
     );
+}
+
+#[tokio::test]
+async fn a_container_started_after_the_copy_is_not_rebuilt() {
+    let mut f = pbs();
+    f.c.state.running = true;
+    let s = with_anonymous(&mut f);
+    let plan = plan_adopt(&s, &opts(None, false));
+    let mock = Mock::new(f.c.clone(), f.img.clone(), None);
+    // Running, as if something started it after the copy.
+    let err = apply(
+        &mock,
+        &ctx(&plan, &f),
+        &[Step::EnsureStopped, Step::Rebuild],
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("failed at `ensure-stopped"), "{err}");
+    assert!(err.contains("Rolled back"), "a pre-rebuild failure: {err}");
+    assert!(!mock.calls().contains(&"priv rebuild".to_string()));
+}
+
+#[test]
+fn recovery_after_a_rebuild_names_the_converted_volumes() {
+    let mut f = pbs();
+    let s = with_anonymous(&mut f);
+    let plan = plan_adopt(&s, &opts(None, false));
+    let r = ctx(&plan, &f).recovery();
+    assert!(
+        r.contains(
+            "Data for /var/cache/pbs is in volume pbs_var_cache_pbs; use -v \
+             pbs_var_cache_pbs:/var/cache/pbs"
+        ),
+        "{r}"
+    );
+}
+
+#[test]
+fn an_empty_anonymous_volume_mounts_without_copy_up() {
+    let mut f = pbs();
+    let mut s = with_anonymous(&mut f);
+    s.empty_volumes.insert(ANON.into());
+    let plan = plan_adopt(&s, &opts(None, false));
+    assert!(plan.conversions[0].nocopy);
+    assert!(
+        plan.template
+            .extra_params
+            .contains("dst=/var/cache/pbs,volume-nocopy,volume-label="),
+        "{}",
+        plan.template.extra_params
+    );
+    let (blocking, _) = gate(&plan, &simulate_render(&plan.template));
+    assert!(blocking.is_empty(), "{blocking:?}");
 }
 
 #[test]
@@ -1643,7 +1934,7 @@ fn ownership_volume_labels_on_mounts_are_not_unmodelled() {
     let mounts = raw["HostConfig"]["Mounts"].as_array_mut().unwrap();
     mounts.push(serde_json::json!({
         "Type": "volume", "Source": "pbs_x", "Target": "/x",
-        "VolumeOptions": {"Labels": {"orca.managed": "true", "orca.mount": "/x"}}
+        "VolumeOptions": {"NoCopy": true, "Labels": {"orca.managed": "true", "orca.mount": "/x"}}
     }));
     assert!(inspect::unmodelled(&raw, &f.img_raw, false).is_empty());
     raw["HostConfig"]["Mounts"][1]["VolumeOptions"]["Labels"]["color"] = "red".into();

@@ -218,6 +218,8 @@ pub struct VolumeInspect {
     pub labels: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub options: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 /// Compose project label docker compose stamps on every container it creates.
@@ -318,14 +320,15 @@ pub fn mounted_by_others<'a>(
         .collect()
 }
 
-/// `VolumeOptions` that only carry orca ownership labels, which the
-/// template expresses as `volume-label=`.
+/// `VolumeOptions` that only carry orca ownership labels and `NoCopy`,
+/// which the template expresses as `volume-label=` and `volume-nocopy`.
 fn ownership_volume_options(v: &Value) -> bool {
     v.as_object().is_none_or(|o| {
         o.iter().all(|(k, v)| match k.as_str() {
             "Labels" => v
                 .as_object()
                 .is_none_or(|l| l.keys().all(|k| labels::is_ownership_key(k))),
+            "NoCopy" => v.is_boolean(),
             _ => is_zero(v),
         })
     })

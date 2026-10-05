@@ -113,12 +113,12 @@ pub struct Template {
 
 impl Template {
     /// Map a spec onto template fields. Ports with a host IP, binds with
-    /// non-default propagation and volumes in `volume_labels` (by name) have
-    /// no Config form, so they go to ExtraParams.
+    /// non-default propagation and volumes in `labeled` (by name) have no
+    /// Config form, so they go to ExtraParams.
     pub fn from_spec(
         spec: &RunSpec,
         icon: &str,
-        volume_labels: &BTreeMap<String, BTreeMap<String, String>>,
+        labeled: &BTreeMap<String, LabeledVolume>,
     ) -> Self {
         let mut configs = Vec::new();
         let mut extra: Vec<String> = Vec::new();
@@ -153,7 +153,7 @@ impl Template {
                 continue;
             }
             if m.kind == MountKind::Volume
-                && let Some(l) = volume_labels.get(&m.source)
+                && let Some(l) = labeled.get(&m.source)
             {
                 let s = volume_mount_arg(&m.source, &m.target, m.read_only, l);
                 extra.push(format!("--mount {}", spec::shell_quote(&s)));
@@ -296,27 +296,34 @@ impl Template {
     }
 }
 
-/// `--mount` value for a named volume that docker creates with `labels` if
+/// How a named volume orca created is mounted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LabeledVolume {
+    pub labels: BTreeMap<String, String>,
+    /// The data it replaces was empty, so docker must not fill it from the
+    /// image.
+    pub nocopy: bool,
+}
+
+/// `--mount` value for a named volume that docker creates with its labels if
 /// it is ever missing. An existing volume keeps the labels it was created with.
-pub fn volume_mount_arg(
-    source: &str,
-    target: &str,
-    read_only: bool,
-    labels: &BTreeMap<String, String>,
-) -> String {
+pub fn volume_mount_arg(source: &str, target: &str, read_only: bool, v: &LabeledVolume) -> String {
     let mut s = format!("type=volume,src={source},dst={target}");
     if read_only {
         s.push_str(",readonly");
     }
-    for (k, v) in labels {
-        s.push_str(&format!(",volume-label={k}={v}"));
+    if v.nocopy {
+        s.push_str(",volume-nocopy");
+    }
+    for (k, val) in &v.labels {
+        s.push_str(&format!(",volume-label={k}={val}"));
     }
     s
 }
 
 /// Whether `path` can be a `--mount` field: docker splits the value as CSV.
 pub fn mount_safe(path: &str) -> bool {
-    path.starts_with('/') && !path.contains([',', '"', '\n', '\r'])
+    path.starts_with('/') && !path.contains([',', '"', '&', '\n', '\r'])
 }
 
 /// Byte range of `<ExtraParams>` and its text as dockerMan reads it.
@@ -384,6 +391,8 @@ fn label_flags(words: &[String]) -> Vec<(std::ops::Range<usize>, String, String)
         let (range, body) = if (w == "-l" || w == "--label") && i + 1 < words.len() {
             (i..i + 2, words[i + 1].as_str())
         } else if let Some(b) = w.strip_prefix("--label=") {
+            (i..i + 1, b)
+        } else if let Some(b) = w.strip_prefix("-l").filter(|b| !b.is_empty()) {
             (i..i + 1, b)
         } else {
             i += 1;
@@ -653,6 +662,19 @@ mod tests {
     }
 
     #[test]
+    fn attached_short_labels_are_recognised() {
+        let xml = "<Container><ExtraParams>-lorca.owner=docker -lkeep=1</ExtraParams></Container>";
+        let out = set_labels(xml, &owned("x")).unwrap();
+        let words = extra(&out);
+        assert!(
+            !words.contains(&"-lorca.owner=docker".to_string()),
+            "{words:?}"
+        );
+        assert_eq!(words[0], "-lkeep=1");
+        assert_eq!(set_labels(&out, &owned("x")).unwrap(), out);
+    }
+
+    #[test]
     fn path_to_mount_swaps_exactly_one_entry() {
         let arg = "type=volume,src=x_data,dst=/data,volume-label=orca.mount=/data";
         let out = path_to_mount(TPL, "0f3a", arg).unwrap();
@@ -689,16 +711,18 @@ mod tests {
             log_driver: spec::DEFAULT_LOG_DRIVER.into(),
             ..RunSpec::default()
         };
-        let mut vl = BTreeMap::new();
-        vl.insert(
+        let vl = BTreeMap::from([(
             "x_data".to_string(),
-            BTreeMap::from([(labels::MANAGED.to_string(), "true".to_string())]),
-        );
+            LabeledVolume {
+                labels: BTreeMap::from([(labels::MANAGED.to_string(), "true".to_string())]),
+                nocopy: true,
+            },
+        )]);
         let t = Template::from_spec(&spec, "", &vl);
         assert!(t.configs.is_empty(), "{:?}", t.configs);
         assert_eq!(
             t.extra_params,
-            "--mount type=volume,src=x_data,dst=/data,readonly,volume-label=orca.managed=true"
+            "--mount type=volume,src=x_data,dst=/data,readonly,volume-nocopy,volume-label=orca.managed=true"
         );
         let t = Template::from_spec(&spec, "", &BTreeMap::new());
         assert_eq!(t.configs[0].value, "x_data");
@@ -707,7 +731,7 @@ mod tests {
     #[test]
     fn mount_safe_paths() {
         assert!(mount_safe("/var/lib/app data"));
-        for bad in ["/a,b", "/a\"b", "rel", "/a\nb"] {
+        for bad in ["/a,b", "/a\"b", "/a&b", "rel", "/a\nb"] {
             assert!(!mount_safe(bad), "{bad:?}");
         }
     }

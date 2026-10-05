@@ -121,8 +121,20 @@ pub async fn inspect_volumes() -> Result<BTreeMap<String, VolumeInspect>> {
     }
     let mut args = vec!["volume", "inspect"];
     args.extend(names.iter().map(String::as_str));
-    let all: Vec<VolumeInspect> =
-        serde_json::from_str(&docker(&args).await?).context("decode docker volume inspect")?;
+    let all: Vec<VolumeInspect> = match docker(&args).await {
+        Ok(out) => serde_json::from_str(&out).context("decode docker volume inspect")?,
+        // One volume removed between the listing and the inspect fails the
+        // whole batch; inspect one by one and skip any that are gone.
+        Err(_) => {
+            let mut all = Vec::new();
+            for n in &names {
+                if let Ok(v) = inspect_volume(n).await {
+                    all.push(v);
+                }
+            }
+            all
+        }
+    };
     Ok(all.into_iter().map(|v| (v.name.clone(), v)).collect())
 }
 

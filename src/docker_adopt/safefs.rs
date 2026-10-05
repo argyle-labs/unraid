@@ -323,7 +323,8 @@ impl Dir {
         Ok(())
     }
 
-    /// Give this directory `src`'s owner, group and permission bits.
+    /// Give this directory `src`'s owner, group and permission bits, never
+    /// setuid or sticky.
     pub fn copy_owner_mode_from(&self, src: &Dir) -> Result<()> {
         let st = src.stat()?;
         rustix::fs::fchown(
@@ -332,8 +333,14 @@ impl Dir {
             Some(rustix::fs::Gid::from_raw(st.st_gid)),
         )
         .map_err(|e| anyhow!("chown {}: {e}", self.path.display()))?;
-        rustix::fs::fchmod(&self.fd, perm(mode_bits(&st)))
+        rustix::fs::fchmod(&self.fd, perm(mode_bits(&st) & 0o2777))
             .map_err(|e| anyhow!("chmod {}: {e}", self.path.display()))
+    }
+
+    /// This directory's extended attributes, as [`manifest_with_xattrs`]
+    /// lists them.
+    pub fn xattrs(&self) -> Result<String> {
+        fd_xattrs(self.fd.as_fd(), &self.path)
     }
 
     /// Remove the empty subdirectory `name`.
@@ -422,6 +429,9 @@ pub fn remove_file(path: &Path) -> Result<bool> {
 /// files, setuid directories, and nesting deeper than [`MAX_DEPTH`].
 /// A setgid directory only sets group inheritance and is allowed.
 pub fn check_copyable(root: &Dir) -> Result<()> {
+    if root.mode()? & 0o4000 != 0 {
+        bail!("{} is a setuid directory", root.path.display());
+    }
     check_copyable_depth(root, 0)
 }
 
@@ -465,9 +475,19 @@ pub struct Manifest {
 /// is followed, and each file is hashed from the fd that was checked to be a
 /// regular file.
 pub fn manifest(root: &Dir) -> Result<Manifest> {
+    manifest_of(root, false)
+}
+
+/// [`manifest`] with every entry's extended attributes (file capabilities,
+/// ACLs, …) in its row, for copies that preserve them.
+pub fn manifest_with_xattrs(root: &Dir) -> Result<Manifest> {
+    manifest_of(root, true)
+}
+
+fn manifest_of(root: &Dir, xattrs: bool) -> Result<Manifest> {
     let mut rows = Vec::new();
     let mut bytes = 0;
-    manifest_into(root, Path::new(""), 0, &mut rows, &mut bytes)?;
+    manifest_into(root, Path::new(""), 0, xattrs, &mut rows, &mut bytes)?;
     rows.sort();
     Ok(Manifest {
         entries: rows.len() as u64,
@@ -480,6 +500,7 @@ fn manifest_into(
     dir: &Dir,
     rel: &Path,
     depth: usize,
+    xattrs: bool,
     rows: &mut Vec<String>,
     bytes: &mut u64,
 ) -> Result<()> {
@@ -489,15 +510,24 @@ fn manifest_into(
     for n in dir.entries()? {
         let st = rustix::fs::statat(&dir.fd, &n, AtFlags::SYMLINK_NOFOLLOW)?;
         let path = rel.join(&n);
+        let shown = dir.path.join(&n);
+        let mut attrs = String::new();
         let (kind, size, content) = match file_type(&st) {
             FileType::Directory => {
-                manifest_into(&dir.child_os(&n)?, &path, depth + 1, rows, bytes)?;
+                let child = dir.child_os(&n)?;
+                if xattrs {
+                    attrs = child.xattrs()?;
+                }
+                manifest_into(&child, &path, depth + 1, xattrs, rows, bytes)?;
                 ('d', 0, String::new())
             }
             FileType::RegularFile => {
                 let mut f = dir
                     .open_regular(&n)?
-                    .ok_or_else(|| anyhow!("{} vanished", dir.path.join(&n).display()))?;
+                    .ok_or_else(|| anyhow!("{} vanished", shown.display()))?;
+                if xattrs {
+                    attrs = fd_xattrs(f.as_fd(), &shown)?;
+                }
                 let mut h = Sha256::new();
                 let mut len = 0u64;
                 let mut buf = vec![0u8; 64 * 1024];
@@ -513,16 +543,19 @@ fn manifest_into(
                 ('f', len, hex_encode(&h.finalize()))
             }
             FileType::Symlink => {
+                if xattrs {
+                    attrs = symlink_xattrs(dir, &n)?;
+                }
                 let t = rustix::fs::readlinkat(&dir.fd, &n, Vec::new())?;
                 ('l', 0, String::from_utf8_lossy(t.to_bytes()).into_owned())
             }
             _ => bail!(
                 "{} is not a regular file, directory or symlink",
-                dir.path.join(&n).display()
+                shown.display()
             ),
         };
         rows.push(format!(
-            "{}\t{kind}\t{size}\t{:o}\t{}\t{}\t{content}",
+            "{}\t{kind}\t{size}\t{:o}\t{}\t{}\t{content}\t{attrs}",
             path.to_string_lossy(),
             mode_bits(&st),
             st.st_uid,
@@ -530,6 +563,75 @@ fn manifest_into(
         ));
     }
     Ok(())
+}
+
+/// Sorted `name=<hex value>` of every extended attribute, comma-joined. A
+/// filesystem without xattr support has none.
+fn fd_xattrs(fd: BorrowedFd<'_>, shown: &Path) -> Result<String> {
+    let err = |e: Errno| anyhow!("read extended attributes of {}: {e}", shown.display());
+    let names = match read_sized(|b| rustix::fs::flistxattr(fd, b)) {
+        Ok(n) => n,
+        Err(Errno::NOTSUP) => return Ok(String::new()),
+        Err(e) => return Err(err(e)),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let value = read_sized(|b| rustix::fs::fgetxattr(fd, name, b)).map_err(err)?;
+        out.push(format!(
+            "{}={}",
+            String::from_utf8_lossy(name),
+            hex_encode(&value)
+        ));
+    }
+    out.sort();
+    Ok(out.join(","))
+}
+
+/// A symlink's own extended attributes, read without following it.
+#[cfg(target_os = "linux")]
+fn symlink_xattrs(dir: &Dir, name: &OsStr) -> Result<String> {
+    use std::os::fd::AsRawFd;
+    let path = Path::new(&format!("/proc/self/fd/{}", dir.fd.as_raw_fd())).join(name);
+    let shown = dir.path.join(name);
+    let err = |e: Errno| anyhow!("read extended attributes of {}: {e}", shown.display());
+    let names = match read_sized(|b| rustix::fs::llistxattr(&path, b)) {
+        Ok(n) => n,
+        Err(Errno::NOTSUP) => return Ok(String::new()),
+        Err(e) => return Err(err(e)),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for n in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let value = read_sized(|b| rustix::fs::lgetxattr(&path, n, b)).map_err(err)?;
+        out.push(format!(
+            "{}={}",
+            String::from_utf8_lossy(n),
+            hex_encode(&value)
+        ));
+    }
+    out.sort();
+    Ok(out.join(","))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn symlink_xattrs(_dir: &Dir, _name: &OsStr) -> Result<String> {
+    Ok(String::new())
+}
+
+/// Call a size-then-fill xattr syscall, retrying while the value grows.
+fn read_sized(mut f: impl FnMut(&mut [u8]) -> rustix::io::Result<usize>) -> Result<Vec<u8>, Errno> {
+    for _ in 0..8 {
+        let n = f(&mut [])?;
+        let mut buf = vec![0u8; n];
+        match f(&mut buf) {
+            Ok(k) => {
+                buf.truncate(k);
+                return Ok(buf);
+            }
+            Err(Errno::RANGE) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Errno::RANGE)
 }
 
 #[cfg(test)]

@@ -97,6 +97,16 @@ pub enum PrivilegedOp {
         from: String,
         to: String,
     },
+    /// The content manifest of a plain local volume (with extended
+    /// attributes when `xattrs`), to prove it unchanged since it was copied.
+    ManifestVolume {
+        volume: String,
+        xattrs: bool,
+    },
+    /// Whether a plain local volume's data root is empty.
+    VolumeEmpty {
+        volume: String,
+    },
     /// Move a compose stack directory to the planned `to`, which must equal
     /// `<root>-retired/<name>-compose-<date of run_id>`.
     RetireStack {
@@ -116,6 +126,42 @@ pub struct PrivilegedReply {
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// [`PrivilegedOp::VolumeEmpty`]'s reply for an empty volume.
+pub const VOLUME_EMPTY: &str = "empty";
+
+/// Precedes the full source manifest digest in a copy's or a
+/// [`PrivilegedOp::ManifestVolume`]'s reply.
+pub const MANIFEST_TAG: &str = "content manifest sha256:";
+
+/// The full manifest digest in a reply carrying [`MANIFEST_TAG`].
+pub fn manifest_digest(detail: &str) -> Option<String> {
+    let rest = &detail[detail.find(MANIFEST_TAG)? + MANIFEST_TAG.len()..];
+    let d: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+    (d.len() == 64).then_some(d)
+}
+
+fn manifest_line(m: &safefs::Manifest) -> String {
+    format!(
+        "{} entries, {} bytes, {MANIFEST_TAG}{}",
+        m.entries, m.bytes, m.digest
+    )
+}
+
+/// `err`, plus that emptying `what` afterwards failed, if it did.
+fn with_cleanup(
+    err: plugin_toolkit::anyhow::Error,
+    cleanup: Result<()>,
+    what: &Path,
+) -> plugin_toolkit::anyhow::Error {
+    match cleanup {
+        Ok(()) => err,
+        Err(c) => err.context(format!(
+            "and emptying {} again failed ({c:#}); remove it by hand",
+            what.display()
+        )),
+    }
 }
 
 /// A per-run id: `YYYYMMDD-HHMMSS-<8 hex>`.
@@ -309,23 +355,22 @@ pub async fn stage_copy(
             );
         }
         Ok(format!(
-            "staged {}: {} entries, {} bytes, content manifest {}",
+            "staged {}: {}",
             app.path().join(&sname).display(),
-            a.entries,
-            a.bytes,
-            &a.digest[..12]
+            manifest_line(&a)
         ))
     }
     .await;
-    if copied.is_err() {
-        discard_stage(&app, &stage, &sname).ok();
-    }
-    copied
+    copied.map_err(|e| {
+        let stage_path = stage.path().to_path_buf();
+        with_cleanup(e, discard_stage(&app, &stage, &sname), &stage_path)
+    })
 }
 
-/// Copy the held `src` into the held, empty `dst` (a volume's data root),
-/// verify it like [`stage_copy`], and give `dst` the source root's owner and
-/// mode. On failure `dst` is emptied again.
+/// Copy the held `src` into the held, empty `dst` (a volume's data root)
+/// with extended attributes, verify it like [`stage_copy`] including them,
+/// and give `dst` the source root's owner and mode. A filesystem that cannot
+/// hold the attributes fails the copy. On failure `dst` is emptied again.
 pub async fn copy_into(src: &Dir, dst: &Dir, volume: &str) -> Result<String> {
     if !dst.entries()?.is_empty() {
         bail!("{} is not empty", dst.path().display());
@@ -334,12 +379,14 @@ pub async fn copy_into(src: &Dir, dst: &Dir, volume: &str) -> Result<String> {
     let copied = async {
         let from = format!("{}/.", src.proc_path()?);
         let to = format!("{}/.", dst.proc_path()?);
+        // A volume converts to an equivalent volume, so file capabilities
+        // and ACLs travel with it (unlike a copy into appdata).
         host::run(
             "/bin/cp",
             &[
                 "-R",
                 "--no-dereference",
-                "--preserve=mode,ownership,timestamps,links",
+                "--preserve=mode,ownership,timestamps,links,xattr",
                 &from,
                 &to,
             ],
@@ -347,8 +394,14 @@ pub async fn copy_into(src: &Dir, dst: &Dir, volume: &str) -> Result<String> {
         .await?;
         dst.copy_owner_mode_from(src)?;
         safefs::check_copyable(dst)?;
-        let a = safefs::manifest(src)?;
-        let b = safefs::manifest(dst)?;
+        if src.xattrs()? != dst.xattrs()? {
+            bail!(
+                "copy of {volume}: extended attributes of {} were not preserved",
+                dst.path().display()
+            );
+        }
+        let a = safefs::manifest_with_xattrs(src)?;
+        let b = safefs::manifest_with_xattrs(dst)?;
         if a != b {
             bail!(
                 "copy of {volume} differs: source {} entries/{} bytes/{}, copy {}/{}/{}",
@@ -361,18 +414,13 @@ pub async fn copy_into(src: &Dir, dst: &Dir, volume: &str) -> Result<String> {
             );
         }
         Ok(format!(
-            "copied {volume} into {}: {} entries, {} bytes, content manifest {}",
+            "copied {volume} into {}: {}",
             dst.path().display(),
-            a.entries,
-            a.bytes,
-            &a.digest[..12]
+            manifest_line(&a)
         ))
     }
     .await;
-    if copied.is_err() {
-        dst.clear().ok();
-    }
-    copied
+    copied.map_err(|e| with_cleanup(e, dst.clear(), dst.path()))
 }
 
 /// Remove this run's staged copy of `suffix`. An exposed copy has no stage,
@@ -492,7 +540,7 @@ pub fn restore_template_in(dir: &Path, name: &str, backup_id: &str) -> Result<St
     )
 }
 
-async fn ensure_stopped(name: &str) -> Result<()> {
+async fn ensure_stopped(name: &str) -> Result<ContainerInspect> {
     let (c, _) = host::inspect_container_raw(name).await?;
     if c.short_name() != name {
         bail!("{name} resolved to {}", c.short_name());
@@ -500,7 +548,43 @@ async fn ensure_stopped(name: &str) -> Result<()> {
     if c.state.running {
         bail!("{name} is running; it must stay stopped while its volumes are copied");
     }
-    Ok(())
+    Ok(c)
+}
+
+/// Why `to` may not receive `from`'s data for container `c`: `from` must be
+/// an anonymous volume only `c` uses, and `to` must carry orca's labels for
+/// `c` at the path `c` mounts `from`.
+pub fn copy_into_problem(
+    c: &ContainerInspect,
+    from: &VolumeInspect,
+    from_users: &[String],
+    to: &VolumeInspect,
+) -> Option<String> {
+    let name = c.short_name();
+    if !from.is_anonymous() {
+        return Some(format!("volume {} is not anonymous", from.name));
+    }
+    if from_users != [name.to_string()] {
+        return Some(format!(
+            "volume {} is used by [{}], not only {name}",
+            from.name,
+            from_users.join(", ")
+        ));
+    }
+    let Some(target) = c
+        .volumes()
+        .find(|m| m.name.as_deref() == Some(from.name.as_str()))
+        .map(|m| m.destination.as_str())
+    else {
+        return Some(format!("{name} does not mount volume {}", from.name));
+    };
+    if to.labels() != ownership::volume_labels(name, target) {
+        return Some(format!(
+            "volume {} does not carry orca's labels for {name} at {target}",
+            to.name
+        ));
+    }
+    None
 }
 
 async fn containers_using_volume(volume: &str) -> Result<Vec<String>> {
@@ -621,8 +705,11 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
             let appdata = appdata_dir()?;
             let staged = stage_copy(&appdata, &src, name, dest_suffix, volume, nonce).await?;
             if let Err(e) = ensure_stopped(name).await {
-                remove_staged(&appdata.child(name)?, nonce, dest_suffix).ok();
-                return Err(e.context("container started during the copy; copy discarded"));
+                let e = e.context("container started during the copy; copy discarded");
+                let cleanup = appdata
+                    .child(name)
+                    .and_then(|app| remove_staged(&app, nonce, dest_suffix).map(|_| ()));
+                return Err(with_cleanup(e, cleanup, &Path::new(APPDATA).join(name)));
             }
             Ok(staged)
         }
@@ -630,18 +717,15 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
             validate_name("container name", name)?;
             validate_name("volume", from)?;
             validate_name("volume", to)?;
-            ensure_stopped(name).await?;
+            let c = ensure_stopped(name).await?;
             let src = plain_local_volume(from).await?;
+            let (from_v, to_v) = (
+                host::inspect_volume(from).await?,
+                host::inspect_volume(to).await?,
+            );
             let users = containers_using_volume(from).await?;
-            if users.iter().any(|u| u != name) {
-                bail!("volume {from} is also used by [{}]", users.join(", "));
-            }
-            let got = host::inspect_volume(to).await?.labels();
-            if !ownership::container_labels(name)
-                .iter()
-                .all(|(k, v)| got.get(k) == Some(v))
-            {
-                bail!("volume {to} does not carry orca's labels for {name}");
+            if let Some(why) = copy_into_problem(&c, &from_v, &users, &to_v) {
+                bail!("{why}");
             }
             let users = containers_using_volume(to).await?;
             if !users.is_empty() {
@@ -650,10 +734,29 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
             let dst = plain_local_volume(to).await?;
             let copied = copy_into(&src, &dst, from).await?;
             if let Err(e) = ensure_stopped(name).await {
-                dst.clear().ok();
-                return Err(e.context("container started during the copy; copy discarded"));
+                let e = e.context("container started during the copy; copy discarded");
+                return Err(with_cleanup(e, dst.clear(), dst.path()));
             }
             Ok(copied)
+        }
+        PrivilegedOp::ManifestVolume { volume, xattrs } => {
+            validate_name("volume", volume)?;
+            let d = plain_local_volume(volume).await?;
+            let m = if *xattrs {
+                safefs::manifest_with_xattrs(&d)?
+            } else {
+                safefs::manifest(&d)?
+            };
+            Ok(format!("{volume}: {}", manifest_line(&m)))
+        }
+        PrivilegedOp::VolumeEmpty { volume } => {
+            validate_name("volume", volume)?;
+            let d = plain_local_volume(volume).await?;
+            Ok(if d.entries()?.is_empty() {
+                VOLUME_EMPTY.to_string()
+            } else {
+                "not empty".to_string()
+            })
         }
         PrivilegedOp::RemoveCopy {
             name,
@@ -897,6 +1000,7 @@ pub fn missing_runner_blocker() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn ops_round_trip_as_op_and_payload() {
@@ -1182,6 +1286,141 @@ mod tests {
         );
         assert!(copy_into(&open(&src), &open(&empty), "v").await.is_err());
         assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn copy_into_needs_the_containers_own_anonymous_volume_and_matching_labels() {
+        use crate::docker_adopt::inspect::{ANONYMOUS_VOLUME_LABEL, MountPoint};
+        let c = ContainerInspect {
+            name: "/pbs".into(),
+            mounts: vec![MountPoint {
+                kind: "volume".into(),
+                name: Some("old".into()),
+                destination: "/data".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let vol = |name: &str, labels: BTreeMap<String, String>| VolumeInspect {
+            name: name.into(),
+            labels: Some(labels),
+            ..Default::default()
+        };
+        let anon = BTreeMap::from([(ANONYMOUS_VOLUME_LABEL.to_string(), String::new())]);
+        let from = vol("old", anon.clone());
+        let to = vol("pbs_data", ownership::volume_labels("pbs", "/data"));
+        let only = vec!["pbs".to_string()];
+        assert_eq!(copy_into_problem(&c, &from, &only, &to), None);
+
+        let named = vol("old", BTreeMap::new());
+        assert!(
+            copy_into_problem(&c, &named, &only, &to)
+                .unwrap()
+                .contains("not anonymous")
+        );
+        let shared = vec!["pbs".to_string(), "other".to_string()];
+        assert!(
+            copy_into_problem(&c, &from, &shared, &to)
+                .unwrap()
+                .contains("not only pbs")
+        );
+        assert!(copy_into_problem(&c, &from, &[], &to).is_some());
+        let elsewhere = vol("x", anon);
+        assert!(
+            copy_into_problem(&c, &elsewhere, &only, &to)
+                .unwrap()
+                .contains("does not mount volume x")
+        );
+        let wrong_path = vol("pbs_data", ownership::volume_labels("pbs", "/other"));
+        assert!(
+            copy_into_problem(&c, &from, &only, &wrong_path)
+                .unwrap()
+                .contains("at /data")
+        );
+    }
+
+    #[test]
+    fn manifest_digests_are_read_back_whole() {
+        let d = "ab".repeat(32);
+        assert_eq!(
+            manifest_digest(&format!("copied x: 1 entries, 2 bytes, {MANIFEST_TAG}{d}")),
+            Some(d)
+        );
+        assert_eq!(manifest_digest(&format!("{MANIFEST_TAG}abc")), None);
+        assert_eq!(manifest_digest("no digest"), None);
+    }
+
+    #[test]
+    fn failed_cleanup_is_reported_with_the_error() {
+        let e = with_cleanup(anyhow!("copy failed"), Ok(()), Path::new("/x"));
+        assert_eq!(format!("{e:#}"), "copy failed");
+        let e = with_cleanup(
+            anyhow!("copy failed"),
+            Err(anyhow!("EBUSY")),
+            Path::new("/x"),
+        );
+        let shown = format!("{e:#}");
+        assert!(
+            shown.contains("emptying /x again failed (EBUSY)"),
+            "{shown}"
+        );
+        assert!(shown.contains("copy failed"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn copy_into_refuses_a_setuid_source_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_s, src) = appdata();
+        let (_d, dst) = appdata();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o4755)).unwrap();
+        if fs::metadata(&src).unwrap().permissions().mode() & 0o4000 == 0 {
+            return; // the filesystem dropped the bit
+        }
+        let e = copy_into(&open(&src), &open(&dst), "v")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("setuid directory"), "{e}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn copy_into_carries_extended_attributes_and_compares_them() {
+        let (_s, src) = appdata();
+        let (_d, dst) = appdata();
+        fs::write(src.join("f"), b"x").unwrap();
+        let set = rustix::fs::setxattr(
+            src.join("f").as_path(),
+            "user.orca-test",
+            b"1",
+            rustix::fs::XattrFlags::empty(),
+        );
+        if set.is_err() {
+            return; // filesystem without user xattrs
+        }
+        let before = safefs::manifest_with_xattrs(&open(&src)).unwrap();
+        copy_into(&open(&src), &open(&dst), "v").await.unwrap();
+        let mut buf = [0u8; 8];
+        let n =
+            rustix::fs::getxattr(dst.join("f").as_path(), "user.orca-test", &mut buf[..]).unwrap();
+        assert_eq!(&buf[..n], b"1");
+        rustix::fs::setxattr(
+            src.join("f").as_path(),
+            "user.orca-test",
+            b"2",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+        let after = safefs::manifest_with_xattrs(&open(&src)).unwrap();
+        assert_ne!(
+            before.digest, after.digest,
+            "xattr values are in the manifest"
+        );
+        assert_eq!(
+            safefs::manifest(&open(&src)).unwrap(),
+            safefs::manifest(&open(&dst)).unwrap(),
+            "the plain manifest ignores them"
+        );
     }
 
     #[test]

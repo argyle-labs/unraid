@@ -399,8 +399,9 @@ fn parse_volume(v: &str) -> Result<MountSpec, String> {
 }
 
 /// `--mount type=…,src=…,dst=…[,readonly][,bind-propagation=…]`, plus
-/// `volume-label=` for orca's ownership keys, which only apply when docker
-/// creates the volume and so are not part of the mount.
+/// `volume-label=` for orca's ownership keys and `volume-nocopy`, which only
+/// apply when docker creates or first fills the volume and so are not part
+/// of the mount.
 fn parse_mount(v: &str) -> Result<MountSpec, String> {
     let mut kind = None;
     let mut source = String::new();
@@ -427,6 +428,7 @@ fn parse_mount(v: &str) -> Result<MountSpec, String> {
                     return Err(format!("unsupported --mount volume-label {key:?}"));
                 }
             }
+            "volume-nocopy" => {}
             other => return Err(format!("unsupported --mount option {other:?}")),
         }
     }
@@ -771,6 +773,10 @@ mod tests {
             }
         );
         assert!(parse_mount("type=volume,src=x,dst=/x,volume-label=color=red").is_err());
+        assert_eq!(
+            parse_mount("type=volume,src=pbs_data,dst=/data,volume-nocopy").unwrap(),
+            parse_mount("type=volume,src=pbs_data,dst=/data").unwrap()
+        );
     }
 
     #[test]
