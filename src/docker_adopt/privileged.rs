@@ -23,6 +23,7 @@ use plugin_toolkit::serde_json::{self, Value};
 use super::host::{self, APPDATA, AUTOSTART_FILE, REBUILD_SCRIPT};
 use super::inspect::{COMPOSE_PROJECT, ContainerInspect, VolumeInspect};
 use super::orphans;
+use super::ownership;
 use super::safefs::{self, Dir};
 use super::template::{self, MANAGED_MARKER};
 use super::validate_name;
@@ -88,6 +89,13 @@ pub enum PrivilegedOp {
         name: String,
         dest_suffix: String,
         nonce: String,
+    },
+    /// Copy a stopped container's anonymous volume `from` into the empty
+    /// volume `to` orca created for it, and verify the copy.
+    CopyIntoVolume {
+        name: String,
+        from: String,
+        to: String,
     },
     /// Move a compose stack directory to the planned `to`, which must equal
     /// `<root>-retired/<name>-compose-<date of run_id>`.
@@ -315,6 +323,58 @@ pub async fn stage_copy(
     copied
 }
 
+/// Copy the held `src` into the held, empty `dst` (a volume's data root),
+/// verify it like [`stage_copy`], and give `dst` the source root's owner and
+/// mode. On failure `dst` is emptied again.
+pub async fn copy_into(src: &Dir, dst: &Dir, volume: &str) -> Result<String> {
+    if !dst.entries()?.is_empty() {
+        bail!("{} is not empty", dst.path().display());
+    }
+    safefs::check_copyable(src)?;
+    let copied = async {
+        let from = format!("{}/.", src.proc_path()?);
+        let to = format!("{}/.", dst.proc_path()?);
+        host::run(
+            "/bin/cp",
+            &[
+                "-R",
+                "--no-dereference",
+                "--preserve=mode,ownership,timestamps,links",
+                &from,
+                &to,
+            ],
+        )
+        .await?;
+        dst.copy_owner_mode_from(src)?;
+        safefs::check_copyable(dst)?;
+        let a = safefs::manifest(src)?;
+        let b = safefs::manifest(dst)?;
+        if a != b {
+            bail!(
+                "copy of {volume} differs: source {} entries/{} bytes/{}, copy {}/{}/{}",
+                a.entries,
+                a.bytes,
+                &a.digest[..12],
+                b.entries,
+                b.bytes,
+                &b.digest[..12]
+            );
+        }
+        Ok(format!(
+            "copied {volume} into {}: {} entries, {} bytes, content manifest {}",
+            dst.path().display(),
+            a.entries,
+            a.bytes,
+            &a.digest[..12]
+        ))
+    }
+    .await;
+    if copied.is_err() {
+        dst.clear().ok();
+    }
+    copied
+}
+
 /// Remove this run's staged copy of `suffix`. An exposed copy has no stage,
 /// so it is never removed here.
 pub fn remove_staged(app: &Dir, nonce: &str, suffix: &str) -> Result<String> {
@@ -461,6 +521,21 @@ async fn containers_using_volume(volume: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// The data root of a plain local volume, held.
+async fn plain_local_volume(volume: &str) -> Result<Dir> {
+    let v = host::inspect_volume(volume).await?;
+    let path = VolumeInspect::expected_mountpoint(volume);
+    if v.driver != "local" || v.options.as_ref().is_some_and(|o| !o.is_empty()) {
+        bail!("volume {volume} is not a plain local volume");
+    }
+    if v.mountpoint != path {
+        bail!("volume {volume} data is not at {path}");
+    }
+    let d = Dir::open(Path::new(&path))?;
+    d.proc_path()?;
+    Ok(d)
+}
+
 /// Run one op as root. Every input is re-validated here, and every file
 /// touched goes through [`safefs`].
 pub async fn execute(op: &PrivilegedOp) -> Result<String> {
@@ -528,16 +603,7 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
             validate_name("destination", dest_suffix)?;
             validate_nonce(nonce)?;
             ensure_stopped(name).await?;
-            let v = host::inspect_volume(volume).await?;
-            let src_path = VolumeInspect::expected_mountpoint(volume);
-            if v.driver != "local" || v.options.as_ref().is_some_and(|o| !o.is_empty()) {
-                bail!("volume {volume} is not a plain local volume");
-            }
-            if v.mountpoint != src_path {
-                bail!("volume {volume} data is not at {src_path}");
-            }
-            let src = Dir::open(Path::new(&src_path))?;
-            src.proc_path()?;
+            let src = plain_local_volume(volume).await?;
             let users = containers_using_volume(volume).await?;
             if users.iter().any(|u| u != name) {
                 bail!("volume {volume} is also used by [{}]", users.join(", "));
@@ -559,6 +625,35 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
                 return Err(e.context("container started during the copy; copy discarded"));
             }
             Ok(staged)
+        }
+        PrivilegedOp::CopyIntoVolume { name, from, to } => {
+            validate_name("container name", name)?;
+            validate_name("volume", from)?;
+            validate_name("volume", to)?;
+            ensure_stopped(name).await?;
+            let src = plain_local_volume(from).await?;
+            let users = containers_using_volume(from).await?;
+            if users.iter().any(|u| u != name) {
+                bail!("volume {from} is also used by [{}]", users.join(", "));
+            }
+            let got = host::inspect_volume(to).await?.labels();
+            if !ownership::container_labels(name)
+                .iter()
+                .all(|(k, v)| got.get(k) == Some(v))
+            {
+                bail!("volume {to} does not carry orca's labels for {name}");
+            }
+            let users = containers_using_volume(to).await?;
+            if !users.is_empty() {
+                bail!("volume {to} is already used by [{}]", users.join(", "));
+            }
+            let dst = plain_local_volume(to).await?;
+            let copied = copy_into(&src, &dst, from).await?;
+            if let Err(e) = ensure_stopped(name).await {
+                dst.clear().ok();
+                return Err(e.context("container started during the copy; copy discarded"));
+            }
+            Ok(copied)
         }
         PrivilegedOp::RemoveCopy {
             name,
@@ -814,6 +909,14 @@ mod tests {
         assert_eq!(v["payload"]["name"], "pbs");
         let back: PrivilegedOp = serde_json::from_value(v).unwrap();
         assert_eq!(back, op);
+        let copy = PrivilegedOp::CopyIntoVolume {
+            name: "pbs".into(),
+            from: "0f3a".into(),
+            to: "pbs_data".into(),
+        };
+        let v = serde_json::to_value(&copy).unwrap();
+        assert_eq!(v["op"], "copy_into_volume");
+        assert_eq!(serde_json::from_value::<PrivilegedOp>(v).unwrap(), copy);
         let ping = serde_json::to_value(PrivilegedOp::Ping).unwrap();
         assert_eq!(ping["op"], "ping");
     }
@@ -1036,6 +1139,49 @@ mod tests {
         // Refused while scanning the source, before anything is copied.
         assert!(e.contains(&src.join("p").display().to_string()), "{e}");
         assert!(!root2.join("pbs").join(stage_name(NONCE, "config")).exists());
+    }
+
+    #[tokio::test]
+    async fn copy_into_refuses_a_volume_that_is_not_empty() {
+        let (_s, src) = appdata();
+        let (_d, dst) = appdata();
+        fs::write(src.join("f"), b"new").unwrap();
+        fs::write(dst.join("keep"), b"theirs").unwrap();
+        let e = copy_into(&open(&src), &open(&dst), "v")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("is not empty"), "{e}");
+        assert_eq!(fs::read(dst.join("keep")).unwrap(), b"theirs");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn copy_into_copies_verifies_and_takes_the_source_roots_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_s, src) = appdata();
+        let (_d, dst) = appdata();
+        fs::create_dir(src.join("sub")).unwrap();
+        fs::write(src.join("sub/f"), b"payload").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o750)).unwrap();
+        let out = copy_into(&open(&src), &open(&dst), "v").await.unwrap();
+        assert!(out.contains("2 entries, 7 bytes"), "{out}");
+        assert_eq!(fs::read(dst.join("sub/f")).unwrap(), b"payload");
+        assert_eq!(
+            fs::metadata(&dst).unwrap().permissions().mode() & 0o7777,
+            0o750
+        );
+
+        let (_e, empty) = appdata();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(src.join("p"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(copy_into(&open(&src), &open(&empty), "v").await.is_err());
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
     }
 
     #[test]

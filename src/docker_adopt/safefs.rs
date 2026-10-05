@@ -323,6 +323,19 @@ impl Dir {
         Ok(())
     }
 
+    /// Give this directory `src`'s owner, group and permission bits.
+    pub fn copy_owner_mode_from(&self, src: &Dir) -> Result<()> {
+        let st = src.stat()?;
+        rustix::fs::fchown(
+            &self.fd,
+            Some(rustix::fs::Uid::from_raw(st.st_uid)),
+            Some(rustix::fs::Gid::from_raw(st.st_gid)),
+        )
+        .map_err(|e| anyhow!("chown {}: {e}", self.path.display()))?;
+        rustix::fs::fchmod(&self.fd, perm(mode_bits(&st)))
+            .map_err(|e| anyhow!("chmod {}: {e}", self.path.display()))
+    }
+
     /// Remove the empty subdirectory `name`.
     pub fn remove_empty_dir(&self, name: &str) -> Result<()> {
         let n = component(name)?;

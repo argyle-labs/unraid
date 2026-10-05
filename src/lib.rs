@@ -30,6 +30,7 @@ pub mod checks;
 pub mod docker_adopt;
 pub mod endpoint;
 pub mod exports;
+pub mod labels;
 pub mod permissions;
 pub mod registration;
 pub mod schema_pull;

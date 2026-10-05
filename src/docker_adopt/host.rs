@@ -113,6 +113,19 @@ pub async fn inspect_volume(name: &str) -> Result<VolumeInspect> {
     Ok(serde_json::from_value(raw)?)
 }
 
+/// Every volume on the host, by name.
+pub async fn inspect_volumes() -> Result<BTreeMap<String, VolumeInspect>> {
+    let names = lines(&docker(&["volume", "ls", "-q"]).await?);
+    if names.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut args = vec!["volume", "inspect"];
+    args.extend(names.iter().map(String::as_str));
+    let all: Vec<VolumeInspect> =
+        serde_json::from_str(&docker(&args).await?).context("decode docker volume inspect")?;
+    Ok(all.into_iter().map(|v| (v.name.clone(), v)).collect())
+}
+
 pub async fn dangling_volumes() -> Result<Vec<String>> {
     Ok(lines(
         &docker(&["volume", "ls", "-q", "--filter", "dangling=true"]).await?,
