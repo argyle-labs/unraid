@@ -1334,12 +1334,16 @@ fn redactor_for(c: &ContainerInspect, extra: &[&RunSpec]) -> Redactor {
 }
 
 /// Blocker when the root path cannot be used: none configured, or a
-/// side-effect-free Ping through it fails.
-async fn root_path_blocker(runner: Option<&dyn PrivilegedRunner>) -> Option<String> {
+/// side-effect-free Ping through it fails. Only an admin caller's call
+/// pings, so nobody else reaches root; theirs is checked at execute.
+async fn root_path_blocker(runner: Option<&dyn PrivilegedRunner>, admin: bool) -> Option<String> {
     let runner = match runner {
         None => return Some(privileged::missing_runner_blocker()),
         Some(r) => r,
     };
+    if !admin {
+        return None;
+    }
     match runner.run(&PrivilegedOp::Ping).await {
         Ok(_) => None,
         Err(e) => Some(format!(
@@ -1348,6 +1352,10 @@ async fn root_path_blocker(runner: Option<&dyn PrivilegedRunner>) -> Option<Stri
         )),
     }
 }
+
+/// Note for a caller whose dry run did not ping the root path.
+pub const ROOT_UNCHECKED_NOTE: &str =
+    "root path not checked: it is reached for an admin caller only, and is checked at execute";
 
 // ── tools ────────────────────────────────────────────────────────────────────
 
@@ -1909,7 +1917,7 @@ async fn unraid_docker_set_icon(
         && patch_intended.is_empty()
         && s.container.label(ICON_LABEL) == Some(url.as_str());
     let runner = privileged::runner();
-    blockers.extend(root_path_blocker(runner.as_deref()).await);
+    blockers.extend(root_path_blocker(runner.as_deref(), is_admin).await);
     let (rendered_command, rendered, deltas) = match host::render_command(&xml).await {
         Ok(cmd) => {
             let (got, d) = fidelity(
@@ -1972,6 +1980,7 @@ async fn unraid_docker_set_icon(
                     .map(|n| format!("{}: {n}", template::template_path(name))),
             )
             .chain(unchanged.then(|| "nothing to apply".to_string()))
+            .chain((!is_admin).then(|| ROOT_UNCHECKED_NOTE.to_string()))
             .chain(nocopy_note(&s, &conversions))
             .collect(),
         plan: None,
@@ -2148,7 +2157,7 @@ async fn unraid_docker_adopt(args: UnraidDockerAdoptArgs, ctx: &ToolCtx) -> Resu
 
     let mut blockers = plan.blockers.clone();
     let runner = privileged::runner();
-    blockers.extend(root_path_blocker(runner.as_deref()).await);
+    blockers.extend(root_path_blocker(runner.as_deref(), is_admin).await);
     for m in &plan.migrations {
         if host::is_nonempty_dir(Path::new(&m.to)) {
             blockers.push(format!("{} already has content", m.to));
@@ -2201,6 +2210,9 @@ async fn unraid_docker_adopt(args: UnraidDockerAdoptArgs, ctx: &ToolCtx) -> Resu
     ));
     if let Some(r) = &runner {
         notes.push(format!("root path: {}", r.kind()));
+    }
+    if !is_admin {
+        notes.push(ROOT_UNCHECKED_NOTE.to_string());
     }
     notes.extend(nocopy_note(&s, &plan.conversions));
     let ready = blockers.is_empty() && fidelity_diff.is_empty() && rendered.is_some();

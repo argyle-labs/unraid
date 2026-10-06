@@ -1201,7 +1201,7 @@ mod tests {
             rustix::fs::XattrFlags::empty(),
         );
         if set.is_err() {
-            return; // filesystem without user xattrs
+            return safefs::tests::skip("filesystem without user xattrs");
         }
         stage_copy(&open(&root), &open(&src), "pbs", "config", "v", NONCE)
             .await
@@ -1376,7 +1376,7 @@ mod tests {
         let (_d, dst) = appdata();
         fs::set_permissions(&src, fs::Permissions::from_mode(0o4755)).unwrap();
         if fs::metadata(&src).unwrap().permissions().mode() & 0o4000 == 0 {
-            return; // the filesystem dropped the bit
+            return safefs::tests::skip("the filesystem dropped the setuid bit");
         }
         let e = copy_into(&open(&src), &open(&dst), "v")
             .await
@@ -1398,7 +1398,7 @@ mod tests {
             rustix::fs::XattrFlags::empty(),
         );
         if set.is_err() {
-            return; // filesystem without user xattrs
+            return safefs::tests::skip("filesystem without user xattrs");
         }
         let before = safefs::manifest_with_xattrs(&open(&src)).unwrap();
         copy_into(&open(&src), &open(&dst), "v").await.unwrap();

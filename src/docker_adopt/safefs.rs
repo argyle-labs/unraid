@@ -779,6 +779,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// Report a test that cannot run here, so a skip never reads as a pass.
+    pub(crate) fn skip(why: &str) {
+        eprintln!(
+            "SKIP {}: {why}",
+            std::thread::current().name().unwrap_or("?")
+        );
+    }
+
     pub(crate) fn on_next_mkdir(f: impl FnOnce(&Path) + 'static) {
         AFTER_MKDIR.with(|h| *h.borrow_mut() = Some(Box::new(f)));
     }
@@ -880,7 +888,7 @@ pub(crate) mod tests {
     #[test]
     fn copy_check_refuses_device_nodes() {
         if super::super::host::euid() != Some(0) {
-            return;
+            return skip("needs root");
         }
         let (_d, r) = root();
         // Root inside a user namespace (an unprivileged LXC, or a CI job in one) may not create devices.
@@ -893,7 +901,7 @@ pub(crate) mod tests {
         )
         .is_err()
         {
-            return;
+            return skip("mknod refused (user namespace)");
         }
         let e = check_copyable(&Dir::open(&r).unwrap())
             .unwrap_err()
@@ -1073,7 +1081,7 @@ pub(crate) mod tests {
             rustix::fs::XattrFlags::empty(),
         );
         if set.is_err() {
-            return; // filesystem without user xattrs
+            return skip("filesystem without user xattrs");
         }
         let d = Dir::open(&r).unwrap();
         assert!(manifest_within(&d, true, MANIFEST_LIMITS).is_ok());

@@ -555,7 +555,7 @@ fn stacks_under_a_writable_root_are_not_retired() {
 #[test]
 fn a_bad_pre_existing_retired_dir_is_a_plan_problem() {
     if host::euid() != Some(0) {
-        return; // only root can make a root-owned stacks root
+        return safefs::tests::skip("only root can make a root-owned stacks root");
     }
     let d = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(d.path()).unwrap().join("stacks");
@@ -1072,12 +1072,40 @@ impl PrivilegedRunner for FakeRunner {
 
 #[tokio::test]
 async fn dry_run_pings_the_root_path() {
-    assert!(root_path_blocker(Some(&FakeRunner(true))).await.is_none());
-    let b = root_path_blocker(Some(&FakeRunner(false))).await.unwrap();
+    assert!(
+        root_path_blocker(Some(&FakeRunner(true)), true)
+            .await
+            .is_none()
+    );
+    let b = root_path_blocker(Some(&FakeRunner(false)), true)
+        .await
+        .unwrap();
     assert!(b.contains("failed a ping") && b.contains("orca#762"), "{b}");
     assert!(b.contains("password is required"), "{b}");
-    let b = root_path_blocker(None).await.unwrap();
+    let b = root_path_blocker(None, true).await.unwrap();
     assert!(b.contains("orca#762"), "{b}");
+}
+
+struct CountingRunner(std::sync::atomic::AtomicUsize);
+
+impl PrivilegedRunner for CountingRunner {
+    fn kind(&self) -> &'static str {
+        "counting"
+    }
+    fn run<'a>(&'a self, _op: &'a PrivilegedOp) -> BoxFuture<'a, Result<String>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok("root".into()) })
+    }
+}
+
+#[tokio::test]
+async fn a_non_admin_dry_run_never_reaches_root() {
+    let r = CountingRunner(Default::default());
+    assert!(root_path_blocker(Some(&r), false).await.is_none());
+    assert_eq!(r.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(root_path_blocker(None, false).await.is_some());
+    assert!(root_path_blocker(Some(&r), true).await.is_none());
+    assert_eq!(r.0.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
