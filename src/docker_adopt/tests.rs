@@ -878,7 +878,7 @@ fn ctx(plan: &AdoptPlan, f: &Fx) -> ApplyCtx {
         original: plan.live.clone(),
         conversions: plan.conversions.clone(),
         redactor: redactor_for(&f.c, &[&plan.target]),
-        state: Default::default(),
+        state: Mutex::new(ApplyState::new(&f.c)),
     }
 }
 
@@ -1569,6 +1569,39 @@ fn a_template_that_cannot_take_labels_still_gets_its_icon() {
         p.not_applied
     );
     assert!(label_writes("dockge", &p.labels, &p.conversions).is_empty());
+    let summary = set_icon_summary(
+        "dockge",
+        "u",
+        false,
+        &p.labels,
+        &p.conversions,
+        &p.not_applied,
+    );
+    assert!(
+        summary.starts_with("set dockge's icon to u and rebuild; not applied: ownership labels"),
+        "{summary}"
+    );
+}
+
+#[test]
+fn set_icon_summary_names_only_what_is_applied() {
+    let mut f = pbs();
+    let s = with_anonymous(&mut f);
+    let plan = plan_adopt(&s, &opts(None, false));
+    let labels = ownership::container_labels("pbs");
+    assert_eq!(
+        set_icon_summary("pbs", "u", false, &BTreeMap::new(), &[], &[]),
+        "set pbs's icon to u and rebuild"
+    );
+    assert_eq!(
+        set_icon_summary("pbs", "u", false, &labels, &plan.conversions, &[]),
+        format!(
+            "set pbs's icon to u, write orca's ownership labels, convert anonymous volumes \
+             [{ANON}] to labeled volumes and rebuild"
+        )
+    );
+    let s = set_icon_summary("pbs", "u", true, &BTreeMap::new(), &[], &["x: why".into()]);
+    assert!(s.contains("nothing to change; not applied: x: why"), "{s}");
 }
 
 /// `docker volume inspect` output for a volume carrying `labels`.
@@ -1906,6 +1939,126 @@ fn recovery_after_a_rebuild_names_the_converted_volumes() {
              pbs_var_cache_pbs:/var/cache/pbs"
         ),
         "{r}"
+    );
+}
+
+#[tokio::test]
+async fn stop_records_when_the_container_stopped() {
+    let mut f = pbs();
+    f.c.state.running = true;
+    f.c.state.started_at = "s1".into();
+    f.c.state.finished_at = "f0".into();
+    let plan = plan_adopt(&snapshot(&f), &opts(None, false));
+    let cx = ctx(&plan, &f);
+    assert_eq!(cx.state.lock().unwrap().stopped, None);
+    let mock = Mock::new(f.c.clone(), f.img.clone(), None);
+    apply(&mock, &cx, &[Step::Stop]).await.unwrap();
+    assert_eq!(
+        cx.state.lock().unwrap().stopped,
+        Some(("s1".to_string(), "f0".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn a_container_that_ran_or_a_source_that_changed_since_the_copy_is_not_rebuilt() {
+    let mut f = pbs();
+    f.c.state.running = false;
+    f.c.state.started_at = "2026-10-04T11:00:00Z".into();
+    f.c.state.finished_at = "2026-10-04T11:30:00Z".into();
+    let s = with_anonymous(&mut f);
+    let plan = plan_adopt(&s, &opts(None, false));
+    let steps = [Step::EnsureStopped, Step::Rebuild];
+    let run = |reply: char, ran: bool| {
+        let mock = Mock::new(f.c.clone(), f.img.clone(), None)
+            .with_output("priv manifest_volume", &digest_reply(reply));
+        if ran {
+            mock.container.lock().unwrap().state.finished_at = "2026-10-04T12:05:00Z".into();
+        }
+        let cx = ctx(&plan, &f);
+        cx.state
+            .lock()
+            .unwrap()
+            .manifests
+            .insert(ANON.into(), "1".repeat(64));
+        (mock, cx)
+    };
+
+    let (mock, cx) = run('1', true);
+    let err = apply(&mock, &cx, &steps).await.unwrap_err().to_string();
+    assert!(err.contains("ran after its volumes were copied"), "{err}");
+    assert!(err.contains("Rolled back"), "{err}");
+    assert!(!mock.calls().contains(&"priv rebuild".to_string()));
+
+    let (mock, cx) = run('2', false);
+    let err = apply(&mock, &cx, &steps).await.unwrap_err().to_string();
+    assert!(
+        err.contains(&format!("volume {ANON} changed since it was copied")),
+        "{err}"
+    );
+    assert!(!mock.calls().contains(&"priv rebuild".to_string()));
+
+    let (mock, cx) = run('1', false);
+    cx.state.lock().unwrap().manifests.clear();
+    let err = apply(&mock, &cx, &steps).await.unwrap_err().to_string();
+    assert!(err.contains("no verified copy of it was recorded"), "{err}");
+
+    let (mock, cx) = run('1', false);
+    apply(&mock, &cx, &steps).await.unwrap();
+    assert!(mock.calls().contains(&"priv rebuild".to_string()));
+    assert!(
+        mock.ops
+            .lock()
+            .unwrap()
+            .contains(&PrivilegedOp::ManifestVolume {
+                volume: ANON.into(),
+                xattrs: true
+            })
+    );
+}
+
+#[tokio::test]
+async fn a_failed_removal_reports_the_volumes_already_removed() {
+    let f = pbs();
+    let plan = plan_adopt(&snapshot(&f), &opts(None, false));
+    let (first, second) = ("a".repeat(64), "b".repeat(64));
+    let fail: &'static str = Box::leak(format!("docker volume rm {second}").into_boxed_str());
+    let mock = Mock::new(f.c.clone(), f.img.clone(), Some(fail))
+        .with_output("docker volume ls", &format!("{first}\n{second}\n"))
+        .with_output("priv manifest_volume", &digest_reply('1'));
+    let cx = ctx(&plan, &f);
+    {
+        let mut st = cx.state.lock().unwrap();
+        st.manifests.insert(first.clone(), "1".repeat(64));
+        st.manifests.insert(second.clone(), "1".repeat(64));
+    }
+    let err = apply(
+        &mock,
+        &cx,
+        &[Step::RemoveOwnAnonymousVolumes {
+            candidates: vec![first.clone(), second.clone()],
+        }],
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains(&format!("already removed [{first}]")), "{err}");
+}
+
+#[test]
+fn a_non_admin_dry_run_leaves_nocopy_to_execute() {
+    let mut f = pbs();
+    let mut s = with_anonymous(&mut f);
+    s.empty_unknown.insert(ANON.into());
+    let plan = plan_adopt(&s, &opts(None, false));
+    assert!(!plan.conversions[0].nocopy);
+    let note = nocopy_note(&s, &plan.conversions).unwrap();
+    assert!(
+        note.contains(ANON) && note.contains("decided at execute"),
+        "{note}"
+    );
+    assert_eq!(
+        nocopy_note(&with_anonymous(&mut pbs()), &plan.conversions),
+        None
     );
 }
 

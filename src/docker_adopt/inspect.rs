@@ -156,6 +156,10 @@ pub struct ContainerState {
     pub status: String,
     #[serde(default)]
     pub running: bool,
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub finished_at: String,
 }
 
 #[orca_struct]

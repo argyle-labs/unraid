@@ -325,6 +325,9 @@ pub async fn stage_copy(
     let (app, stage) = create_stage(appdata, name, suffix, nonce)?;
     let sname = stage_name(nonce, suffix);
     let copied = async {
+        // The source's bounded manifest comes first, so a tree too large to
+        // verify is refused before anything is copied.
+        let a = safefs::manifest(src)?;
         safefs::check_copyable(src)?;
         let to = format!("{}/{STAGE_DATA}", stage.proc_path()?);
         // `-a` would also carry security.* xattrs (file capabilities).
@@ -341,7 +344,6 @@ pub async fn stage_copy(
         .await?;
         let data = stage.child(STAGE_DATA)?;
         safefs::check_copyable(&data)?;
-        let a = safefs::manifest(src)?;
         let b = safefs::manifest(&data)?;
         if a != b {
             bail!(
@@ -375,6 +377,7 @@ pub async fn copy_into(src: &Dir, dst: &Dir, volume: &str) -> Result<String> {
     if !dst.entries()?.is_empty() {
         bail!("{} is not empty", dst.path().display());
     }
+    let a = safefs::manifest_with_xattrs(src)?;
     safefs::check_copyable(src)?;
     let copied = async {
         let from = format!("{}/.", src.proc_path()?);
@@ -400,7 +403,6 @@ pub async fn copy_into(src: &Dir, dst: &Dir, volume: &str) -> Result<String> {
                 dst.path().display()
             );
         }
-        let a = safefs::manifest_with_xattrs(src)?;
         let b = safefs::manifest_with_xattrs(dst)?;
         if a != b {
             bail!(
