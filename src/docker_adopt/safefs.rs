@@ -16,6 +16,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use plugin_toolkit::hash::hex_encode;
 use plugin_toolkit::prelude::*;
@@ -323,6 +324,43 @@ impl Dir {
         Ok(())
     }
 
+    /// Names in this directory; `None`, read no further, once there are
+    /// more than `max`.
+    fn entries_max(&self, max: u64) -> Result<Option<Vec<OsString>>> {
+        let mut out = Vec::new();
+        for e in rustix::fs::Dir::read_from(&self.fd)? {
+            let e = e?;
+            let n = e.file_name().to_bytes();
+            if n != b"." && n != b".." {
+                if out.len() as u64 >= max {
+                    return Ok(None);
+                }
+                out.push(OsStr::from_bytes(n).to_os_string());
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Give this directory `src`'s owner, group and permission bits, never
+    /// setuid. The sticky bit is kept.
+    pub fn copy_owner_mode_from(&self, src: &Dir) -> Result<()> {
+        let st = src.stat()?;
+        rustix::fs::fchown(
+            &self.fd,
+            Some(rustix::fs::Uid::from_raw(st.st_uid)),
+            Some(rustix::fs::Gid::from_raw(st.st_gid)),
+        )
+        .map_err(|e| anyhow!("chown {}: {e}", self.path.display()))?;
+        rustix::fs::fchmod(&self.fd, perm(mode_bits(&st) & 0o3777))
+            .map_err(|e| anyhow!("chmod {}: {e}", self.path.display()))
+    }
+
+    /// This directory's extended attributes, sorted by name, within
+    /// [`MANIFEST_LIMITS`].
+    pub fn xattrs(&self) -> Result<Xattrs> {
+        fd_xattrs(self.fd.as_fd(), &self.path, MANIFEST_LIMITS.xattr)
+    }
+
     /// Remove the empty subdirectory `name`.
     pub fn remove_empty_dir(&self, name: &str) -> Result<()> {
         let n = component(name)?;
@@ -409,6 +447,9 @@ pub fn remove_file(path: &Path) -> Result<bool> {
 /// files, setuid directories, and nesting deeper than [`MAX_DEPTH`].
 /// A setgid directory only sets group inheritance and is allowed.
 pub fn check_copyable(root: &Dir) -> Result<()> {
+    if root.mode()? & 0o4000 != 0 {
+        bail!("{} is a setuid directory", root.path.display());
+    }
     check_copyable_depth(root, 0)
 }
 
@@ -438,9 +479,11 @@ fn check_copyable_depth(dir: &Dir, depth: usize) -> Result<()> {
     Ok(())
 }
 
-/// A content summary of a tree: entry count, regular-file bytes, and the
-/// sha256 of the sorted `(path, type, size, mode, uid, gid, content)` list,
-/// where content is a file's sha256 or a symlink's target.
+/// A content summary of a tree: entry count, regular-file bytes, and a
+/// sha256 over one row per entry, `(path, type, size, mode, uid, gid,
+/// content[, xattrs])`, where content is a file's sha256 or a symlink's
+/// target. Rows are hashed as the tree is walked, each directory's entries in
+/// byte order, so no list of rows is held.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub entries: u64,
@@ -448,43 +491,151 @@ pub struct Manifest {
     pub digest: String,
 }
 
+/// Bounds on one manifest walk; exceeding any fails it.
+#[derive(Debug, Clone, Copy)]
+pub struct ManifestLimits {
+    pub entries: u64,
+    /// Regular-file bytes read.
+    pub bytes: u64,
+    /// One entry's xattr name list and values together.
+    pub xattr: usize,
+    pub time: Duration,
+}
+
+/// Linux caps one xattr name list and one value at 64 KiB each, so a
+/// legitimate entry with a few attributes fits.
+pub const MANIFEST_LIMITS: ManifestLimits = ManifestLimits {
+    entries: 2_000_000,
+    bytes: 1 << 40,
+    xattr: 256 * 1024,
+    time: Duration::from_secs(60 * 60),
+};
+
 /// [`Manifest`] of everything under `root`, read by descriptor: no symlink
 /// is followed, and each file is hashed from the fd that was checked to be a
 /// regular file.
 pub fn manifest(root: &Dir) -> Result<Manifest> {
-    let mut rows = Vec::new();
-    let mut bytes = 0;
-    manifest_into(root, Path::new(""), 0, &mut rows, &mut bytes)?;
-    rows.sort();
+    manifest_within(root, false, MANIFEST_LIMITS)
+}
+
+/// [`manifest`] with every entry's extended attributes (file capabilities,
+/// ACLs, …) in its row, for copies that preserve them.
+pub fn manifest_with_xattrs(root: &Dir) -> Result<Manifest> {
+    manifest_within(root, true, MANIFEST_LIMITS)
+}
+
+pub fn manifest_within(root: &Dir, xattrs: bool, limits: ManifestLimits) -> Result<Manifest> {
+    let mut w = Walk {
+        h: Sha256::new(),
+        entries: 0,
+        bytes: 0,
+        xattrs,
+        limits,
+        deadline: Instant::now() + limits.time,
+        root: root.path.clone(),
+    };
+    manifest_into(root, &[], 0, &mut w)?;
     Ok(Manifest {
-        entries: rows.len() as u64,
-        bytes,
-        digest: sha256_hex(rows.join("\n").as_bytes()),
+        entries: w.entries,
+        bytes: w.bytes,
+        digest: hex_encode(&w.h.finalize()),
     })
 }
 
-fn manifest_into(
-    dir: &Dir,
-    rel: &Path,
-    depth: usize,
-    rows: &mut Vec<String>,
-    bytes: &mut u64,
-) -> Result<()> {
+struct Walk {
+    h: Sha256,
+    entries: u64,
+    bytes: u64,
+    xattrs: bool,
+    limits: ManifestLimits,
+    deadline: Instant,
+    root: PathBuf,
+}
+
+impl Walk {
+    fn check_time(&self) -> Result<()> {
+        if Instant::now() >= self.deadline {
+            bail!(
+                "reading {} took longer than {}s",
+                self.root.display(),
+                self.limits.time.as_secs()
+            );
+        }
+        Ok(())
+    }
+
+    /// Length-prefixed, so no field's bytes can be read as another's.
+    fn field(&mut self, b: &[u8]) {
+        self.h.update((b.len() as u64).to_le_bytes());
+        self.h.update(b);
+    }
+
+    fn row(&mut self, path: &[u8], kind: u8, size: u64, st: &Stat, content: &[u8], attrs: &Xattrs) {
+        self.field(path);
+        self.h.update([kind]);
+        self.h.update(size.to_le_bytes());
+        self.h.update(mode_bits(st).to_le_bytes());
+        self.h.update(st.st_uid.to_le_bytes());
+        self.h.update(st.st_gid.to_le_bytes());
+        self.field(content);
+        self.h.update((attrs.len() as u64).to_le_bytes());
+        for (k, v) in attrs {
+            self.field(k);
+            self.field(v);
+        }
+    }
+}
+
+fn manifest_into(dir: &Dir, rel: &[u8], depth: usize, w: &mut Walk) -> Result<()> {
     if depth > MAX_DEPTH {
         bail!("{} is nested deeper than {MAX_DEPTH}", dir.path.display());
     }
-    for n in dir.entries()? {
+    let over = |w: &Walk| {
+        anyhow!(
+            "{} has more than {} entries",
+            w.root.display(),
+            w.limits.entries
+        )
+    };
+    let Some(mut names) = dir.entries_max(w.limits.entries - w.entries)? else {
+        return Err(over(w));
+    };
+    names.sort();
+    for n in names {
+        w.check_time()?;
+        w.entries += 1;
+        // A subdirectory walked earlier may have used up the budget.
+        if w.entries > w.limits.entries {
+            return Err(over(w));
+        }
         let st = rustix::fs::statat(&dir.fd, &n, AtFlags::SYMLINK_NOFOLLOW)?;
-        let path = rel.join(&n);
-        let (kind, size, content) = match file_type(&st) {
+        let mut path = rel.to_vec();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(n.as_bytes());
+        let shown = dir.path.join(&n);
+        let max_xattr = w.limits.xattr;
+        match file_type(&st) {
             FileType::Directory => {
-                manifest_into(&dir.child_os(&n)?, &path, depth + 1, rows, bytes)?;
-                ('d', 0, String::new())
+                let child = dir.child_os(&n)?;
+                let attrs = if w.xattrs {
+                    fd_xattrs(child.fd.as_fd(), &child.path, max_xattr)?
+                } else {
+                    Vec::new()
+                };
+                w.row(&path, b'd', 0, &st, &[], &attrs);
+                manifest_into(&child, &path, depth + 1, w)?;
             }
             FileType::RegularFile => {
                 let mut f = dir
                     .open_regular(&n)?
-                    .ok_or_else(|| anyhow!("{} vanished", dir.path.join(&n).display()))?;
+                    .ok_or_else(|| anyhow!("{} vanished", shown.display()))?;
+                let attrs = if w.xattrs {
+                    fd_xattrs(f.as_fd(), &shown, max_xattr)?
+                } else {
+                    Vec::new()
+                };
                 let mut h = Sha256::new();
                 let mut len = 0u64;
                 let mut buf = vec![0u8; 64 * 1024];
@@ -495,28 +646,119 @@ fn manifest_into(
                     }
                     h.update(&buf[..k]);
                     len += k as u64;
+                    w.bytes += k as u64;
+                    if w.bytes > w.limits.bytes {
+                        bail!(
+                            "{} holds more than {} bytes",
+                            w.root.display(),
+                            w.limits.bytes
+                        );
+                    }
+                    w.check_time()?;
                 }
-                *bytes += len;
-                ('f', len, hex_encode(&h.finalize()))
+                w.row(&path, b'f', len, &st, &h.finalize(), &attrs);
             }
             FileType::Symlink => {
+                let attrs = if w.xattrs {
+                    symlink_xattrs(dir, &n, max_xattr)?
+                } else {
+                    Vec::new()
+                };
                 let t = rustix::fs::readlinkat(&dir.fd, &n, Vec::new())?;
-                ('l', 0, String::from_utf8_lossy(t.to_bytes()).into_owned())
+                w.row(&path, b'l', 0, &st, t.to_bytes(), &attrs);
             }
             _ => bail!(
                 "{} is not a regular file, directory or symlink",
-                dir.path.join(&n).display()
+                shown.display()
             ),
-        };
-        rows.push(format!(
-            "{}\t{kind}\t{size}\t{:o}\t{}\t{}\t{content}",
-            path.to_string_lossy(),
-            mode_bits(&st),
-            st.st_uid,
-            st.st_gid
-        ));
+        }
     }
     Ok(())
+}
+
+/// Extended attributes as sorted `(name, value)` pairs.
+pub type Xattrs = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Every extended attribute, at most `max` bytes of names and values
+/// together. A filesystem without xattr support has none.
+fn fd_xattrs(fd: BorrowedFd<'_>, shown: &Path, max: usize) -> Result<Xattrs> {
+    collect_xattrs(
+        shown,
+        max,
+        |b| rustix::fs::flistxattr(fd, b),
+        |n, b| rustix::fs::fgetxattr(fd, n, b),
+    )
+}
+
+/// A symlink's own extended attributes, read without following it.
+#[cfg(target_os = "linux")]
+fn symlink_xattrs(dir: &Dir, name: &OsStr, max: usize) -> Result<Xattrs> {
+    use std::os::fd::AsRawFd;
+    let path = Path::new(&format!("/proc/self/fd/{}", dir.fd.as_raw_fd())).join(name);
+    collect_xattrs(
+        &dir.path.join(name),
+        max,
+        |b| rustix::fs::llistxattr(&path, b),
+        |n, b| rustix::fs::lgetxattr(&path, n, b),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn symlink_xattrs(_dir: &Dir, _name: &OsStr, _max: usize) -> Result<Xattrs> {
+    Ok(Vec::new())
+}
+
+fn collect_xattrs(
+    shown: &Path,
+    max: usize,
+    list: impl FnMut(&mut [u8]) -> rustix::io::Result<usize>,
+    mut get: impl FnMut(&[u8], &mut [u8]) -> rustix::io::Result<usize>,
+) -> Result<Xattrs> {
+    let err = |e: Errno| match e {
+        Errno::TOOBIG => anyhow!(
+            "extended attributes of {} exceed {max} bytes",
+            shown.display()
+        ),
+        e => anyhow!("read extended attributes of {}: {e}", shown.display()),
+    };
+    let names = match read_sized(max, list) {
+        Ok(n) => n,
+        Err(Errno::NOTSUP) => return Ok(Vec::new()),
+        Err(e) => return Err(err(e)),
+    };
+    let mut left = max - names.len();
+    let mut out = Vec::new();
+    for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let value = read_sized(left, |b| get(name, b)).map_err(err)?;
+        left -= value.len();
+        out.push((name.to_vec(), value));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Call a size-then-fill xattr syscall, retrying while the value grows.
+/// `TOOBIG` when it needs more than `max` bytes.
+fn read_sized(
+    max: usize,
+    mut f: impl FnMut(&mut [u8]) -> rustix::io::Result<usize>,
+) -> Result<Vec<u8>, Errno> {
+    for _ in 0..8 {
+        let n = f(&mut [])?;
+        if n > max {
+            return Err(Errno::TOOBIG);
+        }
+        let mut buf = vec![0u8; n];
+        match f(&mut buf) {
+            Ok(k) => {
+                buf.truncate(k);
+                return Ok(buf);
+            }
+            Err(Errno::RANGE) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Errno::RANGE)
 }
 
 #[cfg(test)]
@@ -535,6 +777,14 @@ pub(crate) mod tests {
         if let Some(f) = AFTER_MKDIR.with(|h| h.borrow_mut().take()) {
             f(p);
         }
+    }
+
+    /// Report a test that cannot run here, so a skip never reads as a pass.
+    pub(crate) fn skip(why: &str) {
+        eprintln!(
+            "SKIP {}: {why}",
+            std::thread::current().name().unwrap_or("?")
+        );
     }
 
     pub(crate) fn on_next_mkdir(f: impl FnOnce(&Path) + 'static) {
@@ -638,7 +888,7 @@ pub(crate) mod tests {
     #[test]
     fn copy_check_refuses_device_nodes() {
         if super::super::host::euid() != Some(0) {
-            return;
+            return skip("needs root");
         }
         let (_d, r) = root();
         // Root inside a user namespace (an unprivileged LXC, or a CI job in one) may not create devices.
@@ -651,7 +901,7 @@ pub(crate) mod tests {
         )
         .is_err()
         {
-            return;
+            return skip("mknod refused (user namespace)");
         }
         let e = check_copyable(&Dir::open(&r).unwrap())
             .unwrap_err()
@@ -759,6 +1009,121 @@ pub(crate) mod tests {
             .set_modified(mtime)
             .unwrap();
         assert_ne!(manifest(&d).unwrap().digest, m2.digest);
+    }
+
+    #[test]
+    fn manifest_is_independent_of_creation_order() {
+        let (_a, a) = root();
+        let (_b, b) = root();
+        for n in ["x", "y", "z"] {
+            fs::write(a.join(n), n).unwrap();
+        }
+        for n in ["z", "x", "y"] {
+            fs::write(b.join(n), n).unwrap();
+        }
+        assert_eq!(
+            manifest(&Dir::open(&a).unwrap()).unwrap(),
+            manifest(&Dir::open(&b).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn manifest_fails_closed_past_any_limit() {
+        let (_d, r) = root();
+        fs::create_dir(r.join("sub")).unwrap();
+        fs::write(r.join("sub/a"), b"1234").unwrap();
+        fs::write(r.join("sub/b"), b"5678").unwrap();
+        let d = Dir::open(&r).unwrap();
+        let within = |l: ManifestLimits| manifest_within(&d, false, l);
+        assert_eq!(within(MANIFEST_LIMITS).unwrap().entries, 3);
+        for entries in [1, 2] {
+            let e = within(ManifestLimits {
+                entries,
+                ..MANIFEST_LIMITS
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains(&format!("more than {entries} entries")), "{e}");
+        }
+        fs::write(r.join("z"), b"").unwrap();
+        let e = within(ManifestLimits {
+            entries: 3,
+            ..MANIFEST_LIMITS
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("more than 3 entries"), "{e}");
+        let e = within(ManifestLimits {
+            bytes: 7,
+            ..MANIFEST_LIMITS
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("more than 7 bytes"), "{e}");
+        let e = within(ManifestLimits {
+            time: Duration::ZERO,
+            ..MANIFEST_LIMITS
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("took longer than"), "{e}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn manifest_refuses_oversized_extended_attributes() {
+        let (_d, r) = root();
+        fs::write(r.join("f"), b"x").unwrap();
+        let set = rustix::fs::setxattr(
+            r.join("f").as_path(),
+            "user.orca-test",
+            &[7u8; 512],
+            rustix::fs::XattrFlags::empty(),
+        );
+        if set.is_err() {
+            return skip("filesystem without user xattrs");
+        }
+        let d = Dir::open(&r).unwrap();
+        assert!(manifest_within(&d, true, MANIFEST_LIMITS).is_ok());
+        let e = manifest_within(
+            &d,
+            true,
+            ManifestLimits {
+                xattr: 256,
+                ..MANIFEST_LIMITS
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("exceed 256 bytes"), "{e}");
+    }
+
+    /// Names and link targets that differ only in bytes invalid as UTF-8
+    /// must not hash alike.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn manifest_rows_use_raw_name_and_target_bytes() {
+        let digest = |name: &[u8], target: &[u8]| {
+            let (_d, r) = root();
+            fs::write(r.join(OsStr::from_bytes(name)), b"x").unwrap();
+            symlink(OsStr::from_bytes(target), r.join("l")).unwrap();
+            manifest(&Dir::open(&r).unwrap()).unwrap().digest
+        };
+        let base = digest(b"a\xff", b"t\xff");
+        assert_ne!(base, digest(b"a\xfe", b"t\xff"));
+        assert_ne!(base, digest(b"a\xff", b"t\xfe"));
+    }
+
+    #[test]
+    fn copied_owner_mode_keeps_the_sticky_bit() {
+        let (_d, r) = root();
+        fs::create_dir(r.join("src")).unwrap();
+        fs::create_dir(r.join("dst")).unwrap();
+        fs::set_permissions(r.join("src"), fs::Permissions::from_mode(0o1777)).unwrap();
+        let dst = Dir::open(&r.join("dst")).unwrap();
+        dst.copy_owner_mode_from(&Dir::open(&r.join("src")).unwrap())
+            .unwrap();
+        assert_eq!(dst.mode().unwrap(), 0o1777);
     }
 
     #[test]

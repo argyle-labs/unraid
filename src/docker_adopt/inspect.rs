@@ -12,6 +12,7 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::{Value, json};
 
 use super::spec::{self, MountKind, MountSpec, RunSpec};
+use crate::labels;
 
 #[orca_struct]
 #[derive(Debug, Clone, Default)]
@@ -155,6 +156,10 @@ pub struct ContainerState {
     pub status: String,
     #[serde(default)]
     pub running: bool,
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub finished_at: String,
 }
 
 #[orca_struct]
@@ -217,6 +222,8 @@ pub struct VolumeInspect {
     pub labels: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub options: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 /// Compose project label docker compose stamps on every container it creates.
@@ -275,6 +282,60 @@ impl VolumeInspect {
     pub fn expected_mountpoint(name: &str) -> String {
         format!("{VOLUMES_ROOT}/{name}/_data")
     }
+
+    pub fn labels(&self) -> BTreeMap<String, String> {
+        self.labels.clone().unwrap_or_default()
+    }
+}
+
+/// Why `volume`, mounted from `source`, is not a plain local volume whose
+/// data root can be copied.
+pub fn local_volume_problems(volume: &str, v: Option<&VolumeInspect>, source: &str) -> Vec<String> {
+    let Some(v) = v else {
+        return vec![format!("volume {volume}: not inspected")];
+    };
+    let mut out = Vec::new();
+    if v.driver != "local" || v.options.as_ref().is_some_and(|o| !o.is_empty()) {
+        out.push(format!(
+            "volume {volume}: driver {:?} with options is not a plain local volume",
+            v.driver
+        ));
+    }
+    if v.mountpoint != VolumeInspect::expected_mountpoint(volume) || source != v.mountpoint {
+        out.push(format!(
+            "volume {volume}: data at {:?}, not {}",
+            v.mountpoint,
+            VolumeInspect::expected_mountpoint(volume)
+        ));
+    }
+    out
+}
+
+/// Containers other than `name` that mount `volume`.
+pub fn mounted_by_others<'a>(
+    volume: &str,
+    name: &str,
+    all: &'a [ContainerInspect],
+) -> Vec<&'a str> {
+    all.iter()
+        .filter(|o| o.short_name() != name)
+        .filter(|o| o.volumes().any(|x| x.name.as_deref() == Some(volume)))
+        .map(|o| o.short_name())
+        .collect()
+}
+
+/// `VolumeOptions` that only carry orca ownership labels and `NoCopy`,
+/// which the template expresses as `volume-label=` and `volume-nocopy`.
+fn ownership_volume_options(v: &Value) -> bool {
+    v.as_object().is_none_or(|o| {
+        o.iter().all(|(k, v)| match k.as_str() {
+            "Labels" => v
+                .as_object()
+                .is_none_or(|l| l.keys().all(|k| labels::is_ownership_key(k))),
+            "NoCopy" => v.is_boolean(),
+            _ => is_zero(v),
+        })
+    })
 }
 
 /// Image env entries (`K=V`), the set a container inherits without asking.
@@ -550,6 +611,7 @@ pub fn unmodelled(container: &Value, image: &Value, compose_moving: bool) -> Vec
                     "BindOptions" => v.as_object().is_none_or(|o| {
                         o.iter().all(|(bk, bv)| bk == "Propagation" || is_zero(bv))
                     }),
+                    "VolumeOptions" => ownership_volume_options(v),
                     _ => is_zero(v),
                 };
                 if !ok {

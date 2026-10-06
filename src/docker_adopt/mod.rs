@@ -10,7 +10,8 @@
 //! the template reproduces the live container (the fidelity gate): every
 //! difference is either an intended consequence of moving under dockerMan
 //! (reported in `intendedChanges`) or blocks execute. Secret-looking env
-//! values are masked in everything returned.
+//! values are masked in everything returned. Both write orca's ownership
+//! labels and convert anonymous volumes to labeled ones ([`ownership`]).
 //!
 //! The mutating verbs set `execute_gated = false` and own their `execute`
 //! opt-in so the dry run can return the template, fidelity diff and step list
@@ -21,6 +22,7 @@
 pub mod host;
 pub mod inspect;
 pub mod orphans;
+pub mod ownership;
 pub mod privileged;
 pub mod redact;
 pub mod safefs;
@@ -40,6 +42,7 @@ use inspect::{
     ContainerInspect, ICON_LABEL, ImageInspect, MANAGED_LABEL, VolumeInspect, live_spec,
 };
 use orphans::ComposeLeftovers;
+use ownership::Conversion;
 use privileged::{PrivilegedOp, PrivilegedRunner};
 use redact::Redactor;
 use spec::{Delta, DiffMode, MountKind, MountSpec, RunSpec};
@@ -126,6 +129,18 @@ pub enum Step {
     RemoveOwnAnonymousVolumes {
         candidates: Vec<String>,
     },
+    /// Refuse to rebuild over copies if the container started since.
+    EnsureStopped,
+    /// Create an empty volume carrying `labels`; refuses one that exists.
+    CreateVolume {
+        volume: String,
+        labels: BTreeMap<String, String>,
+    },
+    /// Copy anonymous volume `from` into the labeled volume `to`.
+    CopyIntoVolume {
+        from: String,
+        to: String,
+    },
     /// Move a staged copy to where the template mounts it. Runs right
     /// before `Rebuild`; an exposed copy is never rolled back.
     ExposeCopy {
@@ -157,6 +172,9 @@ impl Step {
             Step::RefreshIcons => "refresh-icons",
             Step::RemoveVolume { .. } => "remove-volume",
             Step::RemoveOwnAnonymousVolumes { .. } => "remove-own-anonymous-volumes",
+            Step::EnsureStopped => "ensure-stopped",
+            Step::CreateVolume { .. } => "create-volume",
+            Step::CopyIntoVolume { .. } => "copy-into-volume",
             Step::ExposeCopy { .. } => "expose-copy",
             Step::RemoveNetwork { .. } => "remove-network",
             Step::RetireStack { .. } => "retire-stack",
@@ -213,11 +231,34 @@ impl Step {
             ),
             Step::RemoveVolume { volume } => (
                 volume.clone(),
-                Some("only once the copy verified and the container runs".to_string()),
+                Some(
+                    "only once the copy verified, the container runs and the volume still \
+                     matches the copy's manifest"
+                        .to_string(),
+                ),
             ),
             Step::RemoveOwnAnonymousVolumes { candidates } => (
                 format!("[{}]", candidates.join(", ")),
-                Some("only those no container mounts after the rebuild".to_string()),
+                Some(
+                    "only those no container mounts after the rebuild and that still match \
+                     their copy's manifest"
+                        .to_string(),
+                ),
+            ),
+            Step::EnsureStopped => (
+                name.to_string(),
+                Some("still stopped since its volumes were copied".to_string()),
+            ),
+            Step::CreateVolume { volume, labels } => (
+                volume.clone(),
+                Some(format!("labels {}", label_list(labels))),
+            ),
+            Step::CopyIntoVolume { from, to } => (
+                to.clone(),
+                Some(format!(
+                    "copy {from} into it while {name} is stopped; verify entries, bytes and \
+                     manifest digest"
+                )),
             ),
             Step::ExposeCopy { suffix } => (
                 format!("{}/{name}/{suffix}", host::APPDATA),
@@ -237,6 +278,63 @@ impl Step {
     }
 }
 
+fn label_list(labels: &BTreeMap<String, String>) -> String {
+    labels
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether volume `name` exists, by exact name.
+async fn volume_exists(ops: &dyn HostOps, name: &str) -> Result<bool> {
+    let out = ops
+        .docker(&["volume", "ls", "-q", "--filter", &format!("name={name}")])
+        .await?;
+    Ok(out.lines().any(|l| l.trim() == name))
+}
+
+async fn inspect_volume(ops: &dyn HostOps, name: &str) -> Result<VolumeInspect> {
+    let out = ops.docker(&["volume", "inspect", name]).await?;
+    let all: Vec<VolumeInspect> =
+        serde_json::from_str(&out).context("decode docker volume inspect")?;
+    all.into_iter()
+        .find(|v| v.name == name)
+        .ok_or_else(|| anyhow!("volume {name} not found"))
+}
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Why `volume` may not be removed: no verified copy of it was recorded this
+/// run, or its content (re-read as root) no longer matches that copy.
+async fn changed_since_copy(
+    ops: &dyn HostOps,
+    cx: &ApplyCtx,
+    volume: &str,
+    xattrs: bool,
+) -> Result<Option<String>> {
+    let Some(copied) = lock(&cx.state).manifests.get(volume).cloned() else {
+        return Ok(Some("no verified copy of it was recorded".to_string()));
+    };
+    let now = ops
+        .privileged(&PrivilegedOp::ManifestVolume {
+            volume: volume.to_string(),
+            xattrs,
+        })
+        .await?;
+    Ok(match privileged::manifest_digest(&now) {
+        Some(d) if d == copied => None,
+        Some(d) => Some(format!(
+            "changed since it was copied (manifest {} then, {} now)",
+            &copied[..12],
+            &d[..12]
+        )),
+        None => Some(format!("its manifest could not be read: {now}")),
+    })
+}
+
 #[orca_struct]
 #[derive(Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -253,7 +351,15 @@ async fn run_step(ops: &dyn HostOps, step: &Step, cx: &ApplyCtx) -> Result<Strin
     let name_s = cx.name.clone();
     match step {
         Step::Probe => ops.privileged(&PrivilegedOp::Ping).await,
-        Step::Stop => ops.docker(&["stop", name]).await.map(|_| "stopped".into()),
+        Step::Stop => {
+            ops.docker(&["stop", name]).await?;
+            // Left unrecorded, EnsureStopped refuses to rebuild; failing here
+            // instead would skip restarting the container on rollback.
+            if let Ok(c) = ops.inspect_container(name).await {
+                lock(&cx.state).stopped = Some(run_times(&c));
+            }
+            Ok("stopped".into())
+        }
         Step::CopyVolume { volume, suffix, .. } => {
             ops.privileged(&PrivilegedOp::CopyVolume {
                 name: name_s,
@@ -354,6 +460,9 @@ async fn run_step(ops: &dyn HostOps, step: &Step, cx: &ApplyCtx) -> Result<Strin
             if !ops.inspect_container(name).await?.state.running {
                 return Ok(format!("kept {volume}: container is not running"));
             }
+            if let Some(why) = changed_since_copy(ops, cx, volume, false).await? {
+                return Ok(format!("kept {volume}: {why}"));
+            }
             ops.docker(&["volume", "rm", volume])
                 .await
                 .map(|_| format!("removed {volume}"))
@@ -361,18 +470,121 @@ async fn run_step(ops: &dyn HostOps, step: &Step, cx: &ApplyCtx) -> Result<Strin
         Step::RemoveOwnAnonymousVolumes { candidates } => {
             let all = ops.inspect_all().await?;
             let free = orphans::unmounted(candidates, &all);
-            for v in &free {
-                ops.docker(&["volume", "rm", v]).await?;
+            let mut removed = Vec::new();
+            let mut gone = Vec::new();
+            let mut changed = Vec::new();
+            let walked: Result<()> = async {
+                for v in &free {
+                    // dockerMan's rebuild may already have removed them.
+                    if !volume_exists(ops, v).await? {
+                        gone.push(v.clone());
+                    } else if let Some(why) = changed_since_copy(ops, cx, v, true).await? {
+                        changed.push(format!("{v} ({why})"));
+                    } else {
+                        ops.docker(&["volume", "rm", v]).await?;
+                        removed.push(v.clone());
+                    }
+                }
+                Ok(())
             }
-            let kept: Vec<&String> = candidates.iter().filter(|c| !free.contains(c)).collect();
+            .await;
+            if let Err(e) = walked {
+                bail!("{e:#}; already removed [{}]", removed.join(", "));
+            }
+            let kept: Vec<&str> = candidates
+                .iter()
+                .filter(|c| !free.contains(c))
+                .map(String::as_str)
+                .collect();
             Ok(format!(
-                "removed [{}]; kept (still mounted) [{}]",
-                free.join(", "),
-                kept.iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "removed [{}]; already gone [{}]; kept (still mounted) [{}]; kept (not \
+                 proven unchanged) [{}]",
+                removed.join(", "),
+                gone.join(", "),
+                kept.join(", "),
+                changed.join(", ")
             ))
+        }
+        Step::EnsureStopped => {
+            let c = ops.inspect_container(name).await?;
+            if c.state.running {
+                bail!("{name} started after its volumes were copied; not rebuilding over the copy");
+            }
+            // Not running now does not mean it never ran: a start and stop
+            // since the copy moves StartedAt/FinishedAt.
+            let at_stop = lock(&cx.state).stopped.clone();
+            let now = run_times(&c);
+            match at_stop {
+                None => bail!("{name}'s stopped state was never recorded; not rebuilding"),
+                Some(t) if t != now => bail!(
+                    "{name} ran after its volumes were copied (started {}, finished {}; \
+                     {} and {} when stopped); not rebuilding over the copy",
+                    now.0,
+                    now.1,
+                    t.0,
+                    t.1
+                ),
+                Some(_) => {}
+            }
+            let mut sources: BTreeSet<String> = lock(&cx.state).manifests.keys().cloned().collect();
+            sources.extend(cx.conversions.iter().map(|c| c.old.clone()));
+            for v in &sources {
+                let xattrs = cx.conversions.iter().any(|c| &c.old == v);
+                if let Some(why) = changed_since_copy(ops, cx, v, xattrs).await? {
+                    bail!("volume {v} {why}; not rebuilding over the copy");
+                }
+            }
+            Ok(format!(
+                "stopped since the copy; [{}] unchanged",
+                sources.into_iter().collect::<Vec<_>>().join(", ")
+            ))
+        }
+        Step::CreateVolume { volume, labels } => {
+            if volume_exists(ops, volume).await? {
+                bail!("volume {volume} already exists");
+            }
+            let mut args: Vec<String> = vec!["volume".into(), "create".into()];
+            for (k, v) in labels {
+                args.push("--label".into());
+                args.push(format!("{k}={v}"));
+            }
+            args.push(volume.clone());
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            ops.docker(&args).await?;
+            // `docker volume create` succeeds on an existing name, so the
+            // volume is only this run's if it has exactly these labels and
+            // nothing in it.
+            let v = inspect_volume(ops, volume).await?;
+            if &v.labels() != labels {
+                bail!(
+                    "volume {volume} has labels [{}], not the requested ones; it is not this run's",
+                    label_list(&v.labels())
+                );
+            }
+            let empty = ops
+                .privileged(&PrivilegedOp::VolumeEmpty {
+                    volume: volume.clone(),
+                })
+                .await?;
+            if empty != privileged::VOLUME_EMPTY {
+                bail!("volume {volume} is not empty; it is not this run's");
+            }
+            lock(&cx.state)
+                .created
+                .push((volume.clone(), v.created_at.clone()));
+            Ok(format!(
+                "created {volume} at {} with {}",
+                v.created_at,
+                label_list(labels)
+            ))
+        }
+        Step::CopyIntoVolume { from, to } => {
+            ops.privileged(&PrivilegedOp::CopyIntoVolume {
+                name: name_s,
+                from: from.clone(),
+                to: to.clone(),
+            })
+            .await
         }
         Step::RemoveNetwork { network } => {
             let users = orphans::network_users(network, &ops.inspect_all().await?);
@@ -409,7 +621,35 @@ pub struct ApplyCtx {
     pub had_template: bool,
     /// The live container before anything changed, for recovery commands.
     pub original: RunSpec,
+    /// Anonymous volumes this run converts, named in recovery commands.
+    pub conversions: Vec<Conversion>,
     pub redactor: Redactor,
+    pub state: std::sync::Mutex<ApplyState>,
+}
+
+/// What the apply path learns as it goes.
+#[derive(Debug, Default)]
+pub struct ApplyState {
+    /// Source volume -> its manifest digest when it was copied.
+    pub manifests: BTreeMap<String, String>,
+    /// `(volume, CreatedAt)` of each volume this run created.
+    pub created: Vec<(String, String)>,
+    /// The container's `(StartedAt, FinishedAt)` once stopped: as planned
+    /// when it was already stopped, else as `Stop` left it.
+    pub stopped: Option<(String, String)>,
+}
+
+impl ApplyState {
+    pub fn new(c: &ContainerInspect) -> Self {
+        ApplyState {
+            stopped: (!c.state.running).then(|| run_times(c)),
+            ..Default::default()
+        }
+    }
+}
+
+fn run_times(c: &ContainerInspect) -> (String, String) {
+    (c.state.started_at.clone(), c.state.finished_at.clone())
 }
 
 impl ApplyCtx {
@@ -432,6 +672,12 @@ impl ApplyCtx {
              values are in the saved inspect).",
             spec::docker_run_command(&self.original)
         ));
+        for c in &self.conversions {
+            r.push_str(&format!(
+                " Data for {} is in volume {}; use -v {}:{} in place of the {} mount.",
+                c.target, c.new, c.new, c.target, c.old
+            ));
+        }
         r
     }
 }
@@ -472,6 +718,12 @@ pub async fn apply(ops: &dyn HostOps, cx: &ApplyCtx, steps: &[Step]) -> Result<V
                     Step::CopyVolume { suffix, .. } => copies.push(suffix.clone()),
                     Step::ExposeCopy { suffix } => exposed.push(suffix.clone()),
                     _ => {}
+                }
+                if let Step::CopyVolume { volume: v, .. } | Step::CopyIntoVolume { from: v, .. } =
+                    step
+                    && let Some(d) = privileged::manifest_digest(&detail)
+                {
+                    lock(&cx.state).manifests.insert(v.clone(), d);
                 }
                 done.push(StepOutcome {
                     action: change.action,
@@ -544,6 +796,15 @@ pub async fn apply(ops: &dyn HostOps, cx: &ApplyCtx, steps: &[Step]) -> Result<V
                 .await;
             note(format!("remove copy {suffix}"), r);
         }
+        let created = lock(&cx.state).created.clone();
+        for (v, at) in &created {
+            let r = match inspect_volume(ops, v).await {
+                Ok(now) if &now.created_at == at => ops.docker(&["volume", "rm", v]).await,
+                Ok(_) => Err(anyhow!("it is no longer the volume this run created; kept")),
+                Err(e) => Err(e),
+            };
+            note(format!("remove volume {v}"), r);
+        }
         if stopped && cx.was_running {
             let r = ops.docker(&["start", name]).await;
             note("start container".into(), r);
@@ -573,6 +834,14 @@ pub struct Snapshot {
     pub all: Vec<ContainerInspect>,
     /// `docker volume inspect` of the container's volumes.
     pub volumes: BTreeMap<String, VolumeInspect>,
+    /// Volumes that already exist under a name an anonymous volume would
+    /// convert to.
+    pub conversion_targets: BTreeMap<String, VolumeInspect>,
+    /// The container's anonymous volumes the root path found empty.
+    pub empty_volumes: BTreeSet<String>,
+    /// Anonymous volumes whose emptiness was not probed (a non-admin
+    /// caller), so their `volume-nocopy` is decided at execute.
+    pub empty_unknown: BTreeSet<String>,
     pub existing_template: Option<String>,
     /// `(file, <Name>)` of every template in templates-user.
     pub templates: Vec<(String, Option<String>)>,
@@ -620,6 +889,9 @@ pub struct AdoptPlan {
     pub intended: Vec<String>,
     pub blockers: Vec<String>,
     pub migrations: Vec<Migration>,
+    pub conversions: Vec<Conversion>,
+    /// Ownership labels the recreated container carries.
+    pub labels: BTreeMap<String, String>,
     pub compose: Option<ComposeLeftovers>,
     pub autostart: bool,
     pub was_running: bool,
@@ -737,36 +1009,12 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
         let suffixes = orphans::appdata_suffixes(name, c.compose_project(), &names);
         for (m, suffix) in vols.iter().zip(suffixes) {
             let volume = m.name.clone().unwrap_or_default();
-            match s.volumes.get(&volume) {
-                None => blockers.push(format!("volume {volume}: not inspected")),
-                Some(v) => {
-                    if v.driver != "local" || v.options.as_ref().is_some_and(|o| !o.is_empty()) {
-                        blockers.push(format!(
-                            "volume {volume}: driver {:?} with options is not a plain local volume",
-                            v.driver
-                        ));
-                    }
-                    if v.mountpoint != VolumeInspect::expected_mountpoint(&volume)
-                        || m.source != v.mountpoint
-                    {
-                        blockers.push(format!(
-                            "volume {volume}: data at {:?}, not {}",
-                            v.mountpoint,
-                            VolumeInspect::expected_mountpoint(&volume)
-                        ));
-                    }
-                }
-            }
-            let others: Vec<&str> = s
-                .all
-                .iter()
-                .filter(|o| o.short_name() != name)
-                .filter(|o| {
-                    o.volumes()
-                        .any(|x| x.name.as_deref() == Some(volume.as_str()))
-                })
-                .map(|o| o.short_name())
-                .collect();
+            blockers.extend(inspect::local_volume_problems(
+                &volume,
+                s.volumes.get(&volume),
+                &m.source,
+            ));
+            let others = inspect::mounted_by_others(&volume, name, &s.all);
             if !others.is_empty() {
                 blockers.push(format!(
                     "volume {volume} is also mounted by [{}]",
@@ -801,6 +1049,31 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
         }
     }
 
+    let migrated: Vec<String> = migrations.iter().map(|m| m.volume.clone()).collect();
+    let (conversions, conversion_blockers) = ownership::plan_conversions(
+        c,
+        &s.volumes,
+        &s.conversion_targets,
+        &s.empty_volumes,
+        &s.all,
+        &migrated,
+    );
+    blockers.extend(conversion_blockers);
+    for cv in &conversions {
+        convert_mount(&mut target, cv);
+        intended.push(format!(
+            "anonymous volume {} at {} -> volume {}",
+            cv.old, cv.target, cv.new
+        ));
+    }
+    let labels = ownership::container_labels(name);
+    intended.extend(ownership::label_changes(
+        &format!("container {name}"),
+        &live.labels,
+        &labels,
+    ));
+    target.labels.extend(labels.clone());
+
     let icon = match &o.repo {
         Some(repo) => template::icon_url(&o.icon_base, repo),
         None => s
@@ -810,7 +1083,7 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
             .or_else(|| c.label(ICON_LABEL).map(str::to_string))
             .unwrap_or_default(),
     };
-    let template = Template::from_spec(&target, &icon);
+    let template = Template::from_spec(&target, &icon, &labeled_volumes(&conversions));
     let template_xml = template.render();
 
     let was_running = c.state.running;
@@ -818,7 +1091,7 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
     let autostart = o.autostart.unwrap_or(in_autostart || was_running);
 
     let mut steps = vec![Step::Probe];
-    if !migrations.is_empty() && was_running {
+    if (!migrations.is_empty() || !conversions.is_empty()) && was_running {
         steps.push(Step::Stop);
     }
     for m in &migrations {
@@ -828,6 +1101,7 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
             to: m.to.clone(),
         });
     }
+    conversion_steps(&mut steps, &conversions);
     steps.push(Step::SaveInspect {
         json: s.container_raw.to_string(),
     });
@@ -839,6 +1113,9 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
             st.push(Step::ExposeCopy {
                 suffix: m.suffix.clone(),
             });
+        }
+        if !migrations.is_empty() || !conversions.is_empty() {
+            st.push(Step::EnsureStopped);
         }
         st.push(Step::Rebuild)
     });
@@ -893,10 +1170,52 @@ pub fn plan_adopt(s: &Snapshot, o: &AdoptOpts) -> AdoptPlan {
         intended,
         blockers,
         migrations,
+        conversions,
+        labels,
         compose,
         autostart,
         was_running,
         steps,
+    }
+}
+
+/// Point `spec`'s mount of `cv.old` at `cv.new`.
+fn convert_mount(spec: &mut RunSpec, cv: &Conversion) {
+    let old = spec
+        .mounts
+        .iter()
+        .find(|m| m.kind == MountKind::Volume && m.source == cv.old && m.target == cv.target)
+        .cloned();
+    if let Some(old) = old {
+        spec.mounts.remove(&old);
+        spec.mounts.insert(MountSpec {
+            source: cv.new.clone(),
+            ..old
+        });
+    }
+}
+
+fn labeled_volumes(conversions: &[Conversion]) -> BTreeMap<String, template::LabeledVolume> {
+    conversions
+        .iter()
+        .map(|c| (c.new.clone(), c.mount()))
+        .collect()
+}
+
+/// Create each converted volume (unless re-used) and copy into it; the
+/// container must already be stopped.
+fn conversion_steps(steps: &mut Vec<Step>, conversions: &[Conversion]) {
+    for cv in conversions {
+        if !cv.reuse {
+            steps.push(Step::CreateVolume {
+                volume: cv.new.clone(),
+                labels: cv.labels.clone(),
+            });
+        }
+        steps.push(Step::CopyIntoVolume {
+            from: cv.old.clone(),
+            to: cv.new.clone(),
+        });
     }
 }
 
@@ -1015,12 +1334,16 @@ fn redactor_for(c: &ContainerInspect, extra: &[&RunSpec]) -> Redactor {
 }
 
 /// Blocker when the root path cannot be used: none configured, or a
-/// side-effect-free Ping through it fails.
-async fn root_path_blocker(runner: Option<&dyn PrivilegedRunner>) -> Option<String> {
+/// side-effect-free Ping through it fails. Only an admin caller's call
+/// pings, so nobody else reaches root; theirs is checked at execute.
+async fn root_path_blocker(runner: Option<&dyn PrivilegedRunner>, admin: bool) -> Option<String> {
     let runner = match runner {
         None => return Some(privileged::missing_runner_blocker()),
         Some(r) => r,
     };
+    if !admin {
+        return None;
+    }
     match runner.run(&PrivilegedOp::Ping).await {
         Ok(_) => None,
         Err(e) => Some(format!(
@@ -1029,6 +1352,10 @@ async fn root_path_blocker(runner: Option<&dyn PrivilegedRunner>) -> Option<Stri
         )),
     }
 }
+
+/// Note for a caller whose dry run did not ping the root path.
+pub const ROOT_UNCHECKED_NOTE: &str =
+    "root path not checked: it is reached for an admin caller only, and is checked at execute";
 
 // ── tools ────────────────────────────────────────────────────────────────────
 
@@ -1058,6 +1385,36 @@ pub struct DockerContainerStatus {
     pub autostart: bool,
     /// Docker volumes mounted by the container (stored outside appdata).
     pub volumes_outside_appdata: Vec<String>,
+    /// Ownership labels the container lacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_labels: Vec<String>,
+    /// Label coverage of each docker volume the container mounts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<VolumeLabelStatus>,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeLabelStatus {
+    pub name: String,
+    /// Container path it is mounted at.
+    pub target: String,
+    pub anonymous: bool,
+    /// Ownership labels the volume lacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_labels: Vec<String>,
+}
+
+/// How many resources on the host carry every ownership label.
+#[orca_struct]
+#[derive(Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelCoverage {
+    pub containers: usize,
+    pub containers_labeled: usize,
+    pub volumes: usize,
+    pub volumes_labeled: usize,
 }
 
 #[orca_struct]
@@ -1067,6 +1424,25 @@ pub struct DockerStatusOutput {
     pub containers: Vec<DockerContainerStatus>,
     pub dangling_volumes: usize,
     pub dangling_images: usize,
+    pub label_coverage: LabelCoverage,
+}
+
+pub fn label_coverage(
+    containers: &[DockerContainerStatus],
+    volumes: &BTreeMap<String, VolumeInspect>,
+) -> LabelCoverage {
+    LabelCoverage {
+        containers: containers.len(),
+        containers_labeled: containers
+            .iter()
+            .filter(|c| c.missing_labels.is_empty())
+            .count(),
+        volumes: volumes.len(),
+        volumes_labeled: volumes
+            .values()
+            .filter(|v| ownership::missing(&v.labels(), ownership::VOLUME_KEYS).is_empty())
+            .count(),
+    }
 }
 
 pub fn container_status(
@@ -1074,6 +1450,7 @@ pub fn container_status(
     template_xml: Option<&str>,
     autostart: &[String],
     icon_base: &str,
+    volumes: &BTreeMap<String, VolumeInspect>,
 ) -> DockerContainerStatus {
     let name = c.short_name().to_string();
     let icon = template_xml
@@ -1093,12 +1470,33 @@ pub fn container_status(
             .filter(|m| !Path::new(&m.source).starts_with(host::APPDATA))
             .filter_map(|m| m.name.clone())
             .collect(),
+        missing_labels: ownership::missing(
+            &c.config.labels.clone().unwrap_or_default(),
+            ownership::CONTAINER_KEYS,
+        ),
+        volumes: c
+            .volumes()
+            .filter_map(|m| {
+                let n = m.name.clone()?;
+                let v = volumes.get(&n);
+                Some(VolumeLabelStatus {
+                    anonymous: v.is_some_and(VolumeInspect::is_anonymous),
+                    missing_labels: ownership::missing(
+                        &v.map(VolumeInspect::labels).unwrap_or_default(),
+                        ownership::VOLUME_KEYS,
+                    ),
+                    target: m.destination.clone(),
+                    name: n,
+                })
+            })
+            .collect(),
         name,
     }
 }
 
 /// Per-container Unraid adoption state on this host: template, managed label,
-/// icon, autostart and docker volumes, plus host-wide dangling counts.
+/// icon, autostart, docker volumes and orca ownership-label coverage, plus
+/// host-wide dangling and label-coverage counts.
 #[orca_tool(domain = "unraid", verb = "docker.status")]
 async fn unraid_docker_status(
     args: UnraidDockerStatusArgs,
@@ -1106,16 +1504,18 @@ async fn unraid_docker_status(
 ) -> Result<DockerStatusOutput> {
     let base = icon_base(args.icon_base)?;
     let autostart = host::read_autostart();
+    let volumes = host::inspect_volumes().await?;
     let mut containers: Vec<DockerContainerStatus> = host::inspect_all()
         .await?
         .iter()
         .map(|c| {
             let xml = std::fs::read_to_string(template::template_path(c.short_name())).ok();
-            container_status(c, xml.as_deref(), &autostart, &base)
+            container_status(c, xml.as_deref(), &autostart, &base, &volumes)
         })
         .collect();
     containers.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(DockerStatusOutput {
+        label_coverage: label_coverage(&containers, &volumes),
         containers,
         dangling_volumes: host::dangling_volumes().await?.len(),
         dangling_images: host::dangling_images().await?.len(),
@@ -1131,6 +1531,9 @@ pub struct DockerChange {
     pub name: String,
     /// True when execute would proceed: no fidelity diff and no blockers.
     pub ready: bool,
+    /// What the call applies (on a dry run, what execute would apply),
+    /// including what it cannot.
+    pub summary: String,
     pub template_path: String,
     /// The template to be written; secret values masked.
     pub template_xml: String,
@@ -1145,6 +1548,9 @@ pub struct DockerChange {
     pub intended_changes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<String>,
+    /// Every orca ownership label written, per container and volume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<LabelWrite>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
     /// The ordered steps, when `dryRun`.
@@ -1153,6 +1559,95 @@ pub struct DockerChange {
     /// Per-step results, when applied.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<StepOutcome>,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelWrite {
+    /// `container` or `volume`.
+    pub kind: String,
+    pub name: String,
+    pub labels: BTreeMap<String, String>,
+}
+
+/// The labels the recreated container `name` and each converted volume get.
+pub fn label_writes(
+    name: &str,
+    labels: &BTreeMap<String, String>,
+    conversions: &[Conversion],
+) -> Vec<LabelWrite> {
+    (!labels.is_empty())
+        .then(|| LabelWrite {
+            kind: "container".to_string(),
+            name: name.to_string(),
+            labels: labels.clone(),
+        })
+        .into_iter()
+        .chain(conversions.iter().map(|c| LabelWrite {
+            kind: "volume".to_string(),
+            name: c.new.clone(),
+            labels: c.labels.clone(),
+        }))
+        .collect()
+}
+
+/// The conversions whose `volume-nocopy` waits for execute, as a note.
+pub fn nocopy_note(s: &Snapshot, conversions: &[Conversion]) -> Option<String> {
+    let unknown: Vec<&str> = conversions
+        .iter()
+        .filter(|c| s.empty_unknown.contains(&c.old))
+        .map(|c| c.old.as_str())
+        .collect();
+    (!unknown.is_empty()).then(|| {
+        format!(
+            "whether [{}] are empty (volume-nocopy) is decided at execute: the probe runs as \
+             root, for an admin caller only",
+            unknown.join(", ")
+        )
+    })
+}
+
+/// What the labels and conversions add to a summary: `, write …, convert …`.
+fn ownership_summary(labels: &BTreeMap<String, String>, conversions: &[Conversion]) -> String {
+    let mut out = String::new();
+    if !labels.is_empty() {
+        out.push_str(", write orca's ownership labels");
+    }
+    if !conversions.is_empty() {
+        out.push_str(&format!(
+            ", convert anonymous volumes [{}] to labeled volumes",
+            conversions
+                .iter()
+                .map(|c| c.old.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out
+}
+
+/// set_icon's summary, naming only what it applies and what it cannot.
+pub fn set_icon_summary(
+    name: &str,
+    url: &str,
+    unchanged: bool,
+    labels: &BTreeMap<String, String>,
+    conversions: &[Conversion],
+    not_applied: &[String],
+) -> String {
+    let mut out = if unchanged {
+        format!("{name} already has icon {url} and what the template can carry; nothing to change")
+    } else {
+        format!(
+            "set {name}'s icon to {url}{} and rebuild",
+            ownership_summary(labels, conversions)
+        )
+    };
+    if !not_applied.is_empty() {
+        out.push_str(&format!("; not applied: {}", not_applied.join("; ")));
+    }
+    out
 }
 
 fn execution_plan<A: Serialize>(
@@ -1171,7 +1666,10 @@ fn execution_plan<A: Serialize>(
 }
 
 /// Inspect `name` (S13: refusing an id-prefix match) and its images.
-async fn snapshot(name: &str) -> Result<Snapshot> {
+/// `probe_empty` runs the root emptiness probe of its anonymous volumes;
+/// only an admin caller may reach root, so a dry run by anyone else leaves
+/// them in `empty_unknown`.
+async fn snapshot(name: &str, probe_empty: bool) -> Result<Snapshot> {
     let (container, container_raw) = host::inspect_container_raw(name).await?;
     if container.short_name() != name {
         bail!(
@@ -1192,6 +1690,34 @@ async fn snapshot(name: &str) -> Result<Snapshot> {
             volumes.insert(n.clone(), v);
         }
     }
+    let mut conversion_targets = BTreeMap::new();
+    let mut empty_volumes = BTreeSet::new();
+    let mut empty_unknown = BTreeSet::new();
+    let runner = privileged::runner();
+    for m in container.volumes() {
+        let Some(old) = m
+            .name
+            .as_ref()
+            .filter(|n| volumes.get(*n).is_some_and(VolumeInspect::is_anonymous))
+        else {
+            continue;
+        };
+        let new = ownership::converted_name(name, &m.destination);
+        if let Ok(v) = host::inspect_volume(&new).await {
+            conversion_targets.insert(new, v);
+        }
+        if !probe_empty {
+            empty_unknown.insert(old.clone());
+        } else if let Some(r) = &runner
+            && r.run(&PrivilegedOp::VolumeEmpty {
+                volume: old.clone(),
+            })
+            .await
+            .is_ok_and(|e| e == privileged::VOLUME_EMPTY)
+        {
+            empty_volumes.insert(old.clone());
+        }
+    }
     let compose_file = container
         .label(inspect::COMPOSE_WORKING_DIR)
         .and_then(|d| host::compose_file(Path::new(d)));
@@ -1201,6 +1727,9 @@ async fn snapshot(name: &str) -> Result<Snapshot> {
         tag_image_id,
         all: host::inspect_all().await?,
         volumes,
+        conversion_targets,
+        empty_volumes,
+        empty_unknown,
         existing_template: std::fs::read_to_string(template::template_path(name)).ok(),
         templates: host::list_templates(),
         autostart: host::read_autostart(),
@@ -1272,22 +1801,33 @@ pub struct UnraidDockerSetIconArgs {
     pub execute: bool,
 }
 
-/// Steps for set_icon, given the patched template and what dockerMan renders
-/// from it (`expect`).
-pub fn set_icon_steps(s: &Snapshot, xml: &str, url: &str, expect: RunSpec) -> Vec<Step> {
+/// Steps for set_icon, given the patched template, what dockerMan renders
+/// from it (`expect`) and the anonymous volumes it converts.
+pub fn set_icon_steps(
+    s: &Snapshot,
+    xml: &str,
+    url: &str,
+    expect: RunSpec,
+    conversions: &[Conversion],
+) -> Vec<Step> {
     let c = &s.container;
     let was_running = c.state.running;
     let in_autostart = s.autostart.iter().any(|n| n == c.short_name());
-    let mut steps = vec![
-        Step::Probe,
-        Step::SaveInspect {
-            json: s.container_raw.to_string(),
-        },
-        Step::WriteTemplate {
-            xml: xml.to_string(),
-        },
-    ];
+    let mut steps = vec![Step::Probe];
+    if !conversions.is_empty() && was_running {
+        steps.push(Step::Stop);
+    }
+    conversion_steps(&mut steps, conversions);
+    steps.push(Step::SaveInspect {
+        json: s.container_raw.to_string(),
+    });
+    steps.push(Step::WriteTemplate {
+        xml: xml.to_string(),
+    });
     autostart_steps(&mut steps, in_autostart, was_running, in_autostart, |st| {
+        if !conversions.is_empty() {
+            st.push(Step::EnsureStopped);
+        }
         st.push(Step::Rebuild)
     });
     steps.push(Step::EnsureState {
@@ -1302,6 +1842,11 @@ pub fn set_icon_steps(s: &Snapshot, xml: &str, url: &str, expect: RunSpec) -> Ve
     });
     steps.push(Step::ClearIconCache);
     steps.push(Step::RefreshIcons);
+    if !conversions.is_empty() {
+        steps.push(Step::RemoveOwnAnonymousVolumes {
+            candidates: conversions.iter().map(|c| c.old.clone()).collect(),
+        });
+    }
     steps
 }
 
@@ -1320,9 +1865,11 @@ pub fn set_icon_blockers(s: &Snapshot) -> Vec<String> {
 }
 
 /// Point a dockerMan-managed container's template at an argyle-labs repo
-/// icon, rebuild it (keeping its running/stopped state and autostart) and
-/// refresh both icon caches. Refuses unless the patched template reproduces
-/// the live container.
+/// icon, give it orca's ownership labels and convert its anonymous volumes
+/// to labeled ones, rebuild it (keeping its running/stopped state and
+/// autostart) and refresh both icon caches. Refuses unless the patched
+/// template reproduces the live container; changes nothing when it already
+/// has all of that.
 #[orca_tool(
     domain = "unraid",
     verb = "docker.set_icon",
@@ -1337,28 +1884,44 @@ async fn unraid_docker_set_icon(
     validate_name("container name", &args.name)?;
     validate_name("repo", &args.repo)?;
     let base = icon_base(args.icon_base.clone())?;
+    let admin = authorize_execute(TOOL, ctx.caller().as_ref());
+    let is_admin = admin.is_ok();
     if args.execute {
-        authorize_execute(TOOL, ctx.caller().as_ref())?;
+        admin?;
     }
     let name = args.name.as_str();
     let path = template::template_path(name);
-    let s = snapshot(name).await?;
+    let s = snapshot(name, is_admin).await?;
     let current = s.existing_template.clone().ok_or_else(|| {
         anyhow!("{name} has no Unraid template at {path}; adopt it with unraid.docker.adopt")
     })?;
     let url = template::icon_url(&base, &args.repo);
-    let xml = template::set_icon(&current, &url).map_err(|e| anyhow!("{path}: {e}"))?;
+    let with_icon = template::set_icon(&current, &url).map_err(|e| anyhow!("{path}: {e}"))?;
 
     let (live, mut unsupported) = live_spec(&s.container, &s.image);
     unsupported.extend(inspect::unmodelled(&s.container_raw, &s.image_raw, false));
     let baked = inspect::baked_env(&s.image);
     let mut blockers = set_icon_blockers(&s);
+    let SetIconPatch {
+        xml,
+        target,
+        conversions,
+        labels,
+        intended: patch_intended,
+        blockers: patch_blockers,
+        not_applied,
+    } = set_icon_patch(&s, &live, &with_icon);
+    blockers.extend(patch_blockers.into_iter().map(|b| format!("{path}: {b}")));
+    let unchanged = xml == current
+        && conversions.is_empty()
+        && patch_intended.is_empty()
+        && s.container.label(ICON_LABEL) == Some(url.as_str());
     let runner = privileged::runner();
-    blockers.extend(root_path_blocker(runner.as_deref()).await);
+    blockers.extend(root_path_blocker(runner.as_deref(), is_admin).await);
     let (rendered_command, rendered, deltas) = match host::render_command(&xml).await {
         Ok(cmd) => {
             let (got, d) = fidelity(
-                &live,
+                &target,
                 &unsupported,
                 &baked,
                 &s.daemon_log_opts,
@@ -1373,43 +1936,59 @@ async fn unraid_docker_set_icon(
         }
     };
     let r = redactor_for(&s.container, &rendered.iter().collect::<Vec<_>>());
-    let (fidelity_diff, mut intended_changes) = split_deltas(deltas, &r);
-    intended_changes.insert(
-        0,
-        format!(
-            "icon {} -> {url}",
-            template::extract_icon(&current).unwrap_or_else(|| "(none)".to_string())
-        ),
-    );
+    let (fidelity_diff, intended) = split_deltas(deltas, &r);
+    let old_icon = template::extract_icon(&current);
+    let mut intended_changes: Vec<String> = (old_icon.as_deref() != Some(url.as_str()))
+        .then(|| format!("icon {} -> {url}", old_icon.as_deref().unwrap_or("(none)")))
+        .into_iter()
+        .collect();
+    intended_changes.extend(patch_intended.iter().map(|i| r.text(i)));
+    intended_changes.extend(intended);
     let ready = blockers.is_empty() && fidelity_diff.is_empty() && rendered.is_some();
-    let steps = set_icon_steps(&s, &xml, &url, rendered.clone().unwrap_or(live.clone()));
+    let steps = if unchanged {
+        Vec::new()
+    } else {
+        set_icon_steps(
+            &s,
+            &xml,
+            &url,
+            rendered.clone().unwrap_or(target.clone()),
+            &conversions,
+        )
+    };
 
+    let summary = set_icon_summary(name, &url, unchanged, &labels, &conversions, &not_applied);
     let mut out = DockerChange {
         dry_run: !args.execute,
         tool: TOOL.to_string(),
         name: name.to_string(),
         ready,
+        summary: summary.clone(),
         template_path: path,
         template_xml: r.text(&redact::mask_template_xml(&xml)),
         rendered_command: rendered_command.as_deref().map(|c| mask_command(c, &r)),
         fidelity_diff,
         intended_changes,
         blockers: blockers.iter().map(|b| r.text(b)).collect(),
+        labels: label_writes(name, &labels, &conversions),
         notes: runner
             .iter()
             .map(|x| format!("root path: {}", x.kind()))
+            .chain(
+                not_applied
+                    .iter()
+                    .map(|n| format!("{}: {n}", template::template_path(name))),
+            )
+            .chain(unchanged.then(|| "nothing to apply".to_string()))
+            .chain((!is_admin).then(|| ROOT_UNCHECKED_NOTE.to_string()))
+            .chain(nocopy_note(&s, &conversions))
             .collect(),
         plan: None,
         steps: Vec::new(),
     };
     if !args.execute {
         out.plan = Some(execution_plan(
-            TOOL,
-            &args,
-            name,
-            &s.run_id,
-            format!("set {name}'s icon to {url} and rebuild"),
-            &steps,
+            TOOL, &args, name, &s.run_id, summary, &steps,
         )?);
         return Ok(out);
     }
@@ -1428,10 +2007,86 @@ async fn unraid_docker_set_icon(
         autostart_before: s.autostart.iter().any(|n| n == name),
         had_template: true,
         original: live,
+        conversions,
         redactor: r,
+        state: std::sync::Mutex::new(ApplyState::new(&s.container)),
     };
     out.steps = apply(&host::LiveOps { runner }, &cx, &steps).await?;
     Ok(out)
+}
+
+/// What set_icon writes besides the icon.
+pub struct SetIconPatch {
+    pub xml: String,
+    /// The live spec with the labels and converted mounts applied.
+    pub target: RunSpec,
+    pub conversions: Vec<Conversion>,
+    pub labels: BTreeMap<String, String>,
+    pub intended: Vec<String>,
+    pub blockers: Vec<String>,
+    /// What the template cannot take, and why; the icon is still set.
+    pub not_applied: Vec<String>,
+}
+
+/// Add orca's ownership labels to the template's ExtraParams and turn each
+/// anonymous volume's Path entry into a labeled `--mount`. A template whose
+/// ExtraParams cannot be rewritten keeps the icon-only patch.
+pub fn set_icon_patch(s: &Snapshot, live: &RunSpec, xml: &str) -> SetIconPatch {
+    let name = s.container.short_name();
+    let labels = ownership::container_labels(name);
+    let mut xml = match template::set_labels(xml, &labels) {
+        Ok(x) => x,
+        Err(e) => {
+            return SetIconPatch {
+                xml: xml.to_string(),
+                target: live.clone(),
+                conversions: Vec::new(),
+                labels: BTreeMap::new(),
+                intended: Vec::new(),
+                blockers: Vec::new(),
+                not_applied: vec![format!(
+                    "ownership labels and anonymous-volume conversions not applied: {e}"
+                )],
+            };
+        }
+    };
+    let (planned, blockers) = ownership::plan_conversions(
+        &s.container,
+        &s.volumes,
+        &s.conversion_targets,
+        &s.empty_volumes,
+        &s.all,
+        &[],
+    );
+    let mut target = live.clone();
+    target.labels.extend(labels.clone());
+    let mut intended =
+        ownership::label_changes(&format!("container {name}"), &live.labels, &labels);
+    let mut conversions = Vec::new();
+    let mut not_applied = Vec::new();
+    for cv in planned {
+        match template::path_to_mount(&xml, &cv.old, &cv.mount_arg()) {
+            Ok(x) => {
+                xml = x;
+                convert_mount(&mut target, &cv);
+                intended.push(format!(
+                    "anonymous volume {} at {} -> volume {}",
+                    cv.old, cv.target, cv.new
+                ));
+                conversions.push(cv);
+            }
+            Err(e) => not_applied.push(format!("anonymous volume {} not converted: {e}", cv.old)),
+        }
+    }
+    SetIconPatch {
+        xml,
+        target,
+        conversions,
+        labels,
+        intended,
+        blockers,
+        not_applied,
+    }
 }
 
 #[orca_struct(args)]
@@ -1483,11 +2138,13 @@ async fn unraid_docker_adopt(args: UnraidDockerAdoptArgs, ctx: &ToolCtx) -> Resu
         validate_name("repo", r)?;
     }
     let base = icon_base(args.icon_base.clone())?;
+    let admin = authorize_execute(TOOL, ctx.caller().as_ref());
+    let is_admin = admin.is_ok();
     if args.execute {
-        authorize_execute(TOOL, ctx.caller().as_ref())?;
+        admin?;
     }
     let name = args.name.as_str();
-    let s = snapshot(name).await?;
+    let s = snapshot(name, is_admin).await?;
     let mut plan = plan_adopt(
         &s,
         &AdoptOpts {
@@ -1500,7 +2157,7 @@ async fn unraid_docker_adopt(args: UnraidDockerAdoptArgs, ctx: &ToolCtx) -> Resu
 
     let mut blockers = plan.blockers.clone();
     let runner = privileged::runner();
-    blockers.extend(root_path_blocker(runner.as_deref()).await);
+    blockers.extend(root_path_blocker(runner.as_deref(), is_admin).await);
     for m in &plan.migrations {
         if host::is_nonempty_dir(Path::new(&m.to)) {
             blockers.push(format!("{} already has content", m.to));
@@ -1554,29 +2211,38 @@ async fn unraid_docker_adopt(args: UnraidDockerAdoptArgs, ctx: &ToolCtx) -> Resu
     if let Some(r) = &runner {
         notes.push(format!("root path: {}", r.kind()));
     }
+    if !is_admin {
+        notes.push(ROOT_UNCHECKED_NOTE.to_string());
+    }
+    notes.extend(nocopy_note(&s, &plan.conversions));
     let ready = blockers.is_empty() && fidelity_diff.is_empty() && rendered.is_some();
+    let summary = if ready {
+        format!(
+            "adopt {name} as an Unraid-managed container{}",
+            ownership_summary(&plan.labels, &plan.conversions)
+        )
+    } else {
+        format!("adopt {name}: NOT ready — see fidelityDiff/blockers")
+    };
 
     let mut out = DockerChange {
         dry_run: !args.execute,
         tool: TOOL.to_string(),
         name: name.to_string(),
         ready,
+        summary: summary.clone(),
         template_path: template::template_path(name),
         template_xml: r.text(&redact::mask_template_xml(&plan.template_xml)),
         rendered_command: rendered_command.as_deref().map(|c| mask_command(c, &r)),
         fidelity_diff,
         intended_changes,
         blockers: blockers.iter().map(|b| r.text(b)).collect(),
+        labels: label_writes(name, &plan.labels, &plan.conversions),
         notes,
         plan: None,
         steps: Vec::new(),
     };
     if !args.execute {
-        let summary = if ready {
-            format!("adopt {name} as an Unraid-managed container")
-        } else {
-            format!("adopt {name}: NOT ready — see fidelityDiff/blockers")
-        };
         out.plan = Some(execution_plan(
             TOOL,
             &args,
@@ -1602,7 +2268,9 @@ async fn unraid_docker_adopt(args: UnraidDockerAdoptArgs, ctx: &ToolCtx) -> Resu
         autostart_before: s.autostart.iter().any(|n| n == name),
         had_template: s.existing_template.is_some(),
         original: plan.live.clone(),
+        conversions: plan.conversions.clone(),
         redactor: r,
+        state: std::sync::Mutex::new(ApplyState::new(&s.container)),
     };
     out.steps = apply(&host::LiveOps { runner }, &cx, &plan.steps).await?;
     Ok(out)
