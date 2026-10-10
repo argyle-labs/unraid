@@ -23,9 +23,13 @@ pub(crate) struct VmDef {
     pub autostart: bool,
 }
 
-fn xml_stems(dir: &Path) -> Vec<String> {
-    let Ok(rd) = fs::read_dir(dir) else {
-        return Vec::new();
+/// `*.xml` stems in `dir`. A missing directory is empty; any other read
+/// failure is an error, so an unreadable tree never reads as "no VMs".
+fn xml_stems(dir: &Path) -> Result<Vec<String>, String> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", dir.display())),
     };
     let mut v: Vec<String> = rd
         .flatten()
@@ -35,26 +39,37 @@ fn xml_stems(dir: &Path) -> Vec<String> {
         })
         .collect();
     v.sort();
-    v
+    Ok(v)
 }
 
-pub(crate) fn inventory(qemu_dir: &str) -> Vec<VmDef> {
+pub(crate) fn inventory(qemu_dir: &str) -> Result<Vec<VmDef>, String> {
     let dir = Path::new(qemu_dir);
-    let auto = xml_stems(&dir.join("autostart"));
-    xml_stems(dir)
+    let auto = xml_stems(&dir.join("autostart"))?;
+    Ok(xml_stems(dir)?
         .into_iter()
         .map(|name| VmDef {
             autostart: auto.contains(&name),
             name,
         })
-        .collect()
+        .collect())
 }
 
 pub(crate) fn check(proc_root: &str, run_dir: &str, qemu_dir: &str) -> Vec<Finding> {
     if crate::libvirt_stack::probe(proc_root, run_dir) == LibvirtStack::ImageNotMounted {
         return Vec::new();
     }
-    let vms = inventory(qemu_dir);
+    let vms = match inventory(qemu_dir) {
+        Ok(v) => v,
+        Err(e) => {
+            return vec![finding(
+                "vm-inventory",
+                Severity::Warn,
+                "VM definitions unreadable",
+                format!("{e}. VM definitions could not be listed, so they are unverified."),
+                None,
+            )];
+        }
+    };
     if vms.is_empty() {
         return Vec::new();
     }
@@ -114,7 +129,7 @@ mod tests {
     #[test]
     fn lists_domains_with_autostart_flags() {
         let r = fake(MOUNTED);
-        let inv = inventory(&format!("{}/qemu", r.str()));
+        let inv = inventory(&format!("{}/qemu", r.str())).unwrap();
         assert_eq!(
             inv,
             [
@@ -137,5 +152,21 @@ mod tests {
     #[test]
     fn unmounted_libvirt_image_is_not_read() {
         assert!(run(&fake("")).is_empty());
+    }
+
+    #[test]
+    fn unreadable_dir_is_an_error_not_empty() {
+        let r = fake(MOUNTED);
+        // A file where the directory should be: read_dir fails, not NotFound.
+        r.write("notadir", "x");
+        assert!(inventory(&format!("{}/notadir", r.str())).is_err());
+        assert_eq!(inventory("/nonexistent/qemu").unwrap(), []);
+        let f = check(
+            r.str(),
+            &format!("{}/run", r.str()),
+            &format!("{}/notadir", r.str()),
+        );
+        assert_eq!(f[0].severity, Severity::Warn);
+        assert!(f[0].detail.contains("unverified"));
     }
 }
