@@ -100,6 +100,10 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         "/var/run/libvirt",
         "/etc/libvirt/qemu",
     ))
+    .chain(crate::dstate::check(
+        "/proc",
+        crate::dstate::SAMPLE_INTERVAL,
+    ))
     .chain(check_vm_manager().await)
     .collect()
 }
