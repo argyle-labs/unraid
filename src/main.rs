@@ -27,7 +27,7 @@ use plugin_toolkit::plugin::Plugin;
 // `as _` keeps them anonymous; `#[allow(unused_imports)]` because the reference
 // is purely for its link-time side effect.
 #[allow(unused_imports)]
-use unraid::{docker_adopt as _, surface as _, tools as _};
+use unraid::{docker_adopt as _, surface as _, tools as _, vm_power as _};
 
 fn main() -> plugin_toolkit::anyhow::Result<()> {
     use unraid::docker_adopt::privileged;

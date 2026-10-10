@@ -25,6 +25,7 @@ pub mod surface {
     include!(concat!(env!("OUT_DIR"), "/unraid_surface.rs"));
 }
 
+pub mod authz;
 pub mod backup;
 pub mod checks;
 pub mod cifs_mounts;
@@ -42,6 +43,7 @@ pub mod permissions;
 pub mod procfs;
 pub mod registration;
 pub mod schema_pull;
+pub mod smb_shares;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;
@@ -50,6 +52,7 @@ pub mod ups;
 pub mod version;
 pub mod vm_inventory;
 pub mod vm_manager;
+pub mod vm_power;
 pub mod zfs_health;
 
 /// Diagnostics-provider registry name (the `Finding.provider` / `RepairArgs.provider`
@@ -433,6 +436,22 @@ impl Client {
         Q: GraphQLQuery,
     {
         self.run::<Q>(variables).await
+    }
+
+    /// Send a hand-written GraphQL document and return its `data`. Used for
+    /// mutations kept out of `queries/`, where every operation auto-surfaces
+    /// as an ungated tool, so the execute-gated verb is the only entry point.
+    pub async fn mutate_raw(
+        &self,
+        document: &str,
+        variables: plugin_toolkit::serde_json::Value,
+    ) -> Result<plugin_toolkit::serde_json::Value, UnraidError> {
+        let mut req = plugin_toolkit::graphql::QueryRequest::new(&self.endpoint, document)
+            .variables(variables)
+            .headers(&self.headers);
+        req.insecure = self.insecure;
+        let resp = self.gql.query(req).await?;
+        Ok(resp.data)
     }
 
     async fn run<Q>(&self, variables: Q::Variables) -> Result<Q::ResponseData, UnraidError>
