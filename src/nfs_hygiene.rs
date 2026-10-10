@@ -20,6 +20,8 @@ pub(crate) struct Export {
     pub fsid: Option<String>,
     /// Union of the default group and every per-client option group.
     pub options: Vec<String>,
+    /// Clients whose effective options include `all_squash`.
+    pub squashed_clients: Vec<String>,
 }
 
 /// One `/etc/exports` line: path (quoted or bare), an optional `-defaults`
@@ -34,12 +36,24 @@ pub(crate) fn parse_line(line: &str) -> Option<Export> {
         None => line.split_once(char::is_whitespace).unwrap_or((line, "")),
     };
     let mut options: Vec<String> = Vec::new();
+    let mut squashed_clients = Vec::new();
+    let mut default_squash = false;
     for tok in rest.split_whitespace() {
+        let has_squash = |g: &str| g.split(',').any(|o| o == "all_squash");
         let group = match tok.strip_prefix('-') {
-            Some(d) => d,
-            None => tok
-                .split_once('(')
-                .map_or("", |(_, o)| o.trim_end_matches(')')),
+            Some(d) => {
+                default_squash |= has_squash(d);
+                d
+            }
+            None => {
+                let (client, g) = tok
+                    .split_once('(')
+                    .map_or((tok, ""), |(c, o)| (c, o.trim_end_matches(')')));
+                if default_squash || has_squash(g) {
+                    squashed_clients.push(client.to_string());
+                }
+                g
+            }
         };
         for o in group.split(',').filter(|o| !o.is_empty()) {
             if !options.iter().any(|x| x == o) {
@@ -55,6 +69,7 @@ pub(crate) fn parse_line(line: &str) -> Option<Export> {
         path: path.to_string(),
         fsid,
         options,
+        squashed_clients,
     })
 }
 
@@ -68,10 +83,10 @@ pub(crate) fn check(exports_path: &str) -> Vec<Finding> {
     }
     let mut out = Vec::new();
 
-    let squashed: Vec<&str> = entries
+    let squashed: Vec<String> = entries
         .iter()
-        .filter(|e| e.options.iter().any(|o| o == "all_squash"))
-        .map(|e| e.path.as_str())
+        .filter(|e| !e.squashed_clients.is_empty())
+        .map(|e| format!("{} for {}", e.path, e.squashed_clients.join(", ")))
         .collect();
     out.push(if squashed.is_empty() {
         finding(
@@ -90,20 +105,32 @@ pub(crate) fn check(exports_path: &str) -> Vec<Finding> {
                 "all_squash on: {}. Every client uid is mapped to anonuid, so clients that need \
                  to own files (e.g. a PBS datastore) fail with EPERM. Use root_squash or \
                  no_root_squash for those exports.",
-                squashed.join(", ")
+                squashed.join("; ")
             ),
             None,
         )
     });
 
     let mut by_fsid: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    let mut no_fsid = Vec::new();
+    // shfs (FUSE) has no stable device number, so a user-share export needs an
+    // explicit fsid; disk and pool exports get one derived from their device.
+    let (mut no_fsid_fuse, mut no_fsid_dev) = (Vec::new(), Vec::new());
     for e in &entries {
         match e.fsid.as_deref() {
             Some(f) => by_fsid.entry(f).or_default().push(&e.path),
-            None => no_fsid.push(e.path.as_str()),
+            None if e.path.starts_with("/mnt/user/") => no_fsid_fuse.push(e.path.as_str()),
+            None => no_fsid_dev.push(e.path.as_str()),
         }
     }
+    let dev_note = if no_fsid_dev.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " No explicit fsid on {} (disk/pool exports): the kernel derives one from the \
+             device, which changes if the device is renumbered.",
+            no_fsid_dev.join(", ")
+        )
+    };
     let dups: Vec<String> = by_fsid
         .iter()
         .filter(|(_, p)| p.len() > 1)
@@ -124,14 +151,14 @@ pub(crate) fn check(exports_path: &str) -> Vec<Finding> {
                 dups.join("; ")
             ),
         )
-    } else if !no_fsid.is_empty() {
+    } else if !no_fsid_fuse.is_empty() {
         (
             Severity::Warn,
-            "NFS exports without an explicit fsid",
+            "User-share NFS exports without an explicit fsid",
             format!(
-                "no fsid on: {}. FUSE-backed exports (/mnt/user) need an explicit fsid to be \
-                 exportable and stable.",
-                no_fsid.join(", ")
+                "no fsid on: {}. These are shfs (FUSE) exports, which have no stable device \
+                 number, so without an explicit fsid client file handles go stale.{dev_note}",
+                no_fsid_fuse.join(", ")
             ),
         )
     } else {
@@ -140,7 +167,7 @@ pub(crate) fn check(exports_path: &str) -> Vec<Finding> {
             "NFS fsids are unique on this host",
             format!(
                 "fsids: {table}. Uniqueness across servers is not checked here; compare with \
-                 other hosts before one client mounts exports from both."
+                 other hosts before one client mounts exports from both.{dev_note}"
             ),
         )
     };
@@ -190,11 +217,20 @@ mod tests {
     }
 
     #[test]
-    fn all_squash_is_warn_naming_the_export() {
-        let f = run("\"/mnt/user/pbs\" -fsid=109 10.0.0.5(sec=sys,rw,all_squash,anonuid=99)\n");
+    fn all_squash_is_reported_per_client() {
+        let f = run(
+            "\"/mnt/user/pbs\" -fsid=109 10.0.0.5(sec=sys,rw,all_squash) 10.0.0.6(rw,root_squash)\n",
+        );
         let s = by_id(&f, "nfs-all-squash");
         assert_eq!(s.severity, Severity::Warn);
-        assert!(s.detail.contains("/mnt/user/pbs"));
+        assert!(s.detail.contains("/mnt/user/pbs for 10.0.0.5."));
+        assert!(!s.detail.contains("10.0.0.6"));
+    }
+
+    #[test]
+    fn default_group_all_squash_applies_to_every_client() {
+        let e = parse_line("\"/mnt/user/a\" -fsid=1,all_squash h1(rw) h2(ro)").unwrap();
+        assert_eq!(e.squashed_clients, ["h1", "h2"]);
     }
 
     #[test]
@@ -206,9 +242,17 @@ mod tests {
     }
 
     #[test]
-    fn missing_fsid_is_warn() {
-        let f = run("\"/mnt/user/a\" -async *(rw)\n");
-        assert_eq!(by_id(&f, "nfs-fsid").severity, Severity::Warn);
+    fn missing_fsid_on_user_share_warns_on_disk_only_notes() {
+        let f = run("\"/mnt/user/a\" -async *(rw)\n/mnt/disk2 *(rw)\n");
+        let w = by_id(&f, "nfs-fsid");
+        assert_eq!(w.severity, Severity::Warn);
+        assert!(w.detail.contains("shfs (FUSE)"));
+        assert!(w.detail.contains("/mnt/disk2 (disk/pool exports)"));
+
+        let f = run("/mnt/disk2 *(rw)\n");
+        let o = by_id(&f, "nfs-fsid");
+        assert_eq!(o.severity, Severity::Ok);
+        assert!(o.detail.contains("derives one from the device"));
     }
 
     #[test]
