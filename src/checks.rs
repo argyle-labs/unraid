@@ -93,6 +93,7 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
     .flatten()
     .chain(crate::zfs_health::check("/proc/spl/kstat/zfs"))
     .chain(crate::cifs_mounts::check("/proc/mounts"))
+    .chain(crate::libvirt_stack::check("/proc", "/var/run/libvirt"))
     .chain(check_vm_manager().await)
     .collect()
 }

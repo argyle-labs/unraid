@@ -32,6 +32,7 @@ pub mod docker_adopt;
 pub mod endpoint;
 pub mod exports;
 pub mod labels;
+pub mod libvirt_stack;
 pub mod permissions;
 pub mod procfs;
 pub mod registration;
