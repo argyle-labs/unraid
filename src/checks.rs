@@ -102,6 +102,9 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
     ))
     .chain(crate::dstate::check("/proc", crate::dstate::SAMPLE_INTERVAL).await)
     .chain(crate::parity::check("/proc"))
+    .chain(std::iter::once(crate::host_settings::check(
+        crate::host_settings::IDENT_CFG,
+    )))
     .chain(check_vm_manager().await)
     .collect()
 }
@@ -1056,7 +1059,7 @@ fn read_key_value_cfg(path: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(parse_key_value(&text))
 }
 
-fn parse_key_value(text: &str) -> BTreeMap<String, String> {
+pub(crate) fn parse_key_value(text: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for line in text.lines() {
         let line = line.trim();
