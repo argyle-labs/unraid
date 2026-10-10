@@ -42,6 +42,7 @@ pub mod permissions;
 pub mod procfs;
 pub mod registration;
 pub mod schema_pull;
+pub mod smb_shares;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;

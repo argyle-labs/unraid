@@ -105,6 +105,10 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
     .chain(std::iter::once(crate::host_settings::check(
         crate::host_settings::IDENT_CFG,
     )))
+    .chain(crate::smb_shares::check(
+        crate::smb_shares::SHARES_CONF,
+        crate::smb_shares::EXTRA_CONF,
+    ))
     .chain(check_vm_manager().await)
     .collect()
 }
