@@ -34,6 +34,7 @@ pub mod endpoint;
 pub mod exports;
 pub mod labels;
 pub mod libvirt_stack;
+pub mod nfs_hygiene;
 pub mod permissions;
 pub mod procfs;
 pub mod registration;
