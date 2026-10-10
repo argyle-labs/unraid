@@ -159,13 +159,16 @@ fn join(v: &[&ProcInfo]) -> String {
     v.iter().map(|p| describe(p)).collect::<Vec<_>>().join("; ")
 }
 
-/// Sample `proc_root` twice, `interval` apart, and report what persisted.
-pub(crate) fn check(proc_root: &str, interval: Duration) -> Vec<Finding> {
+/// Sample `proc_root` twice, `interval` apart, and report what persisted. The
+/// second sample is skipped when the first shows no D/Z process. The wait is
+/// async: plugin calls share one socket thread, so a blocking sleep would
+/// stall every other call.
+pub(crate) async fn check(proc_root: &str, interval: Duration) -> Vec<Finding> {
     let first = scan(proc_root);
     if first.is_empty() {
         return findings(&[]);
     }
-    std::thread::sleep(interval);
+    plugin_toolkit::time::sleep(interval).await;
     findings(&persisted(&first, scan(proc_root)))
 }
 
@@ -311,7 +314,7 @@ mod tests {
         );
         r.proc(102, "du", 'D', 0, &[("wchan", "io_schedule")]);
         r.proc(103, "bash", 'S', 0, &[("wchan", "fuse_lock_inode")]);
-        let f = check(r.str(), Duration::ZERO);
+        let f = plugin_toolkit::reactor::block_on(check(r.str(), Duration::ZERO));
         assert_eq!(f.len(), 1);
         assert_eq!(
             f[0].severity,
@@ -340,7 +343,7 @@ mod tests {
     fn unclassifiable_dstate_says_so() {
         let r = fake();
         r.proc(301, "find", 'D', 0, &[("wchan", "0")]);
-        let f = check(r.str(), Duration::ZERO);
+        let f = plugin_toolkit::reactor::block_on(check(r.str(), Duration::ZERO));
         assert_eq!(f[0].severity, Severity::Info);
         assert!(f[0].detail.contains("unreadable"));
     }
@@ -356,7 +359,7 @@ mod tests {
             &[("cgroup", &format!("0::/docker/{CID}\n"))],
         );
         r.proc(402, "sh", 'Z', 0, &[("cgroup", "0::/user.slice\n")]);
-        let f = check(r.str(), Duration::ZERO);
+        let f = plugin_toolkit::reactor::block_on(check(r.str(), Duration::ZERO));
         assert_eq!(f[0].severity, Severity::Ok);
         let z = f.iter().find(|f| f.id == "container-zombies").unwrap();
         assert_eq!(z.severity, Severity::Info);
@@ -366,8 +369,18 @@ mod tests {
 
     #[test]
     fn missing_proc_root_is_clean() {
-        let f = check("/nonexistent/proc", Duration::ZERO);
+        let f = plugin_toolkit::reactor::block_on(check("/nonexistent/proc", Duration::ZERO));
         assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::Ok);
+    }
+
+    #[test]
+    fn quiet_host_skips_the_second_sample() {
+        let r = fake();
+        r.proc(1, "init", 'S', 0, &[]);
+        let t = std::time::Instant::now();
+        let f = plugin_toolkit::reactor::block_on(check(r.str(), Duration::from_secs(60)));
+        assert!(t.elapsed() < Duration::from_secs(5), "must not wait");
         assert_eq!(f[0].severity, Severity::Ok);
     }
 }
