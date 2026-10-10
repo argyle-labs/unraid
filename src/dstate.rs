@@ -5,6 +5,10 @@
 //! FUSE wait path in both samples is reported, so a slow uncached read does
 //! not trip it. Process age is shown as a hint only: `/proc` records when a
 //! process started, not when it entered `D`. No subprocesses.
+//!
+//! The same two samples give `shfs` CPU use, and the remediation text says
+//! whether a BMC/IPMI device exists, since a reboot that hangs on a host
+//! without one needs physical access.
 
 use std::fs;
 use std::path::Path;
@@ -18,6 +22,12 @@ use crate::checks::finding;
 const CLK_TCK: u64 = 100;
 
 pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// `shfs` CPU share (100 = one core) at or above which it is reported.
+const SHFS_CPU_WARN_PCT: f64 = 90.0;
+
+/// Device nodes and sysfs class the IPMI driver creates when a BMC exists.
+const IPMI_PATHS: &[&str] = &["dev/ipmi0", "dev/ipmi/0", "dev/ipmidev/0", "sys/class/ipmi"];
 
 /// Kernel symbols a task blocks in while waiting on a FUSE request or inode.
 const FUSE_WAIT_SYMBOLS: &[&str] = &["fuse_", "request_wait_answer"];
@@ -159,20 +169,75 @@ fn join(v: &[&ProcInfo]) -> String {
     v.iter().map(|p| describe(p)).collect::<Vec<_>>().join("; ")
 }
 
-/// Sample `proc_root` twice, `interval` apart, and report what persisted. The
-/// second sample is skipped when the first shows no D/Z process. The wait is
-/// async: plugin calls share one socket thread, so a blocking sleep would
-/// stall every other call.
-pub(crate) async fn check(proc_root: &str, interval: Duration) -> Vec<Finding> {
-    let first = scan(proc_root);
-    if first.is_empty() {
-        return findings(&[]);
-    }
-    plugin_toolkit::time::sleep(interval).await;
-    findings(&persisted(&first, scan(proc_root)))
+/// Summed utime+stime ticks of every `shfs` process.
+pub(crate) fn shfs_ticks(proc_root: &str) -> u64 {
+    let Ok(rd) = fs::read_dir(proc_root) else {
+        return 0;
+    };
+    rd.flatten()
+        .filter_map(|e| fs::read_to_string(e.path().join("stat")).ok())
+        .filter_map(|t| {
+            let (comm, _, _) = parse_stat(&t)?;
+            if comm != "shfs" {
+                return None;
+            }
+            let rest: Vec<&str> = t.get(t.rfind(')')? + 1..)?.split_whitespace().collect();
+            // rest[0] is field 3; utime/stime are fields 14 and 15.
+            Some(rest.get(11)?.parse::<u64>().ok()? + rest.get(12)?.parse::<u64>().ok()?)
+        })
+        .sum()
 }
 
-pub(crate) fn findings(procs: &[ProcInfo]) -> Vec<Finding> {
+/// First IPMI path present under `root` (normally `/`).
+pub(crate) fn find_bmc(root: &str) -> Option<String> {
+    IPMI_PATHS
+        .iter()
+        .find(|p| Path::new(root).join(p).exists())
+        .map(|p| format!("/{p}"))
+}
+
+/// Sample `proc_root` twice, `interval` apart, and report what persisted. The
+/// second sample is skipped when the first shows no D/Z process and no shfs.
+/// shfs has nonzero CPU time on any host with the array started, so there
+/// diagnose always waits `interval` (2s) for the CPU measurement. The wait is
+/// async: plugin calls share one socket thread, so a blocking
+/// sleep would stall every other call.
+pub(crate) async fn check(proc_root: &str, sys_root: &str, interval: Duration) -> Vec<Finding> {
+    let (first, t1) = (scan(proc_root), shfs_ticks(proc_root));
+    if first.is_empty() && t1 == 0 {
+        return findings(&[], find_bmc(sys_root).as_deref());
+    }
+    plugin_toolkit::time::sleep(interval).await;
+    let (second, t2) = (scan(proc_root), shfs_ticks(proc_root));
+    let mut out = findings(&persisted(&first, second), find_bmc(sys_root).as_deref());
+    out.extend(shfs_cpu(t2.saturating_sub(t1), interval));
+    out
+}
+
+/// `shfs` CPU finding from the tick delta over `interval`; nothing when the
+/// interval is zero or use is below [`SHFS_CPU_WARN_PCT`].
+pub(crate) fn shfs_cpu(delta_ticks: u64, interval: Duration) -> Option<Finding> {
+    let secs = interval.as_secs_f64();
+    if secs <= 0.0 {
+        return None;
+    }
+    let pct = delta_ticks as f64 / CLK_TCK as f64 / secs * 100.0;
+    (pct >= SHFS_CPU_WARN_PCT).then(|| {
+        finding(
+            "shfs-cpu",
+            Severity::Warn,
+            "shfs is saturating CPU",
+            format!(
+                "shfs used {pct:.0}% CPU (100% = one core) over {secs:.0}s. shfs serves every \
+                 /mnt/user access, so share I/O is throttled behind it; together with \
+                 fuse-dstate this points at a wedged shfs."
+            ),
+            None,
+        )
+    })
+}
+
+pub(crate) fn findings(procs: &[ProcInfo], bmc: Option<&str>) -> Vec<Finding> {
     let d = |w: FuseWait| -> Vec<&ProcInfo> {
         procs
             .iter()
@@ -209,11 +274,30 @@ pub(crate) fn findings(procs: &[ProcInfo]) -> Vec<Finding> {
             "{} process(es) stayed in D state on a FUSE wait path across two samples: {}. \
              This is the signature of a wedged shfs request or inode lock. SIGKILL cannot clear \
              D state; if they persist, the remedy is restarting shfs (array stop/start or \
-             reboot), and they will block a clean unmount, so confirm console access first. \
-             Start age is a hint only, not time spent in D.",
+             reboot), and they will block a clean unmount. Start age is a hint only, not time \
+             spent in D.",
             fuse.len(),
             join(&fuse)
         );
+        let mut ctrs: Vec<&str> = fuse.iter().filter_map(|p| p.container.as_deref()).collect();
+        ctrs.sort_unstable();
+        ctrs.dedup();
+        if !ctrs.is_empty() {
+            detail.push_str(&format!(
+                " Docker cannot stop, kill or restart container(s) {} while these persist: the \
+                 signal is queued but never delivered, so PID and StartedAt stay unchanged.",
+                ctrs.join(", ")
+            ));
+        }
+        detail.push_str(&match bmc {
+            Some(dev) => format!(
+                " A BMC/IPMI device is present ({dev}); use it for console access if the \
+                 shutdown hangs."
+            ),
+            None => " No BMC/IPMI device was found, so a hung shutdown will need physical \
+                     access to the machine; arrange that before attempting it."
+                .to_string(),
+        });
         if !unknown.is_empty() {
             detail.push_str(&format!(
                 " {} more D-state process(es) have an unclassifiable wait channel: {}.",
@@ -314,7 +398,7 @@ mod tests {
         );
         r.proc(102, "du", 'D', 0, &[("wchan", "io_schedule")]);
         r.proc(103, "bash", 'S', 0, &[("wchan", "fuse_lock_inode")]);
-        let f = plugin_toolkit::reactor::block_on(check(r.str(), Duration::ZERO));
+        let f = plugin_toolkit::reactor::block_on(check(r.str(), "/nonexistent", Duration::ZERO));
         assert_eq!(f.len(), 1);
         assert_eq!(
             f[0].severity,
@@ -335,7 +419,7 @@ mod tests {
         r.proc(201, "find", 'D', 0, &[("wchan", "fuse_readdir_uncached")]);
         let first = scan(r.str());
         r.proc(201, "find", 'S', 0, &[]);
-        let f = findings(&persisted(&first, scan(r.str())));
+        let f = findings(&persisted(&first, scan(r.str())), None);
         assert_eq!(f[0].severity, Severity::Ok);
     }
 
@@ -343,7 +427,7 @@ mod tests {
     fn unclassifiable_dstate_says_so() {
         let r = fake();
         r.proc(301, "find", 'D', 0, &[("wchan", "0")]);
-        let f = plugin_toolkit::reactor::block_on(check(r.str(), Duration::ZERO));
+        let f = plugin_toolkit::reactor::block_on(check(r.str(), "/nonexistent", Duration::ZERO));
         assert_eq!(f[0].severity, Severity::Info);
         assert!(f[0].detail.contains("unreadable"));
     }
@@ -359,7 +443,7 @@ mod tests {
             &[("cgroup", &format!("0::/docker/{CID}\n"))],
         );
         r.proc(402, "sh", 'Z', 0, &[("cgroup", "0::/user.slice\n")]);
-        let f = plugin_toolkit::reactor::block_on(check(r.str(), Duration::ZERO));
+        let f = plugin_toolkit::reactor::block_on(check(r.str(), "/nonexistent", Duration::ZERO));
         assert_eq!(f[0].severity, Severity::Ok);
         let z = f.iter().find(|f| f.id == "container-zombies").unwrap();
         assert_eq!(z.severity, Severity::Info);
@@ -368,8 +452,69 @@ mod tests {
     }
 
     #[test]
+    fn fuse_finding_names_stuck_containers_and_bmc_state() {
+        let r = fake();
+        let cg = format!("0::/docker/{CID}\n");
+        r.proc(
+            501,
+            "syncthing",
+            'D',
+            0,
+            &[("wchan", "fuse_lock_inode"), ("cgroup", &cg)],
+        );
+        let none =
+            &plugin_toolkit::reactor::block_on(check(r.str(), "/nonexistent", Duration::ZERO))[0];
+        assert!(
+            none.detail
+                .contains(&format!("container(s) {}", &CID[..12]))
+        );
+        assert!(none.detail.contains("physical access"));
+
+        let sys = FakeRoot::new("sys");
+        sys.mkdir("sys/class/ipmi");
+        assert_eq!(find_bmc(sys.str()).as_deref(), Some("/sys/class/ipmi"));
+        let bmc = &plugin_toolkit::reactor::block_on(check(r.str(), sys.str(), Duration::ZERO))[0];
+        assert!(
+            bmc.detail
+                .contains("BMC/IPMI device is present (/sys/class/ipmi)")
+        );
+    }
+
+    #[test]
+    fn shfs_ticks_sum_only_shfs_utime_and_stime() {
+        let r = fake();
+        let filler = |u: u64, st: u64| {
+            // fields 4..13 zero, 14 utime, 15 stime, 16..21 zero, 22 starttime
+            format!(
+                "{} {u} {st} {} 0 0 0\n",
+                ["0"; 10].join(" "),
+                ["0"; 6].join(" ")
+            )
+        };
+        r.write("10/stat", &format!("10 (shfs) S {}", filler(300, 200)));
+        r.write("11/stat", &format!("11 (shfs) S {}", filler(50, 0)));
+        r.write("12/stat", &format!("12 (smbd) S {}", filler(9999, 9999)));
+        assert_eq!(shfs_ticks(r.str()), 550);
+    }
+
+    #[test]
+    fn shfs_cpu_warns_at_threshold_only() {
+        let two = Duration::from_secs(2);
+        // 328 ticks over 2s at 100 Hz = 164%.
+        let f = shfs_cpu(328, two).unwrap();
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.detail.contains("164%"));
+        assert!(shfs_cpu(100, two).is_none(), "50% is below threshold");
+        assert!(shfs_cpu(1000, Duration::ZERO).is_none());
+    }
+
+    #[test]
     fn missing_proc_root_is_clean() {
-        let f = plugin_toolkit::reactor::block_on(check("/nonexistent/proc", Duration::ZERO));
+        let f = plugin_toolkit::reactor::block_on(check(
+            "/nonexistent/proc",
+            "/nonexistent",
+            Duration::ZERO,
+        ));
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, Severity::Ok);
     }
@@ -379,7 +524,11 @@ mod tests {
         let r = fake();
         r.proc(1, "init", 'S', 0, &[]);
         let t = std::time::Instant::now();
-        let f = plugin_toolkit::reactor::block_on(check(r.str(), Duration::from_secs(60)));
+        let f = plugin_toolkit::reactor::block_on(check(
+            r.str(),
+            "/nonexistent",
+            Duration::from_secs(60),
+        ));
         assert!(t.elapsed() < Duration::from_secs(5), "must not wait");
         assert_eq!(f[0].severity, Severity::Ok);
     }
