@@ -27,18 +27,23 @@ pub mod surface {
 
 pub mod backup;
 pub mod checks;
+pub mod cifs_mounts;
 pub mod docker_adopt;
 pub mod endpoint;
 pub mod exports;
 pub mod labels;
 pub mod permissions;
+pub mod procfs;
 pub mod registration;
 pub mod schema_pull;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod tools;
 pub mod topology;
 pub mod ups;
 pub mod version;
 pub mod vm_manager;
+pub mod zfs_health;
 
 /// Diagnostics-provider registry name (the `Finding.provider` / `RepairArgs.provider`
 /// key and the `diagnostics` [`crate::registration`] backend name).

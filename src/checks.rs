@@ -91,6 +91,8 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
     ]
     .into_iter()
     .flatten()
+    .chain(crate::zfs_health::check("/proc/spl/kstat/zfs"))
+    .chain(crate::cifs_mounts::check("/proc/mounts"))
     .chain(check_vm_manager().await)
     .collect()
 }
@@ -187,7 +189,7 @@ pub fn diagnose(args_json: &str) -> Result<String, String> {
     serde_json::to_string(&findings).map_err(|e| format!("encode findings: {e}"))
 }
 
-fn finding(
+pub(crate) fn finding(
     id: &str,
     severity: Severity,
     title: &str,

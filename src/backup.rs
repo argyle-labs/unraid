@@ -41,17 +41,10 @@ struct Resolved {
 
 /// Look up the source device and fstype backing `mountpoint` in [`MOUNTS`].
 fn mount_source(mountpoint: &str) -> Option<(String, String)> {
-    let txt = fs::read_to_string(MOUNTS).ok()?;
-    for line in txt.lines() {
-        let mut f = line.split_whitespace();
-        let dev = f.next()?;
-        let mp = f.next()?;
-        let fstype = f.next()?;
-        if mp == mountpoint {
-            return Some((dev.to_string(), fstype.to_string()));
-        }
-    }
-    None
+    crate::procfs::read_mounts(MOUNTS)
+        .into_iter()
+        .find(|m| m.target == mountpoint)
+        .map(|m| (m.source, m.fstype))
 }
 
 /// Resolve the Unraid config directory for both flash-booted and disk-based
@@ -77,25 +70,19 @@ fn resolve_config_dir() -> Result<Resolved, String> {
         });
     }
 
-    if let Ok(txt) = fs::read_to_string(MOUNTS) {
-        for line in txt.lines() {
-            let mut f = line.split_whitespace();
-            let (dev, mp) = match (f.next(), f.next()) {
-                (Some(d), Some(m)) => (d, m),
-                _ => continue,
-            };
-            let fstype = f.next().unwrap_or("");
-            let cand = Path::new(mp).join("config");
-            if cand.join("ident.cfg").is_file() || cand.join("super.dat").is_file() {
-                return Ok(Resolved {
-                    note: format!(
-                        "disk/relocated install: resolved config to {} on {dev} ({fstype}) \
-                         mounted at {mp}",
-                        cand.display()
-                    ),
-                    dir: cand,
-                });
-            }
+    for m in crate::procfs::read_mounts(MOUNTS) {
+        let cand = Path::new(&m.target).join("config");
+        if cand.join("ident.cfg").is_file() || cand.join("super.dat").is_file() {
+            return Ok(Resolved {
+                note: format!(
+                    "disk/relocated install: resolved config to {} on {} ({}) mounted at {}",
+                    cand.display(),
+                    m.source,
+                    m.fstype,
+                    m.target
+                ),
+                dir: cand,
+            });
         }
     }
 
