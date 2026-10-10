@@ -42,6 +42,7 @@ pub mod topology;
 pub mod ups;
 pub mod version;
 pub mod vm_manager;
+pub mod zfs_health;
 
 /// Diagnostics-provider registry name (the `Finding.provider` / `RepairArgs.provider`
 /// key and the `diagnostics` [`crate::registration`] backend name).
