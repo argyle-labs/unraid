@@ -6,7 +6,7 @@
 //! because every `queries/` operation auto-surfaces as an ungated tool.
 
 use plugin_toolkit::prelude::*;
-use plugin_toolkit::serde_json::json;
+use plugin_toolkit::serde_json::{Value, json};
 
 use crate::tools::surface_client;
 
@@ -55,6 +55,16 @@ pub(crate) fn resolve_id(domains: &[(String, Option<String>)], vm: &str) -> Resu
     }
 }
 
+/// The mutation's boolean from `data`. GraphQL errors are already `Err` from
+/// the client; a missing/non-boolean field or `false` is an error here too.
+pub(crate) fn mutation_result(data: &Value, field: &str, action: &str) -> Result<()> {
+    match data["vm"][field].as_bool() {
+        Some(true) => Ok(()),
+        Some(false) => bail!("Unraid reported the VM {action} did not succeed"),
+        None => bail!("unexpected response to vm.{field}: {data}"),
+    }
+}
+
 #[orca_struct(args)]
 #[serde(rename_all = "camelCase")]
 pub struct UnraidVmPowerArgs {
@@ -76,8 +86,6 @@ pub struct UnraidVmPowerArgs {
 pub struct VmPowerOutput {
     pub id: String,
     pub action: String,
-    /// The mutation's boolean result.
-    pub ok: bool,
 }
 
 /// Change a VM's power state. Dry-run unless `execute: true`.
@@ -104,8 +112,8 @@ async fn unraid_vm_power(args: UnraidVmPowerArgs, _ctx: &ToolCtx) -> Result<VmPo
     let data = client
         .mutate_raw(&document(field), json!({ "id": id }))
         .await?;
+    mutation_result(&data, field, &args.action)?;
     Ok(VmPowerOutput {
-        ok: data["vm"][field].as_bool().unwrap_or(false),
         id,
         action: args.action,
     })
@@ -165,5 +173,22 @@ mod tests {
                 .contains("ambiguous")
         );
         assert!(resolve_id(&d, "nope").is_err());
+    }
+
+    #[test]
+    fn only_a_true_result_is_success() {
+        assert!(mutation_result(&json!({"vm": {"start": true}}), "start", "start").is_ok());
+        let f = mutation_result(&json!({"vm": {"start": false}}), "start", "start");
+        assert!(f.unwrap_err().to_string().contains("did not succeed"));
+        for bad in [
+            json!(null),
+            json!({"vm": null}),
+            json!({"vm": {"start": "yes"}}),
+        ] {
+            let e = mutation_result(&bad, "start", "start")
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("unexpected response"), "{bad}");
+        }
     }
 }
