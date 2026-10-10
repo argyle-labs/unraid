@@ -32,8 +32,11 @@ pub mod endpoint;
 pub mod exports;
 pub mod labels;
 pub mod permissions;
+pub mod procfs;
 pub mod registration;
 pub mod schema_pull;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod tools;
 pub mod topology;
 pub mod ups;

@@ -187,7 +187,7 @@ pub fn diagnose(args_json: &str) -> Result<String, String> {
     serde_json::to_string(&findings).map_err(|e| format!("encode findings: {e}"))
 }
 
-fn finding(
+pub(crate) fn finding(
     id: &str,
     severity: Severity,
     title: &str,
