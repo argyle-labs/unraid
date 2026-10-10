@@ -20,6 +20,10 @@ pub(crate) struct SmbShare {
     pub name: String,
     pub path: String,
     pub guest_ok: bool,
+    /// `guest only`: every connection runs as the guest account.
+    pub guest_only: bool,
+    /// The account guests run as (`guest account`, Samba default `nobody`).
+    pub guest_account: String,
     pub writeable: bool,
     pub valid_users: Vec<String>,
     pub write_list: Vec<String>,
@@ -32,9 +36,10 @@ impl SmbShare {
         self.guest_ok && self.valid_users.is_empty()
     }
 
-    /// Anyone on the network can write without authenticating.
+    /// Anyone on the network can write without authenticating: the share is
+    /// writable, or the guest account is in `write list`.
     pub fn guest_writable(&self) -> bool {
-        self.guests_admitted() && self.writeable
+        self.guests_admitted() && (self.writeable || self.write_list.contains(&self.guest_account))
     }
 
     pub fn mode(&self) -> &'static str {
@@ -79,6 +84,8 @@ pub(crate) fn parse(text: &str) -> Vec<SmbShare> {
         match k.trim().to_ascii_lowercase().as_str() {
             "path" => cur.path = v.trim().to_string(),
             "public" | "guest ok" => cur.guest_ok = yes(v),
+            "guest only" | "only guest" => cur.guest_only = yes(v),
+            "guest account" => cur.guest_account = v.trim().to_string(),
             "writeable" | "writable" => cur.writeable = yes(v),
             "read only" => cur.writeable = !yes(v),
             "valid users" => cur.valid_users = users(v),
@@ -87,12 +94,22 @@ pub(crate) fn parse(text: &str) -> Vec<SmbShare> {
             _ => {}
         }
     }
+    let account = out
+        .iter()
+        .find(|s| s.name == "global" && !s.guest_account.is_empty())
+        .map_or_else(|| "nobody".to_string(), |g| g.guest_account.clone());
     out.retain(|s| !matches!(s.name.as_str(), "global" | "homes" | "printers"));
+    for s in &mut out {
+        s.guest_account.clone_from(&account);
+    }
     out
 }
 
 fn describe(s: &SmbShare) -> String {
     let mut d = format!("{}={}", s.name, s.mode());
+    if s.guest_only && s.guests_admitted() {
+        d.push_str(" (guest only)");
+    }
     if !s.write_list.is_empty() {
         d.push_str(&format!(" (writers: {})", s.write_list.join(",")));
     }
@@ -235,5 +252,23 @@ mod tests {
     #[test]
     fn missing_table_yields_nothing() {
         assert!(check("/nonexistent/smb-shares.conf", "/nonexistent/x").is_empty());
+    }
+
+    #[test]
+    fn guest_account_in_write_list_makes_a_secure_share_guest_writable() {
+        let s = parse("[m]\npublic = yes\nwriteable = no\nwrite list = nobody\n");
+        assert!(s[0].guest_writable());
+        assert_eq!(s[0].mode(), "public");
+        let s = parse("[global]\nguest account = guest\n[m]\npublic = yes\nwrite list = nobody\n");
+        assert!(!s[0].guest_writable(), "a different guest account");
+        let s = parse("[global]\nguest account = guest\n[m]\npublic = yes\nwrite list = guest\n");
+        assert!(s[0].guest_writable());
+    }
+
+    #[test]
+    fn guest_only_is_reported() {
+        let s = parse("[m]\npublic = yes\nguest only = yes\nwriteable = no\n");
+        assert!(s[0].guest_only);
+        assert_eq!(describe(&s[0]), "m=secure (guest only)");
     }
 }
