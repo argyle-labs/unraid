@@ -73,7 +73,22 @@ pub(crate) fn check(proc_root: &str) -> Vec<Finding> {
     let root = Path::new(proc_root);
     let read = |name: &str| fs::read_to_string(root.join(name)).unwrap_or_default();
     let id = "parity-io-starvation";
-    let (action, pos, total) = match parse_mdstat(&read("mdstat")) {
+    // A missing mdstat means no md driver, so no array to check; any other
+    // read failure leaves parity state unknown.
+    let mdstat = match fs::read_to_string(root.join("mdstat")) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return vec![finding(
+                id,
+                Severity::Info,
+                "Parity state unreadable",
+                format!("{proc_root}/mdstat is unreadable ({e}); parity activity is unknown."),
+                None,
+            )];
+        }
+    };
+    let (action, pos, total) = match parse_mdstat(&mdstat) {
         Resync::Idle => {
             return vec![finding(
                 id,
@@ -209,5 +224,14 @@ mod tests {
     #[test]
     fn non_unraid_host_is_ok() {
         assert_eq!(check("/nonexistent/proc")[0].severity, Severity::Ok);
+    }
+
+    #[test]
+    fn unreadable_mdstat_is_info_not_idle() {
+        let r = FakeRoot::new("parity-unreadable");
+        r.mkdir("mdstat");
+        let f = check(r.str());
+        assert_eq!(f[0].severity, Severity::Info);
+        assert_eq!(f[0].title, "Parity state unreadable");
     }
 }
