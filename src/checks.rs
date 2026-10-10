@@ -100,7 +100,7 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         "/var/run/libvirt",
         "/etc/libvirt/qemu",
     ))
-    .chain(crate::dstate::check("/proc", crate::dstate::SAMPLE_INTERVAL).await)
+    .chain(crate::dstate::check("/proc", "/", crate::dstate::SAMPLE_INTERVAL).await)
     .chain(crate::parity::check("/proc"))
     .chain(std::iter::once(crate::host_settings::check(
         crate::host_settings::IDENT_CFG,
