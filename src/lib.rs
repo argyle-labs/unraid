@@ -45,6 +45,7 @@ pub mod tools;
 pub mod topology;
 pub mod ups;
 pub mod version;
+pub mod vm_inventory;
 pub mod vm_manager;
 pub mod zfs_health;
 

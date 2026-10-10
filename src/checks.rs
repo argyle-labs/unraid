@@ -95,6 +95,11 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
     .chain(crate::cifs_mounts::check("/proc/mounts"))
     .chain(crate::libvirt_stack::check("/proc", "/var/run/libvirt"))
     .chain(crate::nfs_hygiene::check("/etc/exports"))
+    .chain(crate::vm_inventory::check(
+        "/proc",
+        "/var/run/libvirt",
+        "/etc/libvirt/qemu",
+    ))
     .chain(check_vm_manager().await)
     .collect()
 }
