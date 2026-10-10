@@ -25,6 +25,7 @@ pub mod surface {
     include!(concat!(env!("OUT_DIR"), "/unraid_surface.rs"));
 }
 
+pub mod authz;
 pub mod backup;
 pub mod checks;
 pub mod cifs_mounts;

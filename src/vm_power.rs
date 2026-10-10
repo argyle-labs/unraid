@@ -1,13 +1,14 @@
 //! `unraid.vm.power` — start/stop/reboot/pause/resume a libvirt VM through the
 //! Unraid GraphQL `vm { ... }` mutations.
 //!
-//! Execute-gated: without `execute: true` the central gate returns a plan and
-//! the body never runs. The mutation documents live here, not in `queries/`,
+//! Dry-run unless `execute: true`, with admin required for both (see
+//! [`crate::authz`]). The mutation documents live here, not in `queries/`,
 //! because every `queries/` operation auto-surfaces as an ungated tool.
 
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::{Value, json};
 
+use crate::authz::require_admin;
 use crate::tools::surface_client;
 
 /// Actions and the `VmMutations` field each one calls.
@@ -78,6 +79,10 @@ pub struct UnraidVmPowerArgs {
     #[arg(long)]
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// Apply the change. Without it the call only reports what it would do.
+    #[arg(long, default_value_t = false)]
+    #[serde(default)]
+    pub execute: bool,
 }
 
 #[orca_struct]
@@ -86,17 +91,21 @@ pub struct UnraidVmPowerArgs {
 pub struct VmPowerOutput {
     pub id: String,
     pub action: String,
+    /// False for a dry run: the VM was resolved but nothing was sent.
+    pub executed: bool,
 }
 
-/// Change a VM's power state. Dry-run unless `execute: true`.
+/// Change a VM's power state. Dry-run unless `execute: true`; admin is
+/// required for both.
 #[orca_tool(
     domain = "unraid",
     verb = "vm.power",
     role = "admin",
     data_mutation = true,
-    execute_gated = true
+    execute_gated = false
 )]
-async fn unraid_vm_power(args: UnraidVmPowerArgs, _ctx: &ToolCtx) -> Result<VmPowerOutput> {
+async fn unraid_vm_power(args: UnraidVmPowerArgs, ctx: &ToolCtx) -> Result<VmPowerOutput> {
+    require_admin("unraid.vm.power", ctx.caller().as_ref())?;
     let field = mutation_field(&args.action)?;
     let client = surface_client(args.endpoint, None, None, None).await?;
     let domains: Vec<(String, Option<String>)> = client
@@ -109,6 +118,13 @@ async fn unraid_vm_power(args: UnraidVmPowerArgs, _ctx: &ToolCtx) -> Result<VmPo
         .map(|d| (d.id, d.name))
         .collect();
     let id = resolve_id(&domains, &args.vm)?;
+    if !args.execute {
+        return Ok(VmPowerOutput {
+            id,
+            action: args.action,
+            executed: false,
+        });
+    }
     let data = client
         .mutate_raw(&document(field), json!({ "id": id }))
         .await?;
@@ -116,6 +132,7 @@ async fn unraid_vm_power(args: UnraidVmPowerArgs, _ctx: &ToolCtx) -> Result<VmPo
     Ok(VmPowerOutput {
         id,
         action: args.action,
+        executed: true,
     })
 }
 
@@ -189,6 +206,21 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(e.contains("unexpected response"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn dry_run_requires_admin() {
+        for role in [Some("user"), None] {
+            let args = UnraidVmPowerArgs {
+                vm: "pbs".into(),
+                action: "start".into(),
+                endpoint: None,
+                execute: false,
+            };
+            let ctx = crate::authz::test_ctx(role);
+            let e = plugin_toolkit::reactor::block_on(unraid_vm_power(args, &ctx)).unwrap_err();
+            assert!(e.to_string().contains("unraid.vm.power: "), "{e}");
         }
     }
 }
