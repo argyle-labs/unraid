@@ -198,7 +198,9 @@ pub(crate) fn find_bmc(root: &str) -> Option<String> {
 
 /// Sample `proc_root` twice, `interval` apart, and report what persisted. The
 /// second sample is skipped when the first shows no D/Z process and no shfs.
-/// The wait is async: plugin calls share one socket thread, so a blocking
+/// shfs has nonzero CPU time on any host with the array started, so there
+/// diagnose always waits `interval` (2s) for the CPU measurement. The wait is
+/// async: plugin calls share one socket thread, so a blocking
 /// sleep would stall every other call.
 pub(crate) async fn check(proc_root: &str, sys_root: &str, interval: Duration) -> Vec<Finding> {
     let (first, t1) = (scan(proc_root), shfs_ticks(proc_root));
