@@ -28,6 +28,7 @@ pub mod surface {
 pub mod backup;
 pub mod checks;
 pub mod cifs_mounts;
+pub mod deploy;
 pub mod docker_adopt;
 pub mod endpoint;
 pub mod exports;
