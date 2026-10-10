@@ -33,6 +33,7 @@ pub mod docker_adopt;
 pub mod dstate;
 pub mod endpoint;
 pub mod exports;
+pub mod host_settings;
 pub mod labels;
 pub mod libvirt_stack;
 pub mod nfs_hygiene;
