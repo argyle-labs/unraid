@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::prelude::*;
-use plugin_toolkit::process::Command;
 use plugin_toolkit::serde_json::{self, Value};
 
 use super::host::{self, APPDATA, AUTOSTART_FILE, REBUILD_SCRIPT};
@@ -33,10 +32,16 @@ pub const PRIVILEGED_FLAG: &str = "--privileged-op";
 /// Env naming the orca binary whose `admin plugin-apply` is the sudo seam.
 pub const ORCA_BIN_ENV: &str = "ORCA_BIN";
 const MAX_TEMPLATE_BYTES: usize = 1 << 20;
+const MAX_INSPECT_BYTES: usize = 1 << 20;
 
 #[orca_struct]
 #[derive(Debug, Clone, PartialEq)]
-#[serde(tag = "op", content = "payload", rename_all = "snake_case")]
+#[serde(
+    tag = "op",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum PrivilegedOp {
     /// Proves a root path exists; changes nothing.
     Ping,
@@ -501,6 +506,9 @@ pub fn write_template_in(dir: &Path, name: &str, xml: &str, backup_id: &str) -> 
 pub fn save_inspect_in(dir: &Path, name: &str, json: &str, backup_id: &str) -> Result<String> {
     validate_name("container name", name)?;
     validate_run_id(backup_id)?;
+    if json.len() > MAX_INSPECT_BYTES {
+        bail!("inspect JSON is larger than {MAX_INSPECT_BYTES} bytes");
+    }
     let v: Value = serde_json::from_str(json).context("inspect JSON")?;
     let c: ContainerInspect = serde_json::from_value(v.clone())?;
     if c.short_name() != name {
@@ -627,11 +635,11 @@ async fn plain_local_volume(volume: &str) -> Result<Dir> {
 pub async fn execute(op: &PrivilegedOp) -> Result<String> {
     match op {
         PrivilegedOp::Ping => Ok("root".to_string()),
-        // Trust boundary: the template's ExtraParams reach `docker run` via
-        // Rebuild, so writing one is equivalent to starting a root container.
-        // That grants nothing beyond what the caller already has: the orca
-        // user is in the docker group. The checks here pin the file's
-        // identity and location, not its content.
+        // A template's ExtraParams reach `docker run` via Rebuild, so these
+        // ops can start a privileged root container. [`serve_one`] admits them
+        // only for a caller that is root or in the `docker` group, which can
+        // already do that through the docker socket. The checks here pin the
+        // file's identity and location, not its content.
         PrivilegedOp::WriteTemplate {
             name,
             xml,
@@ -863,6 +871,15 @@ pub async fn serve_one(input: &str) -> PrivilegedReply {
             o.remove("plugin");
         }
         let op: PrivilegedOp = serde_json::from_value(v).context("decode op")?;
+        if starts_containers(&op) {
+            let uid = caller_uid();
+            if !may_start_containers(uid, &read_db("/etc/passwd"), &read_db("/etc/group")) {
+                bail!(
+                    "uid {uid} is neither root nor in the {DOCKER_GROUP:?} group, so it may not \
+                     write or rebuild container templates"
+                );
+            }
+        }
         execute(&op).await
     }
     .await;
@@ -878,6 +895,52 @@ pub async fn serve_one(input: &str) -> PrivilegedReply {
             error: Some(format!("{e:#}")),
         },
     }
+}
+
+const DOCKER_GROUP: &str = "docker";
+
+/// Ops whose effect reaches `docker run` as root.
+fn starts_containers(op: &PrivilegedOp) -> bool {
+    matches!(
+        op,
+        PrivilegedOp::WriteTemplate { .. }
+            | PrivilegedOp::SaveInspect { .. }
+            | PrivilegedOp::RestoreTemplate { .. }
+            | PrivilegedOp::Rebuild { .. }
+    )
+}
+
+/// The user sudo ran us for, else our real uid.
+fn caller_uid() -> u32 {
+    std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|u| u.parse().ok())
+        .unwrap_or_else(|| rustix::process::getuid().as_raw())
+}
+
+fn read_db(path: &str) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Whether `uid` is root or a member of the docker group, by its primary gid
+/// or a supplementary entry, as `getgrouplist` resolves it from the files
+/// databases. Read directly so root never spawns a lookup process.
+pub fn may_start_containers(uid: u32, passwd: &str, group: &str) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    let Some((user, gid)) = passwd.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        (f.len() >= 4 && f[2].parse() == Ok(uid)).then(|| (f[0], f[3].parse::<u32>().ok()))
+    }) else {
+        return false;
+    };
+    group.lines().any(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        f.len() >= 4
+            && f[0] == DOCKER_GROUP
+            && (f[2].parse().ok() == gid || f[3].split(',').any(|m| m.trim() == user))
+    })
 }
 
 pub trait PrivilegedRunner: Send + Sync {
@@ -921,34 +984,32 @@ impl Sudo {
             "orca-unraid-privileged-{}.json",
             host::random_suffix()
         ));
-        {
-            use std::io::Write;
+        let stdin = {
+            use std::io::{Seek, Write};
             use std::os::unix::fs::OpenOptionsExt;
-            fs::OpenOptions::new()
+            let mut f = fs::OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(&path)
-                .and_then(|mut f| f.write_all(serde_json::to_string(&req)?.as_bytes()))
                 .with_context(|| format!("write {}", path.display()))?;
-        }
-        // The seam reads the request from stdin until EOF; a file redirect gives
-        // it a clean EOF. Both values are positional args, never interpolated
-        // into the script, and both programs are absolute paths.
-        let out = Command::new("/bin/sh")
-            .args([
-                "-c",
-                r#"exec /usr/bin/sudo -n "$0" admin plugin-apply < "$1""#,
-                &self.orca_bin,
-                &path.to_string_lossy(),
-            ])
+            fs::remove_file(&path).ok();
+            f.write_all(serde_json::to_string(&req)?.as_bytes())
+                .and_then(|_| f.rewind())
+                .with_context(|| format!("write {}", path.display()))?;
+            f
+        };
+        // The seam reads the request from stdin until EOF, which a file gives
+        // cleanly. Both programs are absolute paths.
+        let out = std::process::Command::new("/usr/bin/sudo")
+            .args(["-n", &self.orca_bin, "admin", "plugin-apply"])
+            .stdin(stdin)
             .output()
-            .await;
-        fs::remove_file(&path).ok();
-        let out = out.context("spawn sudo")?;
+            .context("spawn sudo")?;
         parse_reply(
-            out.status.success,
-            out.status.code,
+            out.status.success(),
+            out.status.code(),
             &String::from_utf8_lossy(&out.stdout),
             &String::from_utf8_lossy(&out.stderr),
         )
@@ -1025,6 +1086,45 @@ mod tests {
         assert_eq!(serde_json::from_value::<PrivilegedOp>(v).unwrap(), copy);
         let ping = serde_json::to_value(PrivilegedOp::Ping).unwrap();
         assert_eq!(ping["op"], "ping");
+    }
+
+    #[test]
+    fn ops_reject_unknown_fields_and_keys() {
+        let extra = serde_json::json!({
+            "op": "rebuild", "payload": {"name": "pbs", "extra": 1}
+        });
+        assert!(serde_json::from_value::<PrivilegedOp>(extra).is_err());
+        let top = serde_json::json!({
+            "op": "rebuild", "payload": {"name": "pbs"}, "sneaky": true
+        });
+        assert!(serde_json::from_value::<PrivilegedOp>(top).is_err());
+        let ok = serde_json::json!({"op": "rebuild", "payload": {"name": "pbs"}});
+        assert!(serde_json::from_value::<PrivilegedOp>(ok).is_ok());
+    }
+
+    #[test]
+    fn only_root_or_docker_group_may_start_containers() {
+        let passwd = "root:x:0:0::/root:/bin/sh\norca:x:1000:100::/h:/bin/sh\n\
+                      dock:x:1001:281::/h:/bin/sh\nnobody:x:99:100::/:/bin/false\n";
+        let group = "users:x:100:\ndocker:x:281:orca\n";
+        assert!(may_start_containers(0, "", ""));
+        assert!(may_start_containers(1000, passwd, group));
+        assert!(may_start_containers(1001, passwd, group));
+        assert!(!may_start_containers(99, passwd, group));
+        assert!(!may_start_containers(4242, passwd, group));
+        assert!(!may_start_containers(1000, passwd, "users:x:100:orca\n"));
+        assert!(starts_containers(&PrivilegedOp::Rebuild {
+            name: "pbs".into()
+        }));
+        assert!(!starts_containers(&PrivilegedOp::RefreshIcons));
+    }
+
+    #[test]
+    fn save_inspect_caps_its_size() {
+        let (_d, root) = appdata();
+        let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(MAX_INSPECT_BYTES));
+        let err = save_inspect_in(&root, "pbs", &big, "20260101-000000-0123abcd").unwrap_err();
+        assert!(err.to_string().contains("larger than"), "{err:#}");
     }
 
     #[test]

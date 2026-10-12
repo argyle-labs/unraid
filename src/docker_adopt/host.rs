@@ -39,11 +39,20 @@ $DockerClient = new DockerClient(); $DockerTemplates = new DockerTemplates();
 $custom = DockerUtil::custom(); $subnet = DockerUtil::network($custom); $cpus = DockerUtil::cpus();
 "#;
 
+pub const PHP: &str = "/usr/bin/php";
+
 /// Keeps PHP notices out of stdout, which carries the rendered command.
 const PHP_STDERR_ERRORS: &str = "-ddisplay_errors=stderr";
 
+/// Fixed `PATH` for every spawned program, so a root caller's environment
+/// cannot steer what helper scripts resolve.
+const SAFE_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Runs `program` with an empty environment plus [`SAFE_PATH`]; `env -i`
+/// does the clearing since the toolkit `Command` cannot.
 pub async fn run(program: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new(program)
+    let out = Command::new("/usr/bin/env")
+        .args(["-i", SAFE_PATH, program])
         .args(args)
         .run_checked()
         .await
@@ -258,7 +267,7 @@ pub async fn render_command(xml: &str) -> Result<String> {
         .with_context(|| format!("write {}", path.display()))?;
     let code = format!("{PHP_PROLOGUE}[$cmd] = xmlToCommand($argv[1]); echo $cmd;");
     let path_s = path.to_string_lossy().into_owned();
-    let out = run("php", &[PHP_STDERR_ERRORS, "-r", &code, "--", &path_s]).await;
+    let out = run(PHP, &[PHP_STDERR_ERRORS, "-r", &code, "--", &path_s]).await;
     fs::remove_file(&path).ok();
     let out = out?;
     let cmd = out.trim();
@@ -270,7 +279,7 @@ pub async fn render_command(xml: &str) -> Result<String> {
 
 pub async fn refresh_icons() -> Result<()> {
     let code = format!("{PHP_PROLOGUE}$DockerTemplates->getAllInfo(true);");
-    run("php", &[PHP_STDERR_ERRORS, "-r", &code])
+    run(PHP, &[PHP_STDERR_ERRORS, "-r", &code])
         .await
         .map(|_| ())
 }
