@@ -48,13 +48,15 @@ const PHP_STDERR_ERRORS: &str = "-ddisplay_errors=stderr";
 /// cannot steer what helper scripts resolve.
 const SAFE_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+const ROOT_HOME: &str = "HOME=/root";
+
 /// Runs `program`. As root the environment is cleared to [`SAFE_PATH`] via
 /// `env -i` (the toolkit `Command` cannot clear it) so the caller cannot steer
-/// helper scripts; unprivileged runs keep it, since docker needs
-/// `HOME`/`DOCKER_*`.
+/// helper scripts; `HOME=/root` keeps docker's registry auth in
+/// `/root/.docker/config.json`. Unprivileged runs keep the environment.
 pub async fn run(program: &str, args: &[&str]) -> Result<String> {
     let cmd = if euid() == Some(0) {
-        Command::new("/usr/bin/env").args(["-i", SAFE_PATH, program])
+        Command::new("/usr/bin/env").args(["-i", SAFE_PATH, ROOT_HOME, program])
     } else {
         Command::new(program)
     };

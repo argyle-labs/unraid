@@ -872,6 +872,8 @@ pub async fn serve_one(input: &str) -> PrivilegedReply {
         }
         let op: PrivilegedOp = serde_json::from_value(v).context("decode op")?;
         if starts_containers(&op) {
+            // Trusted: set only by orca `admin plugin-apply` after `env_clear`;
+            // sudo's `env_reset` drops a caller-supplied value.
             let raw = std::env::var("ORCA_CALLER_UID").ok();
             let Some(uid) = caller_uid(raw.as_deref()) else {
                 bail!("ORCA_CALLER_UID is missing or invalid; refusing to write or rebuild container templates");
@@ -913,8 +915,9 @@ fn starts_containers(op: &PrivilegedOp) -> bool {
     )
 }
 
-/// The uid orca ran this op for. orca clears the environment and then sets
-/// `ORCA_CALLER_UID`; absent or unparseable means unknown, never root.
+/// The uid orca ran this op for. Only orca `admin plugin-apply` sets
+/// `ORCA_CALLER_UID`, after `env_clear`; sudo's `env_reset` drops any value the
+/// caller supplied. Absent or unparseable means unknown, never root.
 pub fn caller_uid(raw: Option<&str>) -> Option<u32> {
     raw?.trim().parse().ok()
 }
@@ -940,7 +943,8 @@ pub fn may_start_containers(uid: u32, passwd: &str, group: &str) -> bool {
         let f: Vec<&str> = l.split(':').collect();
         f.len() >= 4
             && f[0] == DOCKER_GROUP
-            && (f[2].parse().ok() == gid || f[3].split(',').any(|m| m.trim() == user))
+            && (matches!((gid, f[2].parse::<u32>()), (Some(a), Ok(b)) if a == b)
+                || f[3].split(',').any(|m| m.trim() == user))
     })
 }
 
@@ -981,33 +985,25 @@ impl Sudo {
         if let Some(o) = req.as_object_mut() {
             o.insert("plugin".to_string(), Value::from("unraid"));
         }
-        let path = std::env::temp_dir().join(format!(
-            "orca-unraid-privileged-{}.json",
-            host::random_suffix()
-        ));
-        let stdin = {
-            use std::io::{Seek, Write};
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-                .with_context(|| format!("write {}", path.display()))?;
-            fs::remove_file(&path).ok();
-            f.write_all(serde_json::to_string(&req)?.as_bytes())
-                .and_then(|_| f.rewind())
-                .with_context(|| format!("write {}", path.display()))?;
-            f
-        };
-        // The seam reads the request from stdin until EOF, which a file gives
-        // cleanly. Both programs are absolute paths.
-        let out = std::process::Command::new("/usr/bin/sudo")
+        let mut child = tokio::process::Command::new("/usr/bin/sudo")
             .args(["-n", &self.orca_bin, "admin", "plugin-apply"])
-            .stdin(stdin)
-            .output()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
             .context("spawn sudo")?;
+        let mut stdin = child.stdin.take().context("sudo stdin")?;
+        let body = serde_json::to_vec(&req)?;
+        // The seam reads until EOF, so stdin is dropped once written; the
+        // write and the output drain run together so a full pipe cannot stall.
+        let write = async move {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(&body).await
+        };
+        let (written, out) = tokio::join!(write, child.wait_with_output());
+        let out = out.context("wait for sudo")?;
+        written.context("write request to sudo")?;
         parse_reply(
             out.status.success(),
             out.status.code(),
@@ -1127,10 +1123,31 @@ mod tests {
         assert!(!may_start_containers(99, passwd, group));
         assert!(!may_start_containers(4242, passwd, group));
         assert!(!may_start_containers(1000, passwd, "users:x:100:orca\n"));
+        let no_gids = "ghost:x:1002:abc::/h:/bin/sh\n";
+        assert!(!may_start_containers(1002, no_gids, "docker:x:xyz:\n"));
         assert!(starts_containers(&PrivilegedOp::Rebuild {
             name: "pbs".into()
         }));
         assert!(!starts_containers(&PrivilegedOp::RefreshIcons));
+    }
+
+    #[tokio::test]
+    async fn direct_executes_gated_ops_without_the_caller_uid_gate() {
+        assert!(std::env::var("ORCA_CALLER_UID").is_err());
+        let op = PrivilegedOp::Rebuild {
+            name: "orca-no-such-container".into(),
+        };
+        let err = format!("{:#}", Direct.run(&op).await.unwrap_err());
+        // `execute`'s template lookup, which fails off-Unraid before the
+        // missing-template check; never `serve_one`'s root or caller gates.
+        assert!(
+            err.contains("templates-user") || err.contains("no template"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("ORCA_CALLER_UID") && !err.contains("must run as root"),
+            "{err}"
+        );
     }
 
     #[test]
