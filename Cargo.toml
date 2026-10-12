@@ -56,6 +56,9 @@ plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main",
 # descriptors. Both are already in the toolkit's dependency graph.
 rustix = { version = "1.1", features = ["fs", "process", "std"] }
 sha2 = "0.11"
+# Pipes the privileged request to sudo; the toolkit `Command` cannot close
+# stdin. Already in the toolkit's dependency graph.
+tokio = { version = "1", features = ["process", "io-util", "macros"] }
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
