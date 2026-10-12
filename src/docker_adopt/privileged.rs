@@ -872,7 +872,10 @@ pub async fn serve_one(input: &str) -> PrivilegedReply {
         }
         let op: PrivilegedOp = serde_json::from_value(v).context("decode op")?;
         if starts_containers(&op) {
-            let uid = caller_uid();
+            let raw = std::env::var("ORCA_CALLER_UID").ok();
+            let Some(uid) = caller_uid(raw.as_deref()) else {
+                bail!("ORCA_CALLER_UID is missing or invalid; refusing to write or rebuild container templates");
+            };
             if !may_start_containers(uid, &read_db("/etc/passwd"), &read_db("/etc/group")) {
                 bail!(
                     "uid {uid} is neither root nor in the {DOCKER_GROUP:?} group, so it may not \
@@ -910,12 +913,10 @@ fn starts_containers(op: &PrivilegedOp) -> bool {
     )
 }
 
-/// The user sudo ran us for, else our real uid.
-fn caller_uid() -> u32 {
-    std::env::var("SUDO_UID")
-        .ok()
-        .and_then(|u| u.parse().ok())
-        .unwrap_or_else(|| rustix::process::getuid().as_raw())
+/// The uid orca ran this op for. orca clears the environment and then sets
+/// `ORCA_CALLER_UID`; absent or unparseable means unknown, never root.
+pub fn caller_uid(raw: Option<&str>) -> Option<u32> {
+    raw?.trim().parse().ok()
 }
 
 fn read_db(path: &str) -> String {
@@ -1100,6 +1101,19 @@ mod tests {
         assert!(serde_json::from_value::<PrivilegedOp>(top).is_err());
         let ok = serde_json::json!({"op": "rebuild", "payload": {"name": "pbs"}});
         assert!(serde_json::from_value::<PrivilegedOp>(ok).is_ok());
+    }
+
+    #[test]
+    fn caller_uid_fails_closed() {
+        let passwd = "orca:x:1000:100::/h:/bin/sh\nnobody:x:99:100::/:/bin/false\n";
+        let group = "docker:x:281:orca\n";
+        let allowed = |raw| caller_uid(raw).is_some_and(|u| may_start_containers(u, passwd, group));
+        assert!(!allowed(None));
+        assert!(!allowed(Some("root")));
+        assert!(!allowed(Some("")));
+        assert!(allowed(Some("1000")));
+        assert!(!allowed(Some("99")));
+        assert!(allowed(Some("0")));
     }
 
     #[test]

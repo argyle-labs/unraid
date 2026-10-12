@@ -48,11 +48,17 @@ const PHP_STDERR_ERRORS: &str = "-ddisplay_errors=stderr";
 /// cannot steer what helper scripts resolve.
 const SAFE_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-/// Runs `program` with an empty environment plus [`SAFE_PATH`]; `env -i`
-/// does the clearing since the toolkit `Command` cannot.
+/// Runs `program`. As root the environment is cleared to [`SAFE_PATH`] via
+/// `env -i` (the toolkit `Command` cannot clear it) so the caller cannot steer
+/// helper scripts; unprivileged runs keep it, since docker needs
+/// `HOME`/`DOCKER_*`.
 pub async fn run(program: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new("/usr/bin/env")
-        .args(["-i", SAFE_PATH, program])
+    let cmd = if euid() == Some(0) {
+        Command::new("/usr/bin/env").args(["-i", SAFE_PATH, program])
+    } else {
+        Command::new(program)
+    };
+    let out = cmd
         .args(args)
         .run_checked()
         .await
