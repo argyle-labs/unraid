@@ -39,6 +39,7 @@ pub mod labels;
 pub mod libvirt_stack;
 pub mod nfs_hygiene;
 pub mod parity;
+pub mod parity_control;
 pub mod permissions;
 pub mod procfs;
 pub mod registration;
