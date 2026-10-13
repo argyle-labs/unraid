@@ -67,6 +67,11 @@ pub enum PrivilegedOp {
         name: String,
         on: bool,
     },
+    /// Turn a libvirt VM's autostart on or off with `virsh autostart`.
+    SetVmAutostart {
+        name: String,
+        on: bool,
+    },
     Rebuild {
         name: String,
     },
@@ -665,6 +670,11 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
                 }
             }
         }
+        PrivilegedOp::SetVmAutostart { name, on } => {
+            let change =
+                crate::vm_autostart::set(&crate::vm_autostart::run_virsh, name, *on).await?;
+            Ok(format!("{change:?}").to_lowercase())
+        }
         PrivilegedOp::Rebuild { name } => {
             validate_name("container name", name)?;
             if safefs::read_file(Path::new(&template::template_path(name)))?.is_none() {
@@ -923,6 +933,7 @@ pub fn policy(op: &PrivilegedOp) -> CallerPolicy {
         | PrivilegedOp::ManifestVolume { .. }
         | PrivilegedOp::VolumeEmpty { .. }
         | PrivilegedOp::RetireStack { .. } => CallerPolicy::RootOrDockerGroup,
+        PrivilegedOp::SetVmAutostart { .. } => CallerPolicy::Root,
     }
 }
 
