@@ -1,9 +1,8 @@
 //! `unraid.parity.control` — start, pause, resume or cancel a parity check
 //! through the Unraid GraphQL `parityCheck { ... }` mutations.
 //!
-//! Pausing is the immediate relief when a check starves share I/O (see the
-//! `parity-io-starvation` finding). Dry-run by default, admin required for
-//! both (see [`crate::authz`]).
+//! Pausing is the immediate relief when a check starves share I/O. Dry-run
+//! by default, admin required for both (see [`crate::authz`]).
 //! `start` is a read-only check; writing parity corrections is the separate
 //! `start_correcting` action, so an invalid action/flag combination cannot be
 //! expressed and is rejected when the arguments are parsed, dry run included.
