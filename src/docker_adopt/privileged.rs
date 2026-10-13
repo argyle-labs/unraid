@@ -76,6 +76,13 @@ pub enum PrivilegedOp {
     ReadVmXml {
         name: String,
     },
+    /// Set a user share's SMB security and user lists (cfg + live conf).
+    SetSmbShare {
+        share: String,
+        security: String,
+        read_list: Vec<String>,
+        write_list: Vec<String>,
+    },
     Rebuild {
         name: String,
     },
@@ -680,6 +687,18 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
             Ok(format!("{change:?}").to_lowercase())
         }
         PrivilegedOp::ReadVmXml { name } => crate::vm_xml::read_redacted_as_root(name),
+        PrivilegedOp::SetSmbShare {
+            share,
+            security,
+            read_list,
+            write_list,
+        } => {
+            use crate::smb_share_write::{SmbShareRequest, apply_in, reload_smbd};
+            let req = SmbShareRequest::new(share, security, read_list, write_list)?;
+            let cfg = crate::exports::UnraidExports::cfg_path(&req.share);
+            let conf = Path::new(crate::smb_shares::SHARES_CONF);
+            Ok(apply_in(&cfg, conf, &req, reload_smbd).await?.join("; "))
+        }
         PrivilegedOp::Rebuild { name } => {
             validate_name("container name", name)?;
             if safefs::read_file(Path::new(&template::template_path(name)))?.is_none() {
@@ -939,6 +958,7 @@ pub fn policy(op: &PrivilegedOp) -> CallerPolicy {
         | PrivilegedOp::VolumeEmpty { .. }
         | PrivilegedOp::RetireStack { .. } => CallerPolicy::RootOrDockerGroup,
         PrivilegedOp::SetVmAutostart { .. } | PrivilegedOp::ReadVmXml { .. } => CallerPolicy::Root,
+        PrivilegedOp::SetSmbShare { .. } => CallerPolicy::Root,
     }
 }
 
