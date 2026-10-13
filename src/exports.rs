@@ -83,7 +83,7 @@ impl UnraidExports {
         Ok(rest.to_string())
     }
 
-    fn cfg_path(name: &str) -> PathBuf {
+    pub(crate) fn cfg_path(name: &str) -> PathBuf {
         Path::new(SHARE_CFG_DIR).join(format!("{name}.cfg"))
     }
 
@@ -188,7 +188,7 @@ impl UnraidExports {
     /// `exportfs -ra`. So an unprivileged daemon can never write exports, and a
     /// bare "Permission denied" invites someone to go hunting for a chmod that
     /// cannot exist. Say what is actually required instead.
-    fn cfg_read_error(name: &str, cfg: &Path, e: &std::io::Error) -> StorageError {
+    pub(crate) fn cfg_read_error(name: &str, cfg: &Path, e: &std::io::Error) -> StorageError {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
             return StorageError::Other(format!(
                 "cannot author exports as an unprivileged daemon: {} is root-only \
@@ -280,7 +280,7 @@ impl UnraidExports {
     /// Apply `updates` to a share cfg, preserving every key this plugin does not
     /// model and the file's existing ordering. Keys absent from the file are
     /// appended.
-    fn write_cfg_keys(text: &str, updates: &[(&str, String)]) -> String {
+    pub(crate) fn write_cfg_keys(text: &str, updates: &[(&str, String)]) -> String {
         let mut out: Vec<String> = Vec::new();
         let mut applied: Vec<&str> = Vec::new();
         for line in text.lines() {
