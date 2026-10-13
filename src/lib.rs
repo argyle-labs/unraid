@@ -450,6 +450,23 @@ impl Client {
         document: &str,
         variables: plugin_toolkit::serde_json::Value,
     ) -> Result<plugin_toolkit::serde_json::Value, UnraidError> {
+        self.raw(document, variables).await
+    }
+
+    /// Send a hand-written read-only GraphQL document and return its `data`.
+    pub async fn query_raw(
+        &self,
+        document: &str,
+        variables: plugin_toolkit::serde_json::Value,
+    ) -> Result<plugin_toolkit::serde_json::Value, UnraidError> {
+        self.raw(document, variables).await
+    }
+
+    async fn raw(
+        &self,
+        document: &str,
+        variables: plugin_toolkit::serde_json::Value,
+    ) -> Result<plugin_toolkit::serde_json::Value, UnraidError> {
         let mut req = plugin_toolkit::graphql::QueryRequest::new(&self.endpoint, document)
             .variables(variables)
             .headers(&self.headers);

@@ -6,8 +6,8 @@
 //! The identity mutation sets all three fields at once, so fields not given
 //! are filled from the current values rather than sent as null.
 //! Time settings (timezone, NTP) have no precondition. Dry-run by default,
-//! admin required for both (see [`crate::authz`]). Mutation documents stay out of `queries/`, where every operation
-//! auto-surfaces as an ungated tool.
+//! admin required for both (see [`crate::authz`]). Mutation documents stay
+//! out of `queries/`, where every operation auto-surfaces as an ungated tool.
 
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::{Map, Value, json};
@@ -77,9 +77,57 @@ pub(crate) struct Plan {
     pub time: Option<Value>,
 }
 
+/// Unraid's server-name rule: 1-15 letters, digits, '.' or '-', not
+/// starting or ending with '.' or '-'.
+pub(crate) fn validate_server_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 15
+        || name.starts_with(['.', '-'])
+        || name.ends_with(['.', '-'])
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        bail!(
+            "invalid server name '{name}': 1-15 letters, digits, '.' or '-', \
+             not starting or ending with '.' or '-'"
+        );
+    }
+    Ok(())
+}
+
+/// An IP address or an RFC 1123 hostname.
+pub(crate) fn validate_ntp_server(s: &str) -> Result<()> {
+    if s.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let host = s.strip_suffix('.').unwrap_or(s);
+    let ok = !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    if !ok {
+        bail!("invalid NTP server '{s}': expected a hostname or IP address");
+    }
+    Ok(())
+}
+
 pub(crate) fn plan(a: &UnraidHostSettingsSetArgs) -> Result<Plan> {
-    if a.name.as_deref().is_some_and(|n| n.trim().is_empty()) {
-        bail!("`name` must not be blank");
+    if let Some(n) = &a.name {
+        validate_server_name(n)?;
+    }
+    // Both land in ident.cfg, a line-based file.
+    for (field, v) in [("comment", &a.comment), ("sysModel", &a.sys_model)] {
+        if v.as_deref()
+            .is_some_and(|v| v.chars().any(char::is_control))
+        {
+            bail!("invalid {field}: control characters are not allowed");
+        }
     }
     let identity = (a.name.is_some() || a.comment.is_some() || a.sys_model.is_some()).then(|| {
         IdentityChange {
@@ -101,6 +149,9 @@ pub(crate) fn plan(a: &UnraidHostSettingsSetArgs) -> Result<Plan> {
     if let Some(s) = &a.ntp_servers {
         if s.len() > 4 {
             bail!("at most 4 NTP servers, got {}", s.len());
+        }
+        for server in s {
+            validate_ntp_server(server)?;
         }
         t.insert("ntpServers".into(), json!(s));
     }
@@ -206,14 +257,14 @@ async fn unraid_host_settings_set(
             if let Err(e) = identity_allowed(&client.array().await?.array.state) {
                 blockers.push(e.to_string());
             }
-            let current = client.mutate_raw(CURRENT_IDENTITY_DOC, json!({})).await?;
+            let current = client.query_raw(CURRENT_IDENTITY_DOC, json!({})).await?;
             Some(identity_vars(change, &current)?)
         }
         None => None,
     };
     let time = match &p.time {
         Some(req) => {
-            let current = client.mutate_raw(CURRENT_TIME_DOC, json!({})).await?;
+            let current = client.query_raw(CURRENT_TIME_DOC, json!({})).await?;
             Some(time_input(req, &current)?)
         }
         None => None,
@@ -355,6 +406,65 @@ mod tests {
         assert!(plan(&a).is_err());
         let mut a = args();
         a.ntp_servers = Some(vec!["a".into(); 5]);
+        assert!(plan(&a).is_err());
+    }
+
+    #[test]
+    fn comment_and_sys_model_refuse_control_chars() {
+        for bad in ["a\nb", "a\rb", "a\0b", "a\x1bb"] {
+            let mut a = args();
+            a.comment = Some(bad.into());
+            assert!(plan(&a).is_err(), "{bad:?}");
+            let mut a = args();
+            a.sys_model = Some(bad.into());
+            assert!(plan(&a).is_err(), "{bad:?}");
+        }
+        let mut a = args();
+        a.comment = Some("media server".into());
+        a.sys_model = Some("N2 Pro".into());
+        assert!(plan(&a).is_ok());
+    }
+
+    #[test]
+    fn server_names_follow_unraid_rules() {
+        for ok in ["Tower", "willow-2", "a.b", "abcdefghijklmno"] {
+            assert!(validate_server_name(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "abcdefghijklmnop",
+            "my tower",
+            "tower_1",
+            "t\u{e9}",
+            "a;b",
+            "-tower",
+            "tower-",
+            ".tower",
+            "tower.",
+        ] {
+            assert!(validate_server_name(bad).is_err(), "{bad}");
+        }
+        let mut a = args();
+        a.name = Some("bad name".into());
+        assert!(plan(&a).is_err());
+    }
+
+    #[test]
+    fn ntp_servers_must_be_hostnames_or_ips() {
+        for ok in [
+            "pool.ntp.org",
+            "time1.google.com.",
+            "10.0.0.1",
+            "::1",
+            "ntp",
+        ] {
+            assert!(validate_ntp_server(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "a b", "-x.org", "x-.org", "a..b", "x;rm", "host:123"] {
+            assert!(validate_ntp_server(bad).is_err(), "{bad}");
+        }
+        let mut a = args();
+        a.ntp_servers = Some(vec!["pool.ntp.org".into(), "bad host".into()]);
         assert!(plan(&a).is_err());
     }
 
