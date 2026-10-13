@@ -871,20 +871,13 @@ pub async fn serve_one(input: &str) -> PrivilegedReply {
             o.remove("plugin");
         }
         let op: PrivilegedOp = serde_json::from_value(v).context("decode op")?;
-        if starts_containers(&op) {
-            // Trusted: set only by orca `admin plugin-apply` after `env_clear`;
-            // sudo's `env_reset` drops a caller-supplied value.
-            let raw = std::env::var("ORCA_CALLER_UID").ok();
-            let Some(uid) = caller_uid(raw.as_deref()) else {
-                bail!("ORCA_CALLER_UID is missing or invalid; refusing to write or rebuild container templates");
-            };
-            if !may_start_containers(uid, &read_db("/etc/passwd"), &read_db("/etc/group")) {
-                bail!(
-                    "uid {uid} is neither root nor in the {DOCKER_GROUP:?} group, so it may not \
-                     write or rebuild container templates"
-                );
-            }
-        }
+        // Trusted: set only by orca `admin plugin-apply` after `env_clear`;
+        // sudo's `env_reset` drops a caller-supplied value.
+        let raw = std::env::var("ORCA_CALLER_UID").ok();
+        let Some(uid) = caller_uid(raw.as_deref()) else {
+            bail!("ORCA_CALLER_UID is missing or invalid; refusing every privileged op");
+        };
+        authorize(&op, uid, &read_db("/etc/passwd"), &read_db("/etc/group"))?;
         execute(&op).await
     }
     .await;
@@ -904,15 +897,47 @@ pub async fn serve_one(input: &str) -> PrivilegedReply {
 
 const DOCKER_GROUP: &str = "docker";
 
-/// Ops whose effect reaches `docker run` as root.
-fn starts_containers(op: &PrivilegedOp) -> bool {
-    matches!(
-        op,
-        PrivilegedOp::WriteTemplate { .. }
-            | PrivilegedOp::SaveInspect { .. }
-            | PrivilegedOp::RestoreTemplate { .. }
-            | PrivilegedOp::Rebuild { .. }
-    )
+/// Who may run an op, by the caller uid orca vouched for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerPolicy {
+    Root,
+    RootOrDockerGroup,
+}
+
+/// The per-op policy table. Exhaustive, so a new op does not compile until it
+/// registers a policy.
+pub fn policy(op: &PrivilegedOp) -> CallerPolicy {
+    match op {
+        PrivilegedOp::Ping
+        | PrivilegedOp::WriteTemplate { .. }
+        | PrivilegedOp::SaveInspect { .. }
+        | PrivilegedOp::RestoreTemplate { .. }
+        | PrivilegedOp::SetAutostart { .. }
+        | PrivilegedOp::Rebuild { .. }
+        | PrivilegedOp::ClearIconCache { .. }
+        | PrivilegedOp::RefreshIcons
+        | PrivilegedOp::CopyVolume { .. }
+        | PrivilegedOp::RemoveCopy { .. }
+        | PrivilegedOp::ExposeCopy { .. }
+        | PrivilegedOp::CopyIntoVolume { .. }
+        | PrivilegedOp::ManifestVolume { .. }
+        | PrivilegedOp::VolumeEmpty { .. }
+        | PrivilegedOp::RetireStack { .. } => CallerPolicy::RootOrDockerGroup,
+    }
+}
+
+pub fn authorize(op: &PrivilegedOp, uid: u32, passwd: &str, group: &str) -> Result<()> {
+    let allowed = match policy(op) {
+        CallerPolicy::Root => uid == 0,
+        CallerPolicy::RootOrDockerGroup => may_start_containers(uid, passwd, group),
+    };
+    if !allowed {
+        bail!(
+            "uid {uid} may not run this privileged op (requires {:?})",
+            policy(op)
+        );
+    }
+    Ok(())
 }
 
 /// The uid orca ran this op for. Only orca `admin plugin-apply` sets
@@ -1125,10 +1150,23 @@ mod tests {
         assert!(!may_start_containers(1000, passwd, "users:x:100:orca\n"));
         let no_gids = "ghost:x:1002:abc::/h:/bin/sh\n";
         assert!(!may_start_containers(1002, no_gids, "docker:x:xyz:\n"));
-        assert!(starts_containers(&PrivilegedOp::Rebuild {
-            name: "pbs".into()
-        }));
-        assert!(!starts_containers(&PrivilegedOp::RefreshIcons));
+    }
+
+    #[test]
+    fn every_op_is_gated_by_its_policy() {
+        let passwd = "orca:x:1000:100::/h:/bin/sh\nnobody:x:99:100::/:/bin/false\n";
+        let group = "docker:x:281:orca\n";
+        for op in [
+            PrivilegedOp::Ping,
+            PrivilegedOp::RefreshIcons,
+            PrivilegedOp::VolumeEmpty { volume: "v".into() },
+            PrivilegedOp::Rebuild { name: "pbs".into() },
+        ] {
+            assert_eq!(policy(&op), CallerPolicy::RootOrDockerGroup);
+            assert!(authorize(&op, 0, passwd, group).is_ok());
+            assert!(authorize(&op, 1000, passwd, group).is_ok());
+            assert!(authorize(&op, 99, passwd, group).is_err());
+        }
     }
 
     #[tokio::test]
