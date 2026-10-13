@@ -35,6 +35,7 @@ pub mod dstate;
 pub mod endpoint;
 pub mod exports;
 pub mod host_settings;
+pub mod host_settings_write;
 pub mod labels;
 pub mod libvirt_stack;
 pub mod nfs_hygiene;
@@ -446,6 +447,23 @@ impl Client {
     /// mutations kept out of `queries/`, where every operation auto-surfaces
     /// as an ungated tool, so the execute-gated verb is the only entry point.
     pub async fn mutate_raw(
+        &self,
+        document: &str,
+        variables: plugin_toolkit::serde_json::Value,
+    ) -> Result<plugin_toolkit::serde_json::Value, UnraidError> {
+        self.raw(document, variables).await
+    }
+
+    /// Send a hand-written read-only GraphQL document and return its `data`.
+    pub async fn query_raw(
+        &self,
+        document: &str,
+        variables: plugin_toolkit::serde_json::Value,
+    ) -> Result<plugin_toolkit::serde_json::Value, UnraidError> {
+        self.raw(document, variables).await
+    }
+
+    async fn raw(
         &self,
         document: &str,
         variables: plugin_toolkit::serde_json::Value,
