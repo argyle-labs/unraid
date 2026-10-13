@@ -72,6 +72,10 @@ pub enum PrivilegedOp {
         name: String,
         on: bool,
     },
+    /// Read a libvirt VM's domain XML, redacted as root; changes nothing.
+    ReadVmXml {
+        name: String,
+    },
     Rebuild {
         name: String,
     },
@@ -675,6 +679,7 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
                 crate::vm_autostart::set(&crate::vm_autostart::run_virsh, name, *on).await?;
             Ok(format!("{change:?}").to_lowercase())
         }
+        PrivilegedOp::ReadVmXml { name } => crate::vm_xml::read_redacted_as_root(name),
         PrivilegedOp::Rebuild { name } => {
             validate_name("container name", name)?;
             if safefs::read_file(Path::new(&template::template_path(name)))?.is_none() {
@@ -933,7 +938,7 @@ pub fn policy(op: &PrivilegedOp) -> CallerPolicy {
         | PrivilegedOp::ManifestVolume { .. }
         | PrivilegedOp::VolumeEmpty { .. }
         | PrivilegedOp::RetireStack { .. } => CallerPolicy::RootOrDockerGroup,
-        PrivilegedOp::SetVmAutostart { .. } => CallerPolicy::Root,
+        PrivilegedOp::SetVmAutostart { .. } | PrivilegedOp::ReadVmXml { .. } => CallerPolicy::Root,
     }
 }
 
