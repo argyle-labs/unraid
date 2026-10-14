@@ -109,24 +109,40 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         crate::smb_shares::SHARES_CONF,
         crate::smb_shares::EXTRA_CONF,
     ))
-    .chain(check_vm_manager().await)
-    .chain(check_disk_health().await)
+    .chain(check_api_endpoints().await)
     .collect()
 }
 
-/// Per-device array health from each endpoint's `array` query. An endpoint that
-/// cannot be queried is already reported by `vm-manager`, so it is skipped here.
-async fn check_disk_health() -> Vec<Finding> {
+/// An enabled endpoint and its client, or why no client could be built.
+type ResolvedEndpoint = (String, Result<Client, String>);
+
+/// Resolve every enabled endpoint once and run the API-backed checks on it.
+async fn check_api_endpoints() -> Vec<Finding> {
     let Ok(rows) = endpoint_db::list() else {
         return Vec::new();
     };
-    let mut out = Vec::new();
+    let mut eps: Vec<ResolvedEndpoint> = Vec::new();
     for ep in rows.into_iter().filter(|e| e.enabled) {
-        let Ok(cfg) = resolve_config(&ep).await else {
-            continue;
-        };
-        if let Ok(data) = Client::new(cfg).array().await {
-            out.extend(crate::disk_health::findings(&ep.name, &data.array));
+        let client = resolve_config(&ep)
+            .await
+            .map(Client::new)
+            .map_err(|e| format!("{e:#}"));
+        eps.push((ep.name, client));
+    }
+    let mut out = check_vm_manager(&eps).await;
+    out.extend(check_disk_health(&eps).await);
+    out
+}
+
+/// Per-device array health from each endpoint's `array` query. An endpoint that
+/// could not be resolved is already reported by `vm-manager`.
+async fn check_disk_health(eps: &[ResolvedEndpoint]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for (name, client) in eps {
+        let Ok(client) = client else { continue };
+        match client.array().await {
+            Ok(data) => out.extend(crate::disk_health::findings(name, &data.array)),
+            Err(e) => out.push(crate::disk_health::query_failed(name, &e.to_string())),
         }
     }
     out
@@ -144,29 +160,24 @@ async fn check_disk_health() -> Vec<Finding> {
 /// - Disabled -> `Info` plus activation instructions. NOT a defect: an operator
 ///   chose this, and a host that is itself a VM often cannot do otherwise.
 /// - Unavailable -> `Warn`. The query genuinely failed and something is wrong.
-async fn check_vm_manager() -> Vec<Finding> {
-    let rows = match endpoint_db::list() {
-        Ok(r) => r.into_iter().filter(|e| e.enabled).collect::<Vec<_>>(),
-        Err(_) => return Vec::new(),
-    };
+async fn check_vm_manager(eps: &[ResolvedEndpoint]) -> Vec<Finding> {
     let mut out = Vec::new();
-    for ep in rows {
-        let cfg = match resolve_config(&ep).await {
-            Ok(cfg) => cfg,
+    for (name, client) in eps {
+        let client = match client {
+            Ok(c) => c,
             Err(e) => {
                 out.push(finding_vm_manager(
-                    &ep.name,
+                    name,
                     crate::vm_manager::VmManager::Unavailable,
-                    Some(&format!("{e:#}")),
+                    Some(e),
                 ));
                 continue;
             }
         };
-        let client = Client::new(cfg);
         let result = client.vms().await;
         let state = crate::vm_manager::classify(&result);
         let err = result.as_ref().err().map(|e| e.to_string());
-        out.push(finding_vm_manager(&ep.name, state, err.as_deref()));
+        out.push(finding_vm_manager(name, state, err.as_deref()));
     }
     out
 }
