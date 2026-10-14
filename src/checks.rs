@@ -110,7 +110,26 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         crate::smb_shares::EXTRA_CONF,
     ))
     .chain(check_vm_manager().await)
+    .chain(check_disk_health().await)
     .collect()
+}
+
+/// Per-device array health from each endpoint's `array` query. An endpoint that
+/// cannot be queried is already reported by `vm-manager`, so it is skipped here.
+async fn check_disk_health() -> Vec<Finding> {
+    let Ok(rows) = endpoint_db::list() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for ep in rows.into_iter().filter(|e| e.enabled) {
+        let Ok(cfg) = resolve_config(&ep).await else {
+            continue;
+        };
+        if let Ok(data) = Client::new(cfg).array().await {
+            out.extend(crate::disk_health::findings(&ep.name, &data.array));
+        }
+    }
+    out
 }
 
 /// Report each endpoint's VM Manager state.
