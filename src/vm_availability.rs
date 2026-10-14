@@ -44,6 +44,7 @@ pub enum VmUnavailableReason {
     VmUnsupportedHost,
     VmManagerDisabled,
     LibvirtNotRunning,
+    VmManagerStateUnknown,
 }
 
 impl VmUnavailableReason {
@@ -52,6 +53,7 @@ impl VmUnavailableReason {
             Self::VmUnsupportedHost => "vm_unsupported_host",
             Self::VmManagerDisabled => "vm_manager_disabled",
             Self::LibvirtNotRunning => "libvirt_not_running",
+            Self::VmManagerStateUnknown => "vm_manager_state_unknown",
         }
     }
 }
@@ -245,6 +247,14 @@ pub(crate) fn assess(
             (Some(VmManager::Enabled), _) => {
                 available("VM Manager is enabled and answering.".to_string())
             }
+            (None, _) if !api.local => VmAvailability {
+                available: false,
+                reason: Some(VmUnavailableReason::VmManagerStateUnknown),
+                detail: "The endpoint's Unraid API answered but did not report VM Manager state."
+                    .to_string(),
+                remediation: None,
+                virtiofsd: false,
+            },
             (_, LibvirtStack::ImageNotMounted) => manager_disabled(),
             (_, s) => daemon_fault(s).unwrap_or_else(manager_disabled),
         }
@@ -457,6 +467,18 @@ pub(crate) mod tests {
         let a = run_with(&remote, &r);
         assert_eq!(a.reason, Some(VmUnavailableReason::VmManagerDisabled));
         assert!(!a.available && !a.virtiofsd);
+    }
+
+    #[test]
+    fn remote_endpoint_without_vm_manager_state_is_unknown_not_disabled() {
+        let remote = ApiView {
+            cpu_flags: Some(vec!["vmx".to_string()]),
+            ..ApiView::default()
+        };
+        let a = run_with(&remote, &fake(VMX, ""));
+        assert_eq!(a.reason, Some(VmUnavailableReason::VmManagerStateUnknown));
+        assert!(!a.available && a.remediation.is_none());
+        assert!(a.detail.contains("did not report VM Manager state"));
     }
 
     #[test]
