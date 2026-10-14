@@ -17,7 +17,6 @@ use quick_xml::{Reader, Writer, XmlVersion};
 
 use crate::authz::require_admin;
 use crate::docker_adopt::privileged::{self, PrivilegedOp};
-use crate::libvirt_stack::{LibvirtStack, probe};
 use crate::schema_pull::sha256_hex;
 use crate::vm_autostart::validate_vm_name;
 use crate::vm_inventory::inventory;
@@ -240,13 +239,11 @@ pub(crate) fn read_redacted_as_root(name: &str) -> Result<String> {
     Ok(plugin_toolkit::serde_json::to_string(&redact(&raw)?)?)
 }
 
-/// Export libvirt VM definitions with checksums. Read-only.
+/// Export this machine's libvirt VM definitions with checksums. Read-only.
 #[orca_tool(domain = "unraid", verb = "vm.xml", role = "admin")]
 async fn unraid_vm_xml(args: UnraidVmXmlArgs, ctx: &ToolCtx) -> Result<VmXmlOutput> {
     require_admin("unraid.vm.xml", ctx.caller().as_ref())?;
-    if probe("/proc", "/var/run/libvirt") == LibvirtStack::ImageNotMounted {
-        bail!("libvirt.img is not mounted at /etc/libvirt: VM Manager is disabled");
-    }
+    crate::vm_availability::require().await?;
     let mut vms = Vec::new();
     for (name, autostart) in select(QEMU_DIR, args.vm.as_deref())? {
         let r = match read_direct(QEMU_DIR, &name)? {

@@ -56,6 +56,7 @@ pub mod topology;
 pub mod ups;
 pub mod version;
 pub mod vm_autostart;
+pub mod vm_availability;
 pub mod vm_inventory;
 pub mod vm_manager;
 pub mod vm_power;
@@ -67,10 +68,10 @@ pub mod zfs_health;
 pub const PROVIDER: &str = "unraid";
 
 use crate::generated::v7_3_1::{
-    AddPlugin, ArrayStatus, ConfigureUps, DockerContainers, InstalledPlugins, ParityHistory,
-    RemovePlugin, Shares, UpsConfiguration, UpsDevices, VarsVersion, Vms, add_plugin, array_status,
-    configure_ups, docker_containers, installed_plugins, parity_history, remove_plugin, shares,
-    ups_configuration, ups_devices, vars_version, vms,
+    AddPlugin, ArrayStatus, ConfigureUps, CpuFlags, DockerContainers, InstalledPlugins,
+    ParityHistory, RemovePlugin, Shares, UpsConfiguration, UpsDevices, VarsVersion, Vms,
+    add_plugin, array_status, configure_ups, cpu_flags, docker_containers, installed_plugins,
+    parity_history, remove_plugin, shares, ups_configuration, ups_devices, vars_version, vms,
 };
 use plugin_toolkit::graphql::{Client as GraphQlClient, GraphQLQuery, GraphQlErrors};
 use plugin_toolkit::tracing;
@@ -280,6 +281,11 @@ impl Client {
         Ok(Self::new_with(cfg, api))
     }
 
+    /// Full GraphQL URL this client queries.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     /// The schema version this client routes through.
     pub fn api_version(&self) -> ApiVersion {
         self.api
@@ -338,6 +344,12 @@ impl Client {
     /// running state is available.
     pub async fn vms(&self) -> Result<vms::ResponseData, UnraidError> {
         self.run::<Vms>(vms::Variables).await
+    }
+
+    /// CPU feature flags (`info.cpu.flags`); `None` when the API reports none.
+    pub async fn cpu_flags(&self) -> Result<Option<Vec<String>>, UnraidError> {
+        let data = self.run::<CpuFlags>(cpu_flags::Variables).await?;
+        Ok(data.info.cpu.flags)
     }
 
     pub async fn add_plugin(

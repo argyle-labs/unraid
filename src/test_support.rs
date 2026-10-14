@@ -1,7 +1,16 @@
 //! Throwaway fake `/proc` (or any) directory tree for unit tests.
 
+use plugin_toolkit::abi::{DbOp, DbReply, DbRow, DbValue, SecretOp, SecretReply};
+use plugin_toolkit::capsink::with_cap_sink;
+use plugin_toolkit::contract::config::{Config as OrcaConfig, Model};
+use plugin_toolkit::prelude::ToolCtx;
+use plugin_toolkit::serde_json;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A temp directory removed on drop. Unique per process and per instance, so
@@ -62,6 +71,114 @@ impl Drop for FakeRoot {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.0).ok();
     }
+}
+
+/// In-memory stand-in for core's `db.op` + `secret.op` capabilities.
+#[derive(Default)]
+pub(crate) struct Store {
+    pub rows: Vec<DbRow>,
+    pub secrets: HashMap<String, String>,
+    pub fail_secret_set: bool,
+}
+
+fn handle(store: &mut Store, cap: &str, json: &str) -> Result<String, String> {
+    match cap {
+        "db.op" => {
+            let op: DbOp = serde_json::from_str(json).map_err(|e| e.to_string())?;
+            let mut reply = DbReply::default();
+            match op {
+                DbOp::List { .. } => reply.rows = store.rows.clone(),
+                DbOp::Insert { row, .. } => {
+                    store.rows.push(row);
+                    reply.affected = 1;
+                }
+                DbOp::Update { key_col, row, .. } => {
+                    if let Some(r) = store
+                        .rows
+                        .iter_mut()
+                        .find(|r| r.get(&key_col) == row.get(&key_col))
+                    {
+                        *r = row;
+                        reply.affected = 1;
+                    }
+                }
+                DbOp::Delete { key_col, key, .. } => {
+                    let before = store.rows.len();
+                    store
+                        .rows
+                        .retain(|r| r.get(&key_col) != Some(&DbValue::Text(key.clone())));
+                    reply.affected = (before - store.rows.len()) as u64;
+                }
+                other => return Err(format!("unexpected db op {}", other.kind())),
+            }
+            serde_json::to_string(&reply).map_err(|e| e.to_string())
+        }
+        "secret.op" => {
+            let op: SecretOp = serde_json::from_str(json).map_err(|e| e.to_string())?;
+            let mut reply = SecretReply::default();
+            match op {
+                SecretOp::Get { name } => reply.value = store.secrets.get(&name).cloned(),
+                SecretOp::Set { .. } if store.fail_secret_set => {
+                    return Err("secret backend unavailable".into());
+                }
+                SecretOp::Set { name, value, .. } => {
+                    store.secrets.insert(name, value);
+                }
+                SecretOp::Exists { name } => reply.found = store.secrets.contains_key(&name),
+                SecretOp::Delete { name } => reply.found = store.secrets.remove(&name).is_some(),
+            }
+            serde_json::to_string(&reply).map_err(|e| e.to_string())
+        }
+        other => Err(format!("unexpected capability {other}")),
+    }
+}
+
+pub(crate) fn with_store<R>(store: &Rc<RefCell<Store>>, body: impl FnOnce() -> R) -> R {
+    let s = store.clone();
+    with_cap_sink(
+        Box::new(move |cap: &str, json: &str| handle(&mut s.borrow_mut(), cap, json)),
+        body,
+    )
+}
+
+/// Runs `body` against an empty in-memory endpoint registry.
+pub(crate) fn isolated<R>(body: impl FnOnce() -> R) -> R {
+    with_store(&Rc::new(RefCell::new(Store::default())), body)
+}
+
+/// Registers endpoint `name` with a single `lan_v4` route to `uri`.
+pub(crate) async fn register(name: &str, uri: &str) {
+    let route = plugin_toolkit::prelude::route::parse_route(&format!("lan_v4={uri}")).unwrap();
+    let args = crate::endpoint::UnraidCreateArgs {
+        name: name.into(),
+        api_key: "k".into(),
+        insecure: false,
+        routes: vec![route],
+    };
+    crate::endpoint::unraid_create(args, &ctx()).await.unwrap();
+}
+
+pub(crate) fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+pub(crate) fn ctx() -> ToolCtx {
+    ToolCtx::new(Arc::new(OrcaConfig {
+        anthropic_api_key: None,
+        lmstudio_url: String::new(),
+        ollama_url: String::new(),
+        default_model: Model::LMStudio {
+            id: String::new(),
+            url: String::new(),
+        },
+        app_dir: PathBuf::from("/tmp"),
+        memory_root: PathBuf::from("/tmp"),
+        db_path: PathBuf::from("/tmp/orca-unraid-endpoint-test.db"),
+        ports: Default::default(),
+    }))
 }
 
 #[cfg(test)]

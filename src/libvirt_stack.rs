@@ -53,28 +53,27 @@ pub(crate) fn probe(proc_root: &str, run_dir: &str) -> LibvirtStack {
 }
 
 pub(crate) fn check(proc_root: &str, run_dir: &str) -> Vec<Finding> {
-    let (sev, title, detail) = match probe(proc_root, run_dir) {
-        LibvirtStack::ImageNotMounted => return Vec::new(),
-        LibvirtStack::Running { pid } => (
+    let stack = probe(proc_root, run_dir);
+    let fault = |title| {
+        let a = crate::vm_availability::daemon_fault(&stack)?;
+        let steps = a
+            .remediation
+            .map(|r| r.steps.join("; "))
+            .unwrap_or_default();
+        Some((Severity::Warn, title, format!("{} Fix: {steps}.", a.detail)))
+    };
+    let row = match &stack {
+        LibvirtStack::ImageNotMounted => None,
+        LibvirtStack::Running { pid } => Some((
             Severity::Ok,
             "libvirt is running",
             format!("/etc/libvirt is mounted and libvirtd (pid {pid}) is running."),
-        ),
-        LibvirtStack::DaemonStopped => (
-            Severity::Warn,
-            "libvirtd is not running",
-            "libvirt.img is mounted at /etc/libvirt but libvirtd has no pid file. Restart it \
-             with `/etc/rc.d/rc.libvirt start` or toggle VM Manager off and on."
-                .to_string(),
-        ),
-        LibvirtStack::StalePid { pid } => (
-            Severity::Warn,
-            "libvirtd exited",
-            format!(
-                "libvirtd.pid names pid {pid}, which is not a running libvirtd: the daemon \
-                 crashed. Check /var/log/libvirt/libvirtd.log, then `/etc/rc.d/rc.libvirt start`."
-            ),
-        ),
+        )),
+        LibvirtStack::DaemonStopped => fault("libvirtd is not running"),
+        LibvirtStack::StalePid { .. } => fault("libvirtd exited"),
+    };
+    let Some((sev, title, detail)) = row else {
+        return Vec::new();
     };
     vec![finding("libvirt-stack", sev, title, detail, None)]
 }
@@ -136,6 +135,6 @@ mod tests {
         r.write("mounts", MOUNTED);
         let w = &check(r.str(), &rd)[0];
         assert_eq!(w.severity, Severity::Warn);
-        assert!(w.detail.contains("rc.libvirt start"));
+        assert!(w.detail.contains("Enable VMs = No") && !w.detail.contains("rc.libvirt"));
     }
 }
