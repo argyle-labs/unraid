@@ -30,6 +30,10 @@ pub struct UnraidVmXmlArgs {
     #[arg(long)]
     #[serde(default)]
     pub vm: Option<String>,
+    /// Registered unraid endpoint; optional when exactly one is registered.
+    #[arg(long)]
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 /// Attributes removed from every element, matched on the local name so
@@ -243,7 +247,7 @@ pub(crate) fn read_redacted_as_root(name: &str) -> Result<String> {
 #[orca_tool(domain = "unraid", verb = "vm.xml", role = "admin")]
 async fn unraid_vm_xml(args: UnraidVmXmlArgs, ctx: &ToolCtx) -> Result<VmXmlOutput> {
     require_admin("unraid.vm.xml", ctx.caller().as_ref())?;
-    crate::vm_availability::require().await?;
+    crate::vm_availability::require(args.endpoint.clone()).await?;
     let mut vms = Vec::new();
     for (name, autostart) in select(QEMU_DIR, args.vm.as_deref())? {
         let r = match read_direct(QEMU_DIR, &name)? {
@@ -441,7 +445,10 @@ mod tests {
     #[test]
     fn requires_admin_in_the_body() {
         for role in [Some("user"), None] {
-            let args = UnraidVmXmlArgs { vm: None };
+            let args = UnraidVmXmlArgs {
+                vm: None,
+                endpoint: None,
+            };
             let ctx = crate::authz::test_ctx(role);
             let e = plugin_toolkit::reactor::block_on(unraid_vm_xml(args, &ctx)).unwrap_err();
             assert!(e.to_string().contains("unraid.vm.xml: "), "{e}");
@@ -449,11 +456,17 @@ mod tests {
     }
 
     #[test]
-    fn refuses_when_vms_are_unavailable() {
-        let args = UnraidVmXmlArgs { vm: None };
+    fn checks_availability_on_the_given_endpoint() {
+        let args = UnraidVmXmlArgs {
+            vm: None,
+            endpoint: Some("no-such-endpoint".into()),
+        };
         let ctx = crate::authz::test_ctx(Some("admin"));
-        crate::vm_availability::tests::assert_refused(plugin_toolkit::reactor::block_on(
-            unraid_vm_xml(args, &ctx),
-        ));
+        let e = plugin_toolkit::reactor::block_on(unraid_vm_xml(args, &ctx)).unwrap_err();
+        assert!(
+            e.downcast_ref::<crate::vm_availability::VmUnavailable>()
+                .is_none(),
+            "{e}"
+        );
     }
 }

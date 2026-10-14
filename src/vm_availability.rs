@@ -4,7 +4,8 @@
 //! CPU virtualization flags and the VM Manager on/off state come from the
 //! Unraid API. The daemon layer beneath an enabled VM Manager has no API, so it
 //! is probed locally (`/etc/libvirt` mount, libvirtd pid file, virtiofsd); the
-//! local probes also stand in for the API when it is unreachable.
+//! local probes also stand in for the API when it is unreachable. An endpoint
+//! that cannot be resolved is an error, not an unreachable API.
 //!
 //! VM verbs refuse with [`VmUnavailable`] when the stack is down, so a caller
 //! gets a reason and steps instead of "failed to connect to the hypervisor".
@@ -242,23 +243,26 @@ pub(crate) fn assess(
     a
 }
 
-async fn api_view() -> ApiView {
-    let Ok(client) = crate::tools::surface_client(None, None, None, None).await else {
-        return ApiView::default();
-    };
+async fn api_view(endpoint: Option<String>) -> Result<ApiView> {
+    let client = crate::tools::surface_client(endpoint, None, None, None).await?;
     let cpu_flags = client.cpu_flags().await.ok().flatten();
     let vm_manager = match classify(&client.vms().await) {
         VmManager::Unavailable => None,
         s => Some(s),
     };
-    ApiView {
+    Ok(ApiView {
         cpu_flags,
         vm_manager,
-    }
+    })
 }
 
-async fn availability() -> VmAvailability {
-    assess(&api_view().await, "/proc", "/var/run/libvirt", VIRTIOFSD)
+async fn availability(endpoint: Option<String>) -> Result<VmAvailability> {
+    Ok(assess(
+        &api_view(endpoint).await?,
+        "/proc",
+        "/var/run/libvirt",
+        VIRTIOFSD,
+    ))
 }
 
 fn gate(a: VmAvailability) -> std::result::Result<(), VmUnavailable> {
@@ -270,21 +274,30 @@ fn gate(a: VmAvailability) -> std::result::Result<(), VmUnavailable> {
 }
 
 /// Refuse with [`VmUnavailable`] when VMs cannot be managed here.
-pub(crate) async fn require() -> Result<()> {
-    Ok(gate(availability().await)?)
+pub(crate) async fn require(endpoint: Option<String>) -> Result<()> {
+    require_with(&api_view(endpoint).await?, "/proc", "/var/run/libvirt")
+}
+
+pub(crate) fn require_with(api: &ApiView, proc_root: &str, run_dir: &str) -> Result<()> {
+    Ok(gate(assess(api, proc_root, run_dir, VIRTIOFSD))?)
 }
 
 #[orca_struct(args)]
 #[serde(rename_all = "camelCase")]
-pub struct UnraidVmAvailabilityArgs {}
+pub struct UnraidVmAvailabilityArgs {
+    /// Registered unraid endpoint; optional when exactly one is registered.
+    #[arg(long)]
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
 
 /// Report whether this host can run VMs, with remediation when it cannot.
 #[orca_tool(domain = "unraid", verb = "vm.availability")]
 async fn unraid_vm_availability(
-    _args: UnraidVmAvailabilityArgs,
+    args: UnraidVmAvailabilityArgs,
     _ctx: &ToolCtx,
 ) -> Result<VmAvailability> {
-    Ok(availability().await)
+    availability(args.endpoint).await
 }
 
 #[cfg(test)]
@@ -434,23 +447,26 @@ pub(crate) mod tests {
         assert!(gate(ok).is_ok());
     }
 
-    /// Test hosts have no API endpoint and, unless libvirt runs here, no
-    /// `/etc/libvirt` mount, so `require` must refuse with [`VmUnavailable`].
-    pub(crate) fn assert_refused<T>(r: Result<T>) {
-        if matches!(
-            probe("/proc", "/var/run/libvirt"),
-            LibvirtStack::Running { .. }
-        ) {
-            return;
-        }
-        let Err(e) = r else {
-            panic!("expected a VmUnavailable refusal");
-        };
-        assert!(e.downcast_ref::<VmUnavailable>().is_some(), "{e}");
+    #[test]
+    fn require_with_refuses_when_unavailable() {
+        let r = fake(VMX, "");
+        let e =
+            require_with(&ApiView::default(), r.str(), &format!("{}/run", r.str())).unwrap_err();
+        let u = e.downcast_ref::<VmUnavailable>().expect("VmUnavailable");
+        assert_eq!(u.0.reason, Some(VmUnavailableReason::VmManagerDisabled));
     }
 
     #[test]
-    fn require_refuses_when_unavailable() {
-        assert_refused(plugin_toolkit::reactor::block_on(require()));
+    fn require_with_passes_when_the_api_reports_enabled() {
+        let r = fake(VMX, "");
+        let api = api(&["vmx"], Some(VmManager::Enabled));
+        assert!(require_with(&api, r.str(), &format!("{}/run", r.str())).is_ok());
+    }
+
+    #[test]
+    fn require_returns_the_endpoint_resolution_error() {
+        let e = plugin_toolkit::reactor::block_on(require(Some("no-such-endpoint".into())))
+            .unwrap_err();
+        assert!(e.downcast_ref::<VmUnavailable>().is_none(), "{e}");
     }
 }

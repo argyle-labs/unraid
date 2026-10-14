@@ -116,6 +116,10 @@ pub struct UnraidVmAutostartArgs {
     /// Desired autostart state.
     #[arg(long)]
     pub enabled: bool,
+    /// Registered unraid endpoint; optional when exactly one is registered.
+    #[arg(long)]
+    #[serde(default)]
+    pub endpoint: Option<String>,
     /// Apply the change. Without it the call only reports what it would do.
     #[arg(long, default_value_t = false)]
     #[serde(default)]
@@ -149,7 +153,7 @@ async fn unraid_vm_autostart(
     ctx: &ToolCtx,
 ) -> Result<VmAutostartOutput> {
     require_admin("unraid.vm.autostart", ctx.caller().as_ref())?;
-    crate::vm_availability::require().await?;
+    crate::vm_availability::require(args.endpoint.clone()).await?;
     let change = plan(&run_virsh, &args.vm, args.enabled).await?;
     if args.execute && change != Change::NoOp {
         let runner =
@@ -312,6 +316,7 @@ mod tests {
             let args = UnraidVmAutostartArgs {
                 vm: "pbs".into(),
                 enabled: true,
+                endpoint: None,
                 execute: false,
             };
             let ctx = crate::authz::test_ctx(role);
@@ -321,15 +326,19 @@ mod tests {
     }
 
     #[test]
-    fn refuses_when_vms_are_unavailable() {
+    fn checks_availability_on_the_given_endpoint() {
         let args = UnraidVmAutostartArgs {
             vm: "pbs".into(),
             enabled: true,
+            endpoint: Some("no-such-endpoint".into()),
             execute: false,
         };
         let ctx = crate::authz::test_ctx(Some("admin"));
-        crate::vm_availability::tests::assert_refused(plugin_toolkit::reactor::block_on(
-            unraid_vm_autostart(args, &ctx),
-        ));
+        let e = plugin_toolkit::reactor::block_on(unraid_vm_autostart(args, &ctx)).unwrap_err();
+        assert!(
+            e.downcast_ref::<crate::vm_availability::VmUnavailable>()
+                .is_none(),
+            "{e}"
+        );
     }
 }
