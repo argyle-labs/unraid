@@ -3,11 +3,12 @@
 //!
 //! CPU virtualization flags and the VM Manager on/off state come from the
 //! Unraid API. The daemon layer beneath an enabled VM Manager has no API, so it
-//! is probed locally (`/etc/libvirt` mount, libvirtd pid file, virtiofsd); the
-//! local probes also stand in for the API when it is unreachable, but only when
-//! no endpoint is registered or the auto-picked endpoint is loopback: probing
-//! this box for a remote host would answer for the wrong machine. An endpoint
-//! that cannot be resolved is an error, not an unreachable API.
+//! is probed locally (`/etc/libvirt` mount, libvirtd pid file, virtiofsd). Local
+//! probes, including the `/proc/cpuinfo` fallback, run only when no endpoint is
+//! registered or the auto-picked endpoint is loopback; a remote endpoint is
+//! answered from its API alone, since probing this box would describe the
+//! wrong machine. An endpoint that cannot be resolved is an error, not an
+//! unreachable API.
 //!
 //! VM verbs refuse with [`VmUnavailable`] when the stack is down, so a caller
 //! gets a reason and steps instead of "failed to connect to the hypervisor".
@@ -119,6 +120,8 @@ pub(crate) struct ApiView {
     pub cpu_flags: Option<Vec<String>>,
     /// `Enabled`/`Disabled` only; an unanswerable query is `None`.
     pub vm_manager: Option<VmManager>,
+    /// The endpoint is this machine, so local probes describe it.
+    pub local: bool,
 }
 
 fn has_virt_flag<'a>(mut flags: impl Iterator<Item = &'a str>) -> bool {
@@ -212,9 +215,14 @@ pub(crate) fn assess(
 ) -> VmAvailability {
     let virt = match &api.cpu_flags {
         Some(flags) => Some(has_virt_flag(flags.iter().map(String::as_str))),
-        None => local_virt_support(proc_root),
+        None if api.local => local_virt_support(proc_root),
+        None => None,
     };
-    let stack = probe(proc_root, run_dir);
+    let stack = if api.local {
+        probe(proc_root, run_dir)
+    } else {
+        LibvirtStack::ImageNotMounted
+    };
     let mut a = if virt == Some(false) {
         unavailable(
             VmUnavailableReason::VmUnsupportedHost,
@@ -241,13 +249,13 @@ pub(crate) fn assess(
             (_, s) => daemon_fault(s).unwrap_or_else(manager_disabled),
         }
     };
-    a.virtiofsd = Path::new(virtiofsd).exists();
+    a.virtiofsd = api.local && Path::new(virtiofsd).exists();
     a
 }
 
 async fn api_view(endpoint: Option<String>) -> Result<ApiView> {
     if endpoint.is_none() && crate::endpoint::endpoint_db::list()?.is_empty() {
-        return Ok(ApiView::default());
+        return Ok(local_view());
     }
     let explicit = endpoint.is_some();
     let client = crate::tools::surface_client(endpoint, None, None, None).await?;
@@ -271,15 +279,25 @@ async fn api_view_from(client: &crate::Client, local: bool) -> Result<ApiView> {
     Ok(ApiView {
         cpu_flags,
         vm_manager,
+        local,
     })
 }
 
 async fn availability(endpoint: Option<String>) -> Result<VmAvailability> {
+    availability_at(endpoint, "/proc", "/var/run/libvirt", VIRTIOFSD).await
+}
+
+async fn availability_at(
+    endpoint: Option<String>,
+    proc_root: &str,
+    run_dir: &str,
+    virtiofsd: &str,
+) -> Result<VmAvailability> {
     Ok(assess(
         &api_view(endpoint).await?,
-        "/proc",
-        "/var/run/libvirt",
-        VIRTIOFSD,
+        proc_root,
+        run_dir,
+        virtiofsd,
     ))
 }
 
@@ -291,9 +309,17 @@ fn gate(a: VmAvailability) -> std::result::Result<(), VmUnavailable> {
     }
 }
 
-/// Refuse with [`VmUnavailable`] when VMs cannot be managed here.
-pub(crate) async fn require(endpoint: Option<String>) -> Result<()> {
-    require_with(&api_view(endpoint).await?, "/proc", "/var/run/libvirt")
+/// Refuse with [`VmUnavailable`] unless this machine's libvirt can be driven;
+/// callers act through local virsh and files, so only local probes decide.
+pub(crate) async fn require() -> Result<()> {
+    require_with(&local_view(), "/proc", "/var/run/libvirt")
+}
+
+fn local_view() -> ApiView {
+    ApiView {
+        local: true,
+        ..ApiView::default()
+    }
 }
 
 pub(crate) fn require_with(api: &ApiView, proc_root: &str, run_dir: &str) -> Result<()> {
@@ -337,13 +363,14 @@ pub(crate) mod tests {
     }
 
     fn run(r: &FakeRoot) -> VmAvailability {
-        run_with(&ApiView::default(), r)
+        run_with(&local_view(), r)
     }
 
     fn api(flags: &[&str], vm_manager: Option<VmManager>) -> ApiView {
         ApiView {
             cpu_flags: Some(flags.iter().map(|s| s.to_string()).collect()),
             vm_manager,
+            local: true,
         }
     }
 
@@ -418,6 +445,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remote_endpoint_ignores_this_machines_libvirt_and_cpuinfo() {
+        let r = fake("flags\t: fpu sse\n", MOUNTED);
+        r.write("run/libvirtd.pid", "77\n")
+            .proc(77, "libvirtd", 'S', 0, &[]);
+        r.write("virtiofsd", "");
+        let remote = ApiView {
+            vm_manager: Some(VmManager::Disabled),
+            ..ApiView::default()
+        };
+        let a = run_with(&remote, &r);
+        assert_eq!(a.reason, Some(VmUnavailableReason::VmManagerDisabled));
+        assert!(!a.available && !a.virtiofsd);
+    }
+
+    #[test]
     fn api_enabled_is_available_without_local_daemon_evidence() {
         let a = run_with(&api(&["vmx"], Some(VmManager::Enabled)), &fake(VMX, ""));
         assert!(a.available);
@@ -468,8 +510,7 @@ pub(crate) mod tests {
     #[test]
     fn require_with_refuses_when_unavailable() {
         let r = fake(VMX, "");
-        let e =
-            require_with(&ApiView::default(), r.str(), &format!("{}/run", r.str())).unwrap_err();
+        let e = require_with(&local_view(), r.str(), &format!("{}/run", r.str())).unwrap_err();
         let u = e.downcast_ref::<VmUnavailable>().expect("VmUnavailable");
         assert_eq!(u.0.reason, Some(VmUnavailableReason::VmManagerDisabled));
     }
@@ -482,9 +523,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn require_returns_the_endpoint_resolution_error() {
-        let e = crate::endpoint::tests::isolated(|| {
-            plugin_toolkit::reactor::block_on(require(Some("no-such-endpoint".into())))
+    fn availability_returns_the_endpoint_resolution_error() {
+        let e = crate::test_support::isolated(|| {
+            plugin_toolkit::reactor::block_on(availability(Some("no-such-endpoint".into())))
         })
         .unwrap_err();
         assert!(
@@ -495,9 +536,9 @@ pub(crate) mod tests {
     }
 
     /// Registers `tower-a` against a mock that fails every query, then runs
-    /// `require` on it; returns the error and how many requests the mock saw.
-    fn require_on_failing_endpoint() -> (plugin_toolkit::anyhow::Error, usize) {
-        use crate::endpoint::tests::{isolated, register, rt};
+    /// `availability` on it; returns the error and how many requests the mock saw.
+    fn availability_on_failing_endpoint() -> (plugin_toolkit::anyhow::Error, usize) {
+        use crate::test_support::{isolated, register, rt};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let rt = rt();
         let server = rt.block_on(async {
@@ -511,7 +552,7 @@ pub(crate) mod tests {
         let e = isolated(|| {
             rt.block_on(async {
                 register("tower-a", &server.uri()).await;
-                require(Some("tower-a".into())).await.unwrap_err()
+                availability(Some("tower-a".into())).await.unwrap_err()
             })
         });
         let seen = rt
@@ -521,21 +562,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn require_resolves_the_named_endpoint() {
-        let (_, seen) = require_on_failing_endpoint();
+    fn availability_resolves_the_named_endpoint() {
+        let (_, seen) = availability_on_failing_endpoint();
         assert!(seen > 0, "the registered endpoint was never queried");
     }
 
     #[test]
     fn named_endpoint_query_failure_is_returned_not_probed_locally() {
-        let (e, _) = require_on_failing_endpoint();
+        let (e, _) = availability_on_failing_endpoint();
         assert!(e.downcast_ref::<VmUnavailable>().is_none(), "{e}");
     }
 
     #[test]
     fn remote_endpoint_query_failure_is_returned_not_probed_locally() {
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        let rt = crate::endpoint::tests::rt();
+        let rt = crate::test_support::rt();
         let e = rt.block_on(async {
             let server = MockServer::start().await;
             Mock::given(wiremock::matchers::method("POST"))
@@ -559,9 +600,20 @@ pub(crate) mod tests {
 
     #[test]
     fn no_endpoint_registered_probes_locally() {
-        let a = crate::endpoint::tests::isolated(|| {
-            plugin_toolkit::reactor::block_on(availability(None))
-        });
-        assert!(a.is_ok(), "{a:?}");
+        let r = fake(VMX, MOUNTED);
+        r.write("run/libvirtd.pid", "77\n")
+            .proc(77, "libvirtd", 'S', 0, &[]);
+        let root = r.str();
+        let a = crate::test_support::isolated(|| {
+            plugin_toolkit::reactor::block_on(availability_at(
+                None,
+                root,
+                &format!("{root}/run"),
+                &format!("{root}/virtiofsd"),
+            ))
+        })
+        .unwrap();
+        assert!(a.available, "{a:?}");
+        assert_eq!(a.detail, "libvirtd (pid 77) is running.");
     }
 }

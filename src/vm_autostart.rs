@@ -116,10 +116,6 @@ pub struct UnraidVmAutostartArgs {
     /// Desired autostart state.
     #[arg(long)]
     pub enabled: bool,
-    /// Registered unraid endpoint; optional when exactly one is registered.
-    #[arg(long)]
-    #[serde(default)]
-    pub endpoint: Option<String>,
     /// Apply the change. Without it the call only reports what it would do.
     #[arg(long, default_value_t = false)]
     #[serde(default)]
@@ -139,8 +135,8 @@ pub struct VmAutostartOutput {
     pub executed: bool,
 }
 
-/// Set a VM's autostart flag. Dry-run unless `execute: true`; admin is
-/// required for both.
+/// Set a VM's autostart flag on this machine (local virsh). Dry-run unless
+/// `execute: true`; admin is required for both.
 #[orca_tool(
     domain = "unraid",
     verb = "vm.autostart",
@@ -153,7 +149,7 @@ async fn unraid_vm_autostart(
     ctx: &ToolCtx,
 ) -> Result<VmAutostartOutput> {
     require_admin("unraid.vm.autostart", ctx.caller().as_ref())?;
-    crate::vm_availability::require(args.endpoint.clone()).await?;
+    crate::vm_availability::require().await?;
     let change = plan(&run_virsh, &args.vm, args.enabled).await?;
     if args.execute && change != Change::NoOp {
         let runner =
@@ -316,32 +312,11 @@ mod tests {
             let args = UnraidVmAutostartArgs {
                 vm: "pbs".into(),
                 enabled: true,
-                endpoint: None,
                 execute: false,
             };
             let ctx = crate::authz::test_ctx(role);
             let e = block(unraid_vm_autostart(args, &ctx)).unwrap_err();
             assert!(e.to_string().contains("unraid.vm.autostart: "), "{e}");
         }
-    }
-
-    #[test]
-    fn checks_availability_on_the_given_endpoint() {
-        let args = UnraidVmAutostartArgs {
-            vm: "pbs".into(),
-            enabled: true,
-            endpoint: Some("no-such-endpoint".into()),
-            execute: false,
-        };
-        let ctx = crate::authz::test_ctx(Some("admin"));
-        let e = crate::endpoint::tests::isolated(|| {
-            plugin_toolkit::reactor::block_on(unraid_vm_autostart(args, &ctx))
-        })
-        .unwrap_err();
-        assert!(
-            e.to_string()
-                .contains("no unraid endpoint named `no-such-endpoint`"),
-            "{e}"
-        );
     }
 }
