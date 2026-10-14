@@ -304,7 +304,7 @@ async fn unraid_delete(args: UnraidDeleteArgs, _ctx: &ToolCtx) -> Result<UnraidD
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::Client;
     use plugin_toolkit::abi::{DbOp, DbReply, DbRow, DbValue, SecretOp, SecretReply};
@@ -321,7 +321,7 @@ mod tests {
 
     /// In-memory stand-in for core's `db.op` + `secret.op` capabilities.
     #[derive(Default)]
-    struct Store {
+    pub(crate) struct Store {
         rows: Vec<DbRow>,
         secrets: HashMap<String, String>,
         fail_secret_set: bool,
@@ -381,7 +381,7 @@ mod tests {
         }
     }
 
-    fn with_store<R>(store: &Rc<RefCell<Store>>, body: impl FnOnce() -> R) -> R {
+    pub(crate) fn with_store<R>(store: &Rc<RefCell<Store>>, body: impl FnOnce() -> R) -> R {
         let s = store.clone();
         with_cap_sink(
             Box::new(move |cap: &str, json: &str| handle(&mut s.borrow_mut(), cap, json)),
@@ -389,7 +389,20 @@ mod tests {
         )
     }
 
-    fn rt() -> tokio::runtime::Runtime {
+    /// Runs `body` against an empty in-memory endpoint registry.
+    pub(crate) fn isolated<R>(body: impl FnOnce() -> R) -> R {
+        with_store(&Rc::new(RefCell::new(Store::default())), body)
+    }
+
+    /// Registers endpoint `name` with a single `lan_v4` route to `uri`.
+    pub(crate) async fn register(name: &str, uri: &str) {
+        let route = route::parse_route(&format!("lan_v4={uri}")).unwrap();
+        unraid_create(create_args(name, "k", vec![route]), &ctx())
+            .await
+            .unwrap();
+    }
+
+    pub(crate) fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

@@ -334,10 +334,13 @@ mod tests {
             execute: false,
         };
         let ctx = crate::authz::test_ctx(Some("admin"));
-        let e = plugin_toolkit::reactor::block_on(unraid_vm_autostart(args, &ctx)).unwrap_err();
+        let e = crate::endpoint::tests::isolated(|| {
+            plugin_toolkit::reactor::block_on(unraid_vm_autostart(args, &ctx))
+        })
+        .unwrap_err();
         assert!(
-            e.downcast_ref::<crate::vm_availability::VmUnavailable>()
-                .is_none(),
+            e.to_string()
+                .contains("no unraid endpoint named `no-such-endpoint`"),
             "{e}"
         );
     }

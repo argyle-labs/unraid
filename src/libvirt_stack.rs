@@ -54,28 +54,26 @@ pub(crate) fn probe(proc_root: &str, run_dir: &str) -> LibvirtStack {
 
 pub(crate) fn check(proc_root: &str, run_dir: &str) -> Vec<Finding> {
     let stack = probe(proc_root, run_dir);
-    let (sev, title, detail) = match &stack {
-        LibvirtStack::ImageNotMounted => return Vec::new(),
-        LibvirtStack::Running { pid } => (
+    let fault = |title| {
+        let a = crate::vm_availability::daemon_fault(&stack)?;
+        let steps = a
+            .remediation
+            .map(|r| r.steps.join("; "))
+            .unwrap_or_default();
+        Some((Severity::Warn, title, format!("{} Fix: {steps}.", a.detail)))
+    };
+    let row = match &stack {
+        LibvirtStack::ImageNotMounted => None,
+        LibvirtStack::Running { pid } => Some((
             Severity::Ok,
             "libvirt is running",
             format!("/etc/libvirt is mounted and libvirtd (pid {pid}) is running."),
-        ),
-        LibvirtStack::DaemonStopped | LibvirtStack::StalePid { .. } => {
-            let Some(a) = crate::vm_availability::daemon_fault(&stack) else {
-                return Vec::new();
-            };
-            let title = if matches!(stack, LibvirtStack::StalePid { .. }) {
-                "libvirtd exited"
-            } else {
-                "libvirtd is not running"
-            };
-            let steps = a
-                .remediation
-                .map(|r| r.steps.join("; "))
-                .unwrap_or_default();
-            (Severity::Warn, title, format!("{} Fix: {steps}.", a.detail))
-        }
+        )),
+        LibvirtStack::DaemonStopped => fault("libvirtd is not running"),
+        LibvirtStack::StalePid { .. } => fault("libvirtd exited"),
+    };
+    let Some((sev, title, detail)) = row else {
+        return Vec::new();
     };
     vec![finding("libvirt-stack", sev, title, detail, None)]
 }

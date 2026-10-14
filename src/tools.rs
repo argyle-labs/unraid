@@ -14,13 +14,6 @@ use plugin_toolkit::prelude::*;
 use crate::endpoint::{self, endpoint_db};
 use crate::{Client, Config, schema_pull};
 
-/// Resolve a [`Client`] for an auto-generated surface tool (`crate::surface`).
-///
-/// Connection selection, in order: an explicit `from` + `api_key` override wins
-/// (paired with optional `insecure`); otherwise the named endpoint from the
-/// registry (`unraid.{list,create,...}`); otherwise, when `endpoint` is omitted
-/// and exactly one endpoint is registered, that sole endpoint. Anything else is
-/// an error naming the fix.
 /// [`Config`] for an explicit `from` override; carries this host's CSRF token
 /// only when `from` is loopback.
 fn from_config(from: &str, api_key: impl Into<String>, insecure: bool) -> Result<Config> {
@@ -32,6 +25,13 @@ fn from_config(from: &str, api_key: impl Into<String>, insecure: bool) -> Result
         .csrf_token(endpoint::local_csrf(from)))
 }
 
+/// Resolve a [`Client`] for an auto-generated surface tool (`crate::surface`).
+///
+/// Connection selection, in order: an explicit `from` + `api_key` override wins
+/// (paired with optional `insecure`); otherwise the named endpoint from the
+/// registry (`unraid.{list,create,...}`); otherwise, when `endpoint` is omitted
+/// and exactly one endpoint is registered, that sole endpoint. Anything else is
+/// an error naming the fix.
 pub(crate) async fn surface_client(
     endpoint: Option<String>,
     from: Option<String>,

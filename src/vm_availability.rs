@@ -244,11 +244,18 @@ pub(crate) fn assess(
 }
 
 async fn api_view(endpoint: Option<String>) -> Result<ApiView> {
+    let explicit = endpoint.is_some();
     let client = crate::tools::surface_client(endpoint, None, None, None).await?;
-    let cpu_flags = client.cpu_flags().await.ok().flatten();
-    let vm_manager = match classify(&client.vms().await) {
-        VmManager::Unavailable => None,
-        s => Some(s),
+    let cpu_flags = match client.cpu_flags().await {
+        Ok(flags) => flags,
+        Err(e) if explicit => return Err(e.into()),
+        Err(_) => None,
+    };
+    let vms = client.vms().await;
+    let vm_manager = match (classify(&vms), vms) {
+        (VmManager::Unavailable, Err(e)) if explicit => return Err(e.into()),
+        (VmManager::Unavailable, _) => None,
+        (s, _) => Some(s),
     };
     Ok(ApiView {
         cpu_flags,
@@ -465,8 +472,52 @@ pub(crate) mod tests {
 
     #[test]
     fn require_returns_the_endpoint_resolution_error() {
-        let e = plugin_toolkit::reactor::block_on(require(Some("no-such-endpoint".into())))
-            .unwrap_err();
+        let e = crate::endpoint::tests::isolated(|| {
+            plugin_toolkit::reactor::block_on(require(Some("no-such-endpoint".into())))
+        })
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("no unraid endpoint named `no-such-endpoint`"),
+            "{e}"
+        );
+    }
+
+    /// Registers `tower-a` against a mock that fails every query, then runs
+    /// `require` on it; returns the error and how many requests the mock saw.
+    fn require_on_failing_endpoint() -> (plugin_toolkit::anyhow::Error, usize) {
+        use crate::endpoint::tests::{isolated, register, rt};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let rt = rt();
+        let server = rt.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            server
+        });
+        let e = isolated(|| {
+            rt.block_on(async {
+                register("tower-a", &server.uri()).await;
+                require(Some("tower-a".into())).await.unwrap_err()
+            })
+        });
+        let seen = rt
+            .block_on(server.received_requests())
+            .map_or(0, |r| r.len());
+        (e, seen)
+    }
+
+    #[test]
+    fn require_resolves_the_named_endpoint() {
+        let (_, seen) = require_on_failing_endpoint();
+        assert!(seen > 0, "the registered endpoint was never queried");
+    }
+
+    #[test]
+    fn named_endpoint_query_failure_is_returned_not_probed_locally() {
+        let (e, _) = require_on_failing_endpoint();
         assert!(e.downcast_ref::<VmUnavailable>().is_none(), "{e}");
     }
 }
