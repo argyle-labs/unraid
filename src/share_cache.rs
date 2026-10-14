@@ -3,15 +3,20 @@
 //!
 //! The GraphQL `Share` type carries only a `cache` boolean and `floor`, with no
 //! cache mode or pool, and the API has no share mutation. Reads therefore come
-//! from emhttp's world-readable `shares.ini` (the settings emhttp loaded), and
-//! writes edit the root-only `/boot/config/shares/<name>.cfg` as
-//! [`PrivilegedOp::SetShareCache`], which re-validates everything.
+//! from emhttp's world-readable `shares.ini` (the settings emhttp loaded).
+//! Writes go through emhttp itself, as [`PrivilegedOp::SetShareCache`]: the
+//! same `cmdEditShare` request the web UI's Share settings page sends to
+//! `/update.htm`, over emhttpd's local socket the way Unraid's `emcmd` does.
+//! emhttp then writes the share cfg and applies it live. Editing the cfg file
+//! directly instead would be overwritten by emhttp's in-memory copy on its
+//! next share save.
 //!
-//! emhttp applies a share cfg when it loads it (array start, or a share edit in
-//! the web UI), so a write persists immediately but takes effect on the next
-//! load; the output says so rather than claiming a live change.
+//! `cmdEditShare` sets every share field it is given, so the request carries
+//! the share's current values from `shares.ini` with only the changed ones
+//! replaced; the result is read back from `shares.ini` to verify.
 //!
-//! Dry-run by default, admin required for both (see [`crate::authz`]).
+//! Executes by default; `dryRun: true` only reports. Admin is required for
+//! both (see [`crate::authz`]).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,14 +25,27 @@ use plugin_toolkit::prelude::*;
 
 use crate::authz::require_admin;
 use crate::docker_adopt::privileged::{self, PrivilegedOp};
-use crate::docker_adopt::safefs;
-use crate::exports::UnraidExports;
 use crate::smb_share_write::validate_share_name;
 
 /// emhttp's per-share state, one `["name"]` section per user share.
 pub(crate) const SHARES_INI: &str = "/var/local/emhttp/shares.ini";
 const USE_CACHE_MODES: &[&str] = &["no", "yes", "only", "prefer"];
-const PENDING: &str = "persisted; emhttp applies it on the next array start or share edit";
+const VAR_INI: &str = "/var/local/emhttp/var.ini";
+const EMHTTPD_SOCKET: &str = "/var/run/emhttpd.socket";
+/// The Share settings form's fields, paired with their `shares.ini` keys.
+const EDIT_FIELDS: &[(&str, &str)] = &[
+    ("shareName", "name"),
+    ("shareNameOrig", "name"),
+    ("shareComment", "comment"),
+    ("shareAllocator", "allocator"),
+    ("shareFloor", "floor"),
+    ("shareSplitLevel", "splitLevel"),
+    ("shareInclude", "include"),
+    ("shareExclude", "exclude"),
+    ("shareUseCache", "useCache"),
+    ("shareCachePool", "cachePool"),
+    ("shareCachePool2", "cachePool2"),
+];
 
 #[orca_struct]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,32 +59,40 @@ pub struct ShareCache {
     pub floor: String,
 }
 
-/// Parse `shares.ini`: `["name"]` headers, then `key="value"` lines.
-pub(crate) fn parse_shares_ini(text: &str) -> Vec<ShareCache> {
-    let mut out: Vec<ShareCache> = Vec::new();
-    let mut cur: Option<(String, BTreeMap<String, String>)> = None;
-    let mut flush = |cur: Option<(String, BTreeMap<String, String>)>| {
-        if let Some((share, kv)) = cur {
-            let get = |k: &str| kv.get(k).cloned().unwrap_or_default();
-            out.push(ShareCache {
-                share,
-                use_cache: get("useCache"),
-                cache_pool: get("cachePool"),
-                floor: get("floor"),
-            });
-        }
-    };
+type Sections = Vec<(String, BTreeMap<String, String>)>;
+
+/// Parse an emhttp ini: optional `["name"]` headers, then `key="value"` lines.
+/// Keys before any header land in a section named "".
+fn parse_ini(text: &str) -> Sections {
+    let mut out: Sections = vec![(String::new(), BTreeMap::new())];
     for line in text.lines() {
         let t = line.trim();
         if let Some(name) = t.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
-            flush(cur.take());
-            cur = Some((name.trim_matches('"').to_string(), BTreeMap::new()));
-        } else if let (Some((_, kv)), Some((k, v))) = (cur.as_mut(), t.split_once('=')) {
+            out.push((name.trim_matches('"').to_string(), BTreeMap::new()));
+        } else if let Some((k, v)) = t.split_once('=') {
+            let kv = &mut out.last_mut().expect("non-empty").1;
             kv.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
         }
     }
-    flush(cur);
     out
+}
+
+fn to_share(share: &str, kv: &BTreeMap<String, String>) -> ShareCache {
+    let get = |k: &str| kv.get(k).cloned().unwrap_or_default();
+    ShareCache {
+        share: share.to_string(),
+        use_cache: get("useCache"),
+        cache_pool: get("cachePool"),
+        floor: get("floor"),
+    }
+}
+
+pub(crate) fn parse_shares_ini(text: &str) -> Vec<ShareCache> {
+    parse_ini(text)
+        .iter()
+        .skip(1)
+        .map(|(s, kv)| to_share(s, kv))
+        .collect()
 }
 
 fn read_shares(ini: &Path) -> Result<Vec<ShareCache>> {
@@ -142,25 +168,104 @@ impl ShareCacheRequest {
     }
 }
 
-/// Apply `req` to the share cfg at `cfg`, keeping every other key and the
-/// file's mode. Returns the keys written.
-pub(crate) fn apply_in(cfg: &Path, req: &ShareCacheRequest) -> Result<String> {
-    use std::os::unix::fs::PermissionsExt;
-    let old = safefs::read_file(cfg)?
-        .ok_or_else(|| anyhow!("share '{}' has no config at {}", req.share, cfg.display()))?;
+fn urlencode(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// The `/update.htm` query for `req`: every form field at its current value,
+/// the requested ones replaced.
+fn edit_query(current: &BTreeMap<String, String>, req: &ShareCacheRequest, csrf: &str) -> String {
     let updates = req.cfg_updates();
-    let new = UnraidExports::write_cfg_keys(&String::from_utf8_lossy(&old), &updates);
-    let mode = std::fs::symlink_metadata(cfg)
-        .map_err(|e| anyhow!("stat {}: {e}", cfg.display()))?
-        .permissions()
-        .mode()
-        & 0o7777;
-    safefs::replace_file(cfg, new.as_bytes(), mode)?;
-    Ok(updates
+    let mut q: Vec<String> = EDIT_FIELDS
+        .iter()
+        .map(|(field, key)| {
+            let v = updates
+                .iter()
+                .find(|(f, _)| f == field)
+                .map(|(_, v)| v.clone())
+                .or_else(|| current.get(*key).cloned())
+                .unwrap_or_default();
+            format!("{field}={}", urlencode(&v))
+        })
+        .collect();
+    q.push("cmdEditShare=Apply".into());
+    q.push(format!("csrf_token={}", urlencode(csrf)));
+    q.join("&")
+}
+
+/// Send one GET to emhttpd's unix socket, as `emcmd` does with curl.
+fn emhttp_get(socket: &Path, query: &str) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|e| anyhow!("connect {}: {e}", socket.display()))?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    write!(
+        s,
+        "GET /update.htm?{query} HTTP/1.0\r\nHost: localhost\r\n\r\n"
+    )?;
+    let mut resp = String::new();
+    s.read_to_string(&mut resp)?;
+    let status = resp.lines().next().unwrap_or_default();
+    if status.split_whitespace().nth(1) != Some("200") {
+        bail!("emhttp update.htm: {status:?}");
+    }
+    Ok(())
+}
+
+/// Apply `req` through emhttp, then confirm it in `shares.ini`. Returns the
+/// fields changed.
+pub(crate) fn apply_in(
+    ini: &Path,
+    var_ini: &Path,
+    socket: &Path,
+    req: &ShareCacheRequest,
+) -> Result<String> {
+    let read =
+        |p: &Path| std::fs::read_to_string(p).map_err(|e| anyhow!("read {}: {e}", p.display()));
+    let sections = parse_ini(&read(ini)?);
+    let current = sections
+        .iter()
+        .skip(1)
+        .find(|(s, _)| *s == req.share)
+        .map(|(_, kv)| kv)
+        .ok_or_else(|| anyhow!("no share '{}' in {}", req.share, ini.display()))?;
+    let csrf = parse_ini(&read(var_ini)?)
+        .into_iter()
+        .find_map(|(_, kv)| kv.get("csrf_token").cloned())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| anyhow!("no csrf_token in {}", var_ini.display()))?;
+    emhttp_get(socket, &edit_query(current, req, &csrf))?;
+
+    let after = list_in(ini, Some(&req.share))?.remove(0);
+    let want = |v: &Option<String>, got: &str| v.as_deref().is_none_or(|v| v == got);
+    if !want(&req.use_cache, &after.use_cache)
+        || !want(&req.cache_pool, &after.cache_pool)
+        || !want(&req.floor_kib.map(|f| f.to_string()), &after.floor)
+    {
+        bail!("emhttp did not apply the change; shares.ini now has {after:?}");
+    }
+    Ok(req
+        .cfg_updates()
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("; "))
+}
+
+pub(crate) fn apply(req: &ShareCacheRequest) -> Result<String> {
+    apply_in(
+        Path::new(SHARES_INI),
+        Path::new(VAR_INI),
+        Path::new(EMHTTPD_SOCKET),
+        req,
+    )
 }
 
 #[orca_struct(args)]
@@ -222,10 +327,10 @@ pub struct UnraidShareCacheSetArgs {
     #[arg(long)]
     #[serde(default)]
     pub floor_kib: Option<u64>,
-    /// Apply the change. Without it the call only reports what it would do.
+    /// Only report what would change.
     #[arg(long, default_value_t = false)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 #[orca_struct]
@@ -234,12 +339,10 @@ pub struct UnraidShareCacheSetArgs {
 pub struct ShareCacheSetOutput {
     /// The share's settings as emhttp currently has them.
     pub current: ShareCache,
-    /// The cfg keys written (or that would be).
+    /// The fields set (or that would be).
     pub changes: Vec<String>,
-    /// The root side's report; empty for a dry run.
+    /// The root side's report, verified against `shares.ini`; empty for a dry run.
     pub applied: String,
-    /// When the change takes effect.
-    pub effective: String,
     pub executed: bool,
 }
 
@@ -275,8 +378,8 @@ pub(crate) fn plan_in(
     Ok((current, req, op))
 }
 
-/// Set a share's cache mode, pool and/or floor. Dry-run unless `execute:
-/// true`; admin is required for both.
+/// Set a share's cache mode, pool and/or floor, live through emhttp.
+/// `dryRun: true` only reports; admin is required for both.
 #[orca_tool(
     domain = "unraid",
     verb = "share.cache.set",
@@ -290,7 +393,7 @@ async fn unraid_share_cache_set(
 ) -> Result<ShareCacheSetOutput> {
     require_admin("unraid.share.cache.set", ctx.caller().as_ref())?;
     let (current, req, op) = plan_in(Path::new(SHARES_INI), &args)?;
-    let applied = if args.execute {
+    let applied = if !args.dry_run {
         let runner =
             privileged::runner().ok_or_else(|| anyhow!(privileged::missing_runner_blocker()))?;
         runner.run(&op).await?
@@ -305,8 +408,7 @@ async fn unraid_share_cache_set(
             .map(|(k, v)| format!("{k}={v}"))
             .collect(),
         applied,
-        effective: PENDING.to_string(),
-        executed: args.execute,
+        executed: !args.dry_run,
     })
 }
 
@@ -340,16 +442,13 @@ floor=\"\"
             use_cache: mode.map(Into::into),
             cache_pool: pool.map(Into::into),
             floor_kib: floor,
-            execute: false,
+            dry_run: true,
         }
     }
 
     fn fake() -> FakeRoot {
         let f = FakeRoot::new("sharecache");
-        f.write("shares.ini", INI).write(
-            "shares/pbs.cfg",
-            "shareComment=\"x\"\nshareUseCache=\"no\"\n",
-        );
+        f.write("shares.ini", INI);
         f
     }
 
@@ -409,34 +508,102 @@ floor=\"\"
         );
     }
 
+    /// A fake emhttpd: records the request line and rewrites `shares.ini`
+    /// with `after` before answering, as emhttp does on `cmdEditShare`.
+    fn fake_emhttp(f: &FakeRoot, after: &'static str) -> std::thread::JoinHandle<String> {
+        use std::io::{BufRead, BufReader, Write};
+        let sock = f.path().join("emhttpd.sock");
+        let ini = f.path().join("shares.ini");
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&s).read_line(&mut line).unwrap();
+            fs::write(&ini, after).unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            line
+        })
+    }
+
+    const FULL: &str = "\
+[\"pbs\"]
+name=\"pbs\"
+comment=\"a b&c\"
+allocator=\"highwater\"
+floor=\"0\"
+splitLevel=\"1\"
+include=\"disk1\"
+exclude=\"\"
+useCache=\"no\"
+cachePool=\"\"
+cachePool2=\"\"
+";
+
     #[test]
-    fn apply_writes_only_the_given_keys_and_keeps_the_rest() {
-        use std::os::unix::fs::PermissionsExt;
+    fn apply_posts_every_field_and_verifies_the_read_back() {
         let f = fake();
-        let cfg = f.path().join("shares/pbs.cfg");
-        fs::set_permissions(&cfg, fs::Permissions::from_mode(0o600)).unwrap();
-        let req =
-            ShareCacheRequest::new("pbs", Some("yes"), Some("cache"), Some(104_857_600)).unwrap();
-        let out = apply_in(&cfg, &req).unwrap();
-        assert!(out.contains("shareFloor=104857600"), "{out}");
-        let text = fs::read_to_string(&cfg).unwrap();
-        assert!(text.contains("shareComment=\"x\""));
-        assert!(text.contains("shareUseCache=\"yes\""));
-        assert!(!text.contains("shareUseCache=\"no\""));
-        assert!(text.contains("shareCachePool=\"cache\""));
-        assert!(text.contains("shareFloor=\"104857600\""));
+        f.write("shares.ini", FULL)
+            .write("var.ini", "csrf_token=\"TOK\"\n");
+        let after = "[\"pbs\"]\nname=\"pbs\"\nuseCache=\"yes\"\ncachePool=\"cache\"\nfloor=\"0\"\n";
+        let srv = fake_emhttp(&f, after);
+        let req = ShareCacheRequest::new("pbs", Some("yes"), Some("cache"), None).unwrap();
+        let p = f.path();
+        let out = apply_in(
+            &p.join("shares.ini"),
+            &p.join("var.ini"),
+            &p.join("emhttpd.sock"),
+            &req,
+        )
+        .unwrap();
+        assert_eq!(out, "shareUseCache=yes; shareCachePool=cache");
+        let line = srv.join().unwrap();
         assert_eq!(
-            fs::metadata(&cfg).unwrap().permissions().mode() & 0o7777,
-            0o600
+            line,
+            "GET /update.htm?shareName=pbs&shareNameOrig=pbs&shareComment=a%20b%26c\
+             &shareAllocator=highwater&shareFloor=0&shareSplitLevel=1&shareInclude=disk1\
+             &shareExclude=&shareUseCache=yes&shareCachePool=cache&shareCachePool2=\
+             &cmdEditShare=Apply&csrf_token=TOK HTTP/1.0\r\n"
         );
     }
 
     #[test]
-    fn apply_refuses_a_share_without_a_cfg() {
+    fn apply_fails_when_emhttp_did_not_change_shares_ini() {
         let f = fake();
-        let req = ShareCacheRequest::new("media", None, None, Some(1)).unwrap();
-        let e = apply_in(&f.path().join("shares/media.cfg"), &req).unwrap_err();
-        assert!(e.to_string().contains("has no config"), "{e}");
+        f.write("shares.ini", FULL)
+            .write("var.ini", "csrf_token=\"TOK\"\n");
+        let srv = fake_emhttp(&f, FULL);
+        let req = ShareCacheRequest::new("pbs", None, None, Some(5)).unwrap();
+        let p = f.path();
+        let e = apply_in(
+            &p.join("shares.ini"),
+            &p.join("var.ini"),
+            &p.join("emhttpd.sock"),
+            &req,
+        )
+        .unwrap_err();
+        srv.join().unwrap();
+        assert!(e.to_string().contains("did not apply"), "{e}");
+    }
+
+    #[test]
+    fn apply_refuses_unknown_share_or_missing_csrf() {
+        let f = fake();
+        f.write("var.ini", "csrf_token=\"\"\n");
+        let p = f.path();
+        let go = |share: &str| {
+            let req = ShareCacheRequest::new(share, None, None, Some(1)).unwrap();
+            apply_in(
+                &p.join("shares.ini"),
+                &p.join("var.ini"),
+                &p.join("none.sock"),
+                &req,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(go("media").contains("no share 'media'"));
+        assert!(go("pbs").contains("no csrf_token"));
     }
 
     #[test]

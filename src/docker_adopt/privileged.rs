@@ -83,7 +83,7 @@ pub enum PrivilegedOp {
         read_list: Vec<String>,
         write_list: Vec<String>,
     },
-    /// Set a user share's cache mode, pool and/or floor in its cfg.
+    /// Set a user share's cache mode, pool and/or floor through emhttp.
     SetShareCache {
         share: String,
         use_cache: Option<String>,
@@ -712,14 +712,14 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
             cache_pool,
             floor_kib,
         } => {
-            use crate::share_cache::{ShareCacheRequest, apply_in};
+            use crate::share_cache::{ShareCacheRequest, apply};
             let req = ShareCacheRequest::new(
                 share,
                 use_cache.as_deref(),
                 cache_pool.as_deref(),
                 *floor_kib,
             )?;
-            apply_in(&crate::exports::UnraidExports::cfg_path(&req.share), &req)
+            apply(&req)
         }
         PrivilegedOp::Rebuild { name } => {
             validate_name("container name", name)?;
