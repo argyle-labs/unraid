@@ -261,9 +261,11 @@ pub(crate) fn apply_in(
         .join("; "))
 }
 
-/// Require the requested keys at their new values and every other key of
-/// the share unchanged, so a field missing from [`EDIT_FIELDS`] (reset by
-/// emhttp) is caught rather than silently clobbering a setting.
+/// Require the requested keys at their new values and every other setting
+/// key unchanged, so a field missing from [`EDIT_FIELDS`] (reset by emhttp)
+/// is caught. Only setting keys are compared: shares.ini also carries
+/// emhttp's computed state (free, used, size, color, luksStatus, …) that
+/// moves on its own.
 fn check_read_back(
     before: &BTreeMap<String, String>,
     after: &BTreeMap<String, String>,
@@ -286,9 +288,11 @@ fn check_read_back(
             problems.push(format!("{k}: wanted {v:?}, got {got:?}"));
         }
     }
-    let keys: std::collections::BTreeSet<&String> = before.keys().chain(after.keys()).collect();
-    for k in keys {
-        if wanted.contains_key(k.as_str()) {
+    // ShareEdit.page's settings, plus `cow` which it shows but never submits.
+    let config_keys: std::collections::BTreeSet<&str> =
+        EDIT_FIELDS.iter().map(|(_, k)| *k).chain(["cow"]).collect();
+    for k in config_keys {
+        if wanted.contains_key(k) {
             continue;
         }
         let (b, a) = (before.get(k), after.get(k));
@@ -659,6 +663,29 @@ cachePool2=\"\"
             "{e}"
         );
         assert!(!e.contains("floor"), "{e}");
+    }
+
+    #[test]
+    fn apply_ignores_runtime_keys_that_move_between_snapshots() {
+        let f = fake();
+        let before = format!("{FULL}free=\"100\"\nused=\"5\"\n");
+        f.write("shares.ini", &before)
+            .write("var.ini", "csrf_token=\"TOK\"\n");
+        let after = before
+            .replace("floor=\"0\"", "floor=\"5\"")
+            .replace("free=\"100\"", "free=\"90\"")
+            .replace("used=\"5\"", "used=\"15\"");
+        let srv = fake_emhttp(&f, after.leak());
+        let req = ShareCacheRequest::new("pbs", None, None, Some(5)).unwrap();
+        let p = f.path();
+        apply_in(
+            &p.join("shares.ini"),
+            &p.join("var.ini"),
+            &p.join("emhttpd.sock"),
+            &req,
+        )
+        .unwrap();
+        srv.join().unwrap();
     }
 
     #[test]
