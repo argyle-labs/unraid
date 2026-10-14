@@ -1,0 +1,7 @@
+query CpuFlags {
+  info {
+    cpu {
+      flags
+    }
+  }
+}

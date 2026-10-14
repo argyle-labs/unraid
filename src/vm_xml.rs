@@ -243,7 +243,7 @@ pub(crate) fn read_redacted_as_root(name: &str) -> Result<String> {
 #[orca_tool(domain = "unraid", verb = "vm.xml", role = "admin")]
 async fn unraid_vm_xml(args: UnraidVmXmlArgs, ctx: &ToolCtx) -> Result<VmXmlOutput> {
     require_admin("unraid.vm.xml", ctx.caller().as_ref())?;
-    crate::vm_availability::require()?;
+    crate::vm_availability::require().await?;
     let mut vms = Vec::new();
     for (name, autostart) in select(QEMU_DIR, args.vm.as_deref())? {
         let r = match read_direct(QEMU_DIR, &name)? {
@@ -446,5 +446,14 @@ mod tests {
             let e = plugin_toolkit::reactor::block_on(unraid_vm_xml(args, &ctx)).unwrap_err();
             assert!(e.to_string().contains("unraid.vm.xml: "), "{e}");
         }
+    }
+
+    #[test]
+    fn refuses_when_vms_are_unavailable() {
+        let args = UnraidVmXmlArgs { vm: None };
+        let ctx = crate::authz::test_ctx(Some("admin"));
+        crate::vm_availability::tests::assert_refused(plugin_toolkit::reactor::block_on(
+            unraid_vm_xml(args, &ctx),
+        ));
     }
 }

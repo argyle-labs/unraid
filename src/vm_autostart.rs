@@ -149,7 +149,7 @@ async fn unraid_vm_autostart(
     ctx: &ToolCtx,
 ) -> Result<VmAutostartOutput> {
     require_admin("unraid.vm.autostart", ctx.caller().as_ref())?;
-    crate::vm_availability::require()?;
+    crate::vm_availability::require().await?;
     let change = plan(&run_virsh, &args.vm, args.enabled).await?;
     if args.execute && change != Change::NoOp {
         let runner =
@@ -318,5 +318,18 @@ mod tests {
             let e = block(unraid_vm_autostart(args, &ctx)).unwrap_err();
             assert!(e.to_string().contains("unraid.vm.autostart: "), "{e}");
         }
+    }
+
+    #[test]
+    fn refuses_when_vms_are_unavailable() {
+        let args = UnraidVmAutostartArgs {
+            vm: "pbs".into(),
+            enabled: true,
+            execute: false,
+        };
+        let ctx = crate::authz::test_ctx(Some("admin"));
+        crate::vm_availability::tests::assert_refused(plugin_toolkit::reactor::block_on(
+            unraid_vm_autostart(args, &ctx),
+        ));
     }
 }
