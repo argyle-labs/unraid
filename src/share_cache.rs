@@ -32,7 +32,9 @@ pub(crate) const SHARES_INI: &str = "/var/local/emhttp/shares.ini";
 const USE_CACHE_MODES: &[&str] = &["no", "yes", "only", "prefer"];
 const VAR_INI: &str = "/var/local/emhttp/var.ini";
 const EMHTTPD_SOCKET: &str = "/var/run/emhttpd.socket";
-/// The Share settings form's fields, paired with their `shares.ini` keys.
+/// The Share settings form's fields, paired with their `shares.ini` keys:
+/// the inputs unraid/webgui `emhttp/plugins/dynamix/ShareEdit.page` submits
+/// for an existing share (`shareCOW` is disabled there, so never sent).
 const EDIT_FIELDS: &[(&str, &str)] = &[
     ("shareName", "name"),
     ("shareNameOrig", "name"),
@@ -243,20 +245,64 @@ pub(crate) fn apply_in(
         .ok_or_else(|| anyhow!("no csrf_token in {}", var_ini.display()))?;
     emhttp_get(socket, &edit_query(current, req, &csrf))?;
 
-    let after = list_in(ini, Some(&req.share))?.remove(0);
-    let want = |v: &Option<String>, got: &str| v.as_deref().is_none_or(|v| v == got);
-    if !want(&req.use_cache, &after.use_cache)
-        || !want(&req.cache_pool, &after.cache_pool)
-        || !want(&req.floor_kib.map(|f| f.to_string()), &after.floor)
-    {
-        bail!("emhttp did not apply the change; shares.ini now has {after:?}");
-    }
+    let before = current.clone();
+    let after = parse_ini(&read(ini)?)
+        .into_iter()
+        .skip(1)
+        .find(|(s, _)| *s == req.share)
+        .map(|(_, kv)| kv)
+        .unwrap_or_default();
+    check_read_back(&before, &after, req)?;
     Ok(req
         .cfg_updates()
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("; "))
+}
+
+/// Require the requested keys at their new values and every other key of
+/// the share unchanged, so a field missing from [`EDIT_FIELDS`] (reset by
+/// emhttp) is caught rather than silently clobbering a setting.
+fn check_read_back(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+    req: &ShareCacheRequest,
+) -> Result<()> {
+    let wanted: BTreeMap<&str, String> = req
+        .cfg_updates()
+        .into_iter()
+        .filter_map(|(f, v)| {
+            EDIT_FIELDS
+                .iter()
+                .find(|(field, _)| *field == f)
+                .map(|(_, k)| (*k, v))
+        })
+        .collect();
+    let mut problems = Vec::new();
+    for (k, v) in &wanted {
+        let got = after.get(*k).map(String::as_str);
+        if got != Some(v.as_str()) {
+            problems.push(format!("{k}: wanted {v:?}, got {got:?}"));
+        }
+    }
+    let keys: std::collections::BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    for k in keys {
+        if wanted.contains_key(k.as_str()) {
+            continue;
+        }
+        let (b, a) = (before.get(k), after.get(k));
+        if b != a {
+            problems.push(format!("{k} changed unexpectedly: {b:?} -> {a:?}"));
+        }
+    }
+    if !problems.is_empty() {
+        bail!(
+            "emhttp did not apply the change cleanly: {}",
+            problems.join("; ")
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn apply(req: &ShareCacheRequest) -> Result<String> {
@@ -545,8 +591,10 @@ cachePool2=\"\"
         let f = fake();
         f.write("shares.ini", FULL)
             .write("var.ini", "csrf_token=\"TOK\"\n");
-        let after = "[\"pbs\"]\nname=\"pbs\"\nuseCache=\"yes\"\ncachePool=\"cache\"\nfloor=\"0\"\n";
-        let srv = fake_emhttp(&f, after);
+        let after = FULL
+            .replace("useCache=\"no\"", "useCache=\"yes\"")
+            .replace("cachePool=\"\"", "cachePool=\"cache\"");
+        let srv = fake_emhttp(&f, after.leak());
         let req = ShareCacheRequest::new("pbs", Some("yes"), Some("cache"), None).unwrap();
         let p = f.path();
         let out = apply_in(
@@ -583,7 +631,34 @@ cachePool2=\"\"
         )
         .unwrap_err();
         srv.join().unwrap();
-        assert!(e.to_string().contains("did not apply"), "{e}");
+        assert!(e.to_string().contains("floor: wanted \"5\""), "{e}");
+    }
+
+    #[test]
+    fn apply_fails_naming_an_unrelated_key_emhttp_reset() {
+        let f = fake();
+        f.write("shares.ini", FULL)
+            .write("var.ini", "csrf_token=\"TOK\"\n");
+        let after = FULL
+            .replace("floor=\"0\"", "floor=\"5\"")
+            .replace("comment=\"a b&c\"", "comment=\"\"");
+        let srv = fake_emhttp(&f, after.leak());
+        let req = ShareCacheRequest::new("pbs", None, None, Some(5)).unwrap();
+        let p = f.path();
+        let e = apply_in(
+            &p.join("shares.ini"),
+            &p.join("var.ini"),
+            &p.join("emhttpd.sock"),
+            &req,
+        )
+        .unwrap_err()
+        .to_string();
+        srv.join().unwrap();
+        assert!(
+            e.contains("comment changed unexpectedly: Some(\"a b&c\") -> Some(\"\")"),
+            "{e}"
+        );
+        assert!(!e.contains("floor"), "{e}");
     }
 
     #[test]
