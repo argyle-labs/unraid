@@ -29,7 +29,7 @@ use plugin_toolkit::plugin::Plugin;
 #[allow(unused_imports)]
 use unraid::{
     docker_adopt as _, host_settings_write as _, share_cache as _, surface as _, tools as _,
-    vm_autostart as _, vm_power as _, vm_xml as _,
+    vm_autostart as _, vm_availability as _, vm_power as _, vm_xml as _,
 };
 
 fn main() -> plugin_toolkit::anyhow::Result<()> {

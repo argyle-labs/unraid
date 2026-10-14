@@ -14,7 +14,6 @@ use plugin_toolkit::prelude::*;
 use crate::authz::require_admin;
 use crate::docker_adopt::host;
 use crate::docker_adopt::privileged::{self, PrivilegedOp};
-use crate::libvirt_stack::{LibvirtStack, probe};
 
 /// libvirt's official CLI; the C API would mean linking libvirt.
 pub(crate) const VIRSH: &str = "/usr/bin/virsh";
@@ -150,9 +149,7 @@ async fn unraid_vm_autostart(
     ctx: &ToolCtx,
 ) -> Result<VmAutostartOutput> {
     require_admin("unraid.vm.autostart", ctx.caller().as_ref())?;
-    if probe("/proc", "/var/run/libvirt") == LibvirtStack::ImageNotMounted {
-        bail!("libvirt.img is not mounted at /etc/libvirt: VM Manager is disabled");
-    }
+    crate::vm_availability::require()?;
     let change = plan(&run_virsh, &args.vm, args.enabled).await?;
     if args.execute && change != Change::NoOp {
         let runner =
