@@ -26,6 +26,7 @@ use plugin_toolkit::prelude::*;
 
 use crate::authz::require_admin;
 use crate::docker_adopt::privileged::{self, PrivilegedOp};
+use crate::docker_adopt::safefs;
 use crate::smb_share_write::validate_share_name;
 
 /// emhttp's per-share state, one `["name"]` section per user share.
@@ -186,11 +187,14 @@ fn urlencode(v: &str) -> String {
         .collect()
 }
 
-/// The `/update.htm` query for `req`: every form field at its current value,
-/// the requested ones replaced.
-fn edit_query(current: &BTreeMap<String, String>, req: &ShareCacheRequest, csrf: &str) -> String {
+/// Every form field (which is also its cfg key) with the value sent: the
+/// requested ones replaced, the rest at their current value.
+fn form_values(
+    current: &BTreeMap<String, String>,
+    req: &ShareCacheRequest,
+) -> Vec<(&'static str, String)> {
     let updates = req.cfg_updates();
-    let mut q: Vec<String> = EDIT_FIELDS
+    EDIT_FIELDS
         .iter()
         .map(|(field, key)| {
             let v = updates
@@ -199,8 +203,17 @@ fn edit_query(current: &BTreeMap<String, String>, req: &ShareCacheRequest, csrf:
                 .map(|(_, v)| v.clone())
                 .or_else(|| current.get(*key).cloned())
                 .unwrap_or_default();
-            format!("{field}={}", urlencode(&v))
+            (*field, v)
         })
+        .collect()
+}
+
+/// The `/update.htm` query for `req`: every form field at its current value,
+/// the requested ones replaced.
+fn edit_query(current: &BTreeMap<String, String>, req: &ShareCacheRequest, csrf: &str) -> String {
+    let mut q: Vec<String> = form_values(current, req)
+        .iter()
+        .map(|(field, v)| format!("{field}={}", urlencode(v)))
         .collect();
     q.push("cmdEditShare=Apply".into());
     q.push(format!("csrf_token={}", urlencode(csrf)));
@@ -213,6 +226,7 @@ fn emhttp_get(socket: &Path, query: &str) -> Result<()> {
     let mut s = std::os::unix::net::UnixStream::connect(socket)
         .map_err(|e| anyhow!("connect {}: {e}", socket.display()))?;
     s.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    s.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
     write!(
         s,
         "GET /update.htm?{query} HTTP/1.0\r\nHost: localhost\r\n\r\n"
@@ -250,11 +264,17 @@ pub(crate) fn apply_in(
         .filter(|t| !t.is_empty())
         .ok_or_else(|| anyhow!("no csrf_token in {}", var_ini.display()))?;
     let cfg = cfg_dir.join(format!("{}.cfg", req.share));
-    let snapshot =
-        |p: &Path| -> Result<BTreeMap<String, String>> { Ok(parse_ini(&read(p)?).remove(0).1) };
+    // A share never saved in the UI has no cfg yet: emhttp creates it.
+    let snapshot = |p: &Path| -> Result<BTreeMap<String, String>> {
+        Ok(match safefs::read_file(p)? {
+            Some(b) => parse_ini(&String::from_utf8_lossy(&b)).remove(0).1,
+            None => BTreeMap::new(),
+        })
+    };
     let before = snapshot(&cfg)?;
     emhttp_get(socket, &edit_query(current, req, &csrf))?;
-    check_read_back(&before, &snapshot(&cfg)?, req)?;
+    let sent: BTreeMap<&str, String> = form_values(current, req).into_iter().collect();
+    check_read_back(&before, &snapshot(&cfg)?, &sent, req)?;
     Ok(req
         .cfg_updates()
         .iter()
@@ -263,12 +283,15 @@ pub(crate) fn apply_in(
         .join("; "))
 }
 
-/// Require the requested cfg keys at their new values and every other cfg
-/// key unchanged, so a setting emhttp reset (SMB/NFS export, security, case
-/// sensitivity, a field missing from [`EDIT_FIELDS`]) is caught.
+/// Require the requested cfg keys at their new values and every other key
+/// present before unchanged, so a setting emhttp reset (SMB/NFS export,
+/// security, case sensitivity, a field missing from [`EDIT_FIELDS`]) is
+/// caught. A key emhttp newly writes must hold the value the form sent for
+/// it; keys the form did not send (defaults like `shareCOW`) are accepted.
 fn check_read_back(
     before: &BTreeMap<String, String>,
     after: &BTreeMap<String, String>,
+    sent: &BTreeMap<&str, String>,
     req: &ShareCacheRequest,
 ) -> Result<()> {
     let wanted: BTreeMap<&str, String> = req.cfg_updates().into_iter().collect();
@@ -289,7 +312,14 @@ fn check_read_back(
             continue;
         }
         let (b, a) = (before.get(k), after.get(k));
-        if b != a {
+        if b.is_none() {
+            match (sent.get(k), a) {
+                (Some(v), Some(a)) if v != a => {
+                    problems.push(format!("{k}: sent {v:?}, got {a:?}"))
+                }
+                _ => {}
+            }
+        } else if b != a {
             problems.push(format!("{k} changed unexpectedly: {b:?} -> {a:?}"));
         }
     }
@@ -675,6 +705,42 @@ shareCaseSensitive=\"auto\"
             "{e}"
         );
         assert!(!e.contains("shareFloor"), "{e}");
+    }
+
+    #[test]
+    fn apply_creates_the_cfg_of_a_never_saved_share() {
+        let f = setup();
+        fs::remove_file(f.path().join("pbs.cfg")).unwrap();
+        let cfg = CFG.replace("shareFloor=\"0\"", "shareFloor=\"5\"");
+        let srv = fake_emhttp(&f, cfg, None);
+        let req = ShareCacheRequest::new("pbs", None, None, Some(5)).unwrap();
+        run(&f, &req).unwrap();
+        srv.join().unwrap();
+    }
+
+    #[test]
+    fn apply_accepts_keys_emhttp_newly_writes() {
+        let f = setup();
+        f.write("pbs.cfg", &CFG.replace("shareCachePool2=\"\"\n", ""));
+        let cfg = CFG.replace("shareFloor=\"0\"", "shareFloor=\"5\"") + "shareCOW=\"auto\"\n";
+        let srv = fake_emhttp(&f, cfg, None);
+        let req = ShareCacheRequest::new("pbs", None, None, Some(5)).unwrap();
+        run(&f, &req).unwrap();
+        srv.join().unwrap();
+    }
+
+    #[test]
+    fn apply_fails_when_a_new_key_differs_from_what_the_form_sent() {
+        let f = setup();
+        f.write("pbs.cfg", &CFG.replace("shareCachePool2=\"\"\n", ""));
+        let cfg = CFG
+            .replace("shareFloor=\"0\"", "shareFloor=\"5\"")
+            .replace("shareCachePool2=\"\"", "shareCachePool2=\"x\"");
+        let srv = fake_emhttp(&f, cfg, None);
+        let req = ShareCacheRequest::new("pbs", None, None, Some(5)).unwrap();
+        let e = run(&f, &req).unwrap_err().to_string();
+        srv.join().unwrap();
+        assert!(e.contains("shareCachePool2: sent \"\", got \"x\""), "{e}");
     }
 
     #[test]
