@@ -13,7 +13,8 @@
 //!
 //! `cmdEditShare` sets every share field it is given, so the request carries
 //! the share's current values from `shares.ini` with only the changed ones
-//! replaced; the result is read back from `shares.ini` to verify.
+//! replaced. The share's persisted cfg is snapshotted before and after to
+//! verify: the requested keys changed and nothing else did.
 //!
 //! Executes by default; `dryRun: true` only reports. Admin is required for
 //! both (see [`crate::authz`]).
@@ -32,6 +33,10 @@ pub(crate) const SHARES_INI: &str = "/var/local/emhttp/shares.ini";
 const USE_CACHE_MODES: &[&str] = &["no", "yes", "only", "prefer"];
 const VAR_INI: &str = "/var/local/emhttp/var.ini";
 const EMHTTPD_SOCKET: &str = "/var/run/emhttpd.socket";
+/// `<share>.cfg` per user share: only `shareXxx="value"` settings, no runtime
+/// state; emhttpd rewrites it on `cmdEditShare` (the keys are ShareEdit.page's
+/// field names, unraid/webgui `emhttp/plugins/dynamix/ShareEdit.page`).
+const SHARES_CFG_DIR: &str = "/boot/config/shares";
 /// The Share settings form's fields, paired with their `shares.ini` keys:
 /// the inputs unraid/webgui `emhttp/plugins/dynamix/ShareEdit.page` submits
 /// for an existing share (`shareCOW` is disabled there, so never sent).
@@ -221,10 +226,11 @@ fn emhttp_get(socket: &Path, query: &str) -> Result<()> {
     Ok(())
 }
 
-/// Apply `req` through emhttp, then confirm it in `shares.ini`. Returns the
-/// fields changed.
+/// Apply `req` through emhttp, then confirm it in the share's cfg. Returns
+/// the fields changed.
 pub(crate) fn apply_in(
     ini: &Path,
+    cfg_dir: &Path,
     var_ini: &Path,
     socket: &Path,
     req: &ShareCacheRequest,
@@ -243,16 +249,12 @@ pub(crate) fn apply_in(
         .find_map(|(_, kv)| kv.get("csrf_token").cloned())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| anyhow!("no csrf_token in {}", var_ini.display()))?;
+    let cfg = cfg_dir.join(format!("{}.cfg", req.share));
+    let snapshot =
+        |p: &Path| -> Result<BTreeMap<String, String>> { Ok(parse_ini(&read(p)?).remove(0).1) };
+    let before = snapshot(&cfg)?;
     emhttp_get(socket, &edit_query(current, req, &csrf))?;
-
-    let before = current.clone();
-    let after = parse_ini(&read(ini)?)
-        .into_iter()
-        .skip(1)
-        .find(|(s, _)| *s == req.share)
-        .map(|(_, kv)| kv)
-        .unwrap_or_default();
-    check_read_back(&before, &after, req)?;
+    check_read_back(&before, &snapshot(&cfg)?, req)?;
     Ok(req
         .cfg_updates()
         .iter()
@@ -261,26 +263,15 @@ pub(crate) fn apply_in(
         .join("; "))
 }
 
-/// Require the requested keys at their new values and every other setting
-/// key unchanged, so a field missing from [`EDIT_FIELDS`] (reset by emhttp)
-/// is caught. Only setting keys are compared: shares.ini also carries
-/// emhttp's computed state (free, used, size, color, luksStatus, …) that
-/// moves on its own.
+/// Require the requested cfg keys at their new values and every other cfg
+/// key unchanged, so a setting emhttp reset (SMB/NFS export, security, case
+/// sensitivity, a field missing from [`EDIT_FIELDS`]) is caught.
 fn check_read_back(
     before: &BTreeMap<String, String>,
     after: &BTreeMap<String, String>,
     req: &ShareCacheRequest,
 ) -> Result<()> {
-    let wanted: BTreeMap<&str, String> = req
-        .cfg_updates()
-        .into_iter()
-        .filter_map(|(f, v)| {
-            EDIT_FIELDS
-                .iter()
-                .find(|(field, _)| *field == f)
-                .map(|(_, k)| (*k, v))
-        })
-        .collect();
+    let wanted: BTreeMap<&str, String> = req.cfg_updates().into_iter().collect();
     let mut problems = Vec::new();
     for (k, v) in &wanted {
         let got = after.get(*k).map(String::as_str);
@@ -288,10 +279,12 @@ fn check_read_back(
             problems.push(format!("{k}: wanted {v:?}, got {got:?}"));
         }
     }
-    // ShareEdit.page's settings, plus `cow` which it shows but never submits.
-    let config_keys: std::collections::BTreeSet<&str> =
-        EDIT_FIELDS.iter().map(|(_, k)| *k).chain(["cow"]).collect();
-    for k in config_keys {
+    let keys: std::collections::BTreeSet<&str> = before
+        .keys()
+        .chain(after.keys())
+        .map(String::as_str)
+        .collect();
+    for k in keys {
         if wanted.contains_key(k) {
             continue;
         }
@@ -312,6 +305,7 @@ fn check_read_back(
 pub(crate) fn apply(req: &ShareCacheRequest) -> Result<String> {
     apply_in(
         Path::new(SHARES_INI),
+        Path::new(SHARES_CFG_DIR),
         Path::new(VAR_INI),
         Path::new(EMHTTPD_SOCKET),
         req,
@@ -391,7 +385,7 @@ pub struct ShareCacheSetOutput {
     pub current: ShareCache,
     /// The fields set (or that would be).
     pub changes: Vec<String>,
-    /// The root side's report, verified against `shares.ini`; empty for a dry run.
+    /// The root side's report, verified against the share cfg; empty for a dry run.
     pub applied: String,
     pub executed: bool,
 }
@@ -558,18 +552,26 @@ floor=\"\"
         );
     }
 
-    /// A fake emhttpd: records the request line and rewrites `shares.ini`
-    /// with `after` before answering, as emhttp does on `cmdEditShare`.
-    fn fake_emhttp(f: &FakeRoot, after: &'static str) -> std::thread::JoinHandle<String> {
+    /// A fake emhttpd: records the request line and rewrites `pbs.cfg` (and
+    /// `shares.ini`, when given) before answering, as emhttp does.
+    fn fake_emhttp(
+        f: &FakeRoot,
+        cfg: String,
+        ini: Option<String>,
+    ) -> std::thread::JoinHandle<String> {
         use std::io::{BufRead, BufReader, Write};
-        let sock = f.path().join("emhttpd.sock");
-        let ini = f.path().join("shares.ini");
+        let p = f.path();
+        let sock = p.join("emhttpd.sock");
+        let (cfg_path, ini_path) = (p.join("pbs.cfg"), p.join("shares.ini"));
         let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         std::thread::spawn(move || {
             let (mut s, _) = l.accept().unwrap();
             let mut line = String::new();
             BufReader::new(&s).read_line(&mut line).unwrap();
-            fs::write(&ini, after).unwrap();
+            fs::write(&cfg_path, cfg).unwrap();
+            if let Some(ini) = ini {
+                fs::write(&ini_path, ini).unwrap();
+            }
             s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
             line
@@ -588,26 +590,55 @@ exclude=\"\"
 useCache=\"no\"
 cachePool=\"\"
 cachePool2=\"\"
+free=\"100\"
+used=\"5\"
 ";
+
+    const CFG: &str = "\
+shareComment=\"a b&c\"
+shareAllocator=\"highwater\"
+shareFloor=\"0\"
+shareSplitLevel=\"1\"
+shareInclude=\"disk1\"
+shareExclude=\"\"
+shareUseCache=\"no\"
+shareCachePool=\"\"
+shareCachePool2=\"\"
+shareExport=\"e\"
+shareSecurity=\"private\"
+shareReadList=\"\"
+shareWriteList=\"orca\"
+shareCaseSensitive=\"auto\"
+";
+
+    fn setup() -> FakeRoot {
+        let f = fake();
+        f.write("shares.ini", FULL)
+            .write("pbs.cfg", CFG)
+            .write("var.ini", "csrf_token=\"TOK\"\n");
+        f
+    }
+
+    fn run(f: &FakeRoot, req: &ShareCacheRequest) -> Result<String> {
+        let p = f.path();
+        apply_in(
+            &p.join("shares.ini"),
+            p,
+            &p.join("var.ini"),
+            &p.join("emhttpd.sock"),
+            req,
+        )
+    }
 
     #[test]
     fn apply_posts_every_field_and_verifies_the_read_back() {
-        let f = fake();
-        f.write("shares.ini", FULL)
-            .write("var.ini", "csrf_token=\"TOK\"\n");
-        let after = FULL
-            .replace("useCache=\"no\"", "useCache=\"yes\"")
-            .replace("cachePool=\"\"", "cachePool=\"cache\"");
-        let srv = fake_emhttp(&f, after.leak());
+        let f = setup();
+        let cfg = CFG
+            .replace("shareUseCache=\"no\"", "shareUseCache=\"yes\"")
+            .replace("shareCachePool=\"\"", "shareCachePool=\"cache\"");
+        let srv = fake_emhttp(&f, cfg, None);
         let req = ShareCacheRequest::new("pbs", Some("yes"), Some("cache"), None).unwrap();
-        let p = f.path();
-        let out = apply_in(
-            &p.join("shares.ini"),
-            &p.join("var.ini"),
-            &p.join("emhttpd.sock"),
-            &req,
-        )
-        .unwrap();
+        let out = run(&f, &req).unwrap();
         assert_eq!(out, "shareUseCache=yes; shareCachePool=cache");
         let line = srv.join().unwrap();
         assert_eq!(
@@ -620,71 +651,42 @@ cachePool2=\"\"
     }
 
     #[test]
-    fn apply_fails_when_emhttp_did_not_change_shares_ini() {
-        let f = fake();
-        f.write("shares.ini", FULL)
-            .write("var.ini", "csrf_token=\"TOK\"\n");
-        let srv = fake_emhttp(&f, FULL);
+    fn apply_fails_when_emhttp_did_not_change_the_cfg() {
+        let f = setup();
+        let srv = fake_emhttp(&f, CFG.into(), None);
         let req = ShareCacheRequest::new("pbs", None, None, Some(5)).unwrap();
-        let p = f.path();
-        let e = apply_in(
-            &p.join("shares.ini"),
-            &p.join("var.ini"),
-            &p.join("emhttpd.sock"),
-            &req,
-        )
-        .unwrap_err();
+        let e = run(&f, &req).unwrap_err();
         srv.join().unwrap();
-        assert!(e.to_string().contains("floor: wanted \"5\""), "{e}");
+        assert!(e.to_string().contains("shareFloor: wanted \"5\""), "{e}");
     }
 
     #[test]
-    fn apply_fails_naming_an_unrelated_key_emhttp_reset() {
-        let f = fake();
-        f.write("shares.ini", FULL)
-            .write("var.ini", "csrf_token=\"TOK\"\n");
-        let after = FULL
-            .replace("floor=\"0\"", "floor=\"5\"")
-            .replace("comment=\"a b&c\"", "comment=\"\"");
-        let srv = fake_emhttp(&f, after.leak());
+    fn apply_fails_naming_an_smb_setting_emhttp_reset() {
+        let f = setup();
+        let cfg = CFG
+            .replace("shareFloor=\"0\"", "shareFloor=\"5\"")
+            .replace("shareSecurity=\"private\"", "shareSecurity=\"public\"");
+        let srv = fake_emhttp(&f, cfg, None);
         let req = ShareCacheRequest::new("pbs", None, None, Some(5)).unwrap();
-        let p = f.path();
-        let e = apply_in(
-            &p.join("shares.ini"),
-            &p.join("var.ini"),
-            &p.join("emhttpd.sock"),
-            &req,
-        )
-        .unwrap_err()
-        .to_string();
+        let e = run(&f, &req).unwrap_err().to_string();
         srv.join().unwrap();
         assert!(
-            e.contains("comment changed unexpectedly: Some(\"a b&c\") -> Some(\"\")"),
+            e.contains("shareSecurity changed unexpectedly: Some(\"private\") -> Some(\"public\")"),
             "{e}"
         );
-        assert!(!e.contains("floor"), "{e}");
+        assert!(!e.contains("shareFloor"), "{e}");
     }
 
     #[test]
-    fn apply_ignores_runtime_keys_that_move_between_snapshots() {
-        let f = fake();
-        let before = format!("{FULL}free=\"100\"\nused=\"5\"\n");
-        f.write("shares.ini", &before)
-            .write("var.ini", "csrf_token=\"TOK\"\n");
-        let after = before
-            .replace("floor=\"0\"", "floor=\"5\"")
+    fn apply_ignores_runtime_state_moving_in_shares_ini() {
+        let f = setup();
+        let cfg = CFG.replace("shareFloor=\"0\"", "shareFloor=\"5\"");
+        let ini = FULL
             .replace("free=\"100\"", "free=\"90\"")
             .replace("used=\"5\"", "used=\"15\"");
-        let srv = fake_emhttp(&f, after.leak());
+        let srv = fake_emhttp(&f, cfg, Some(ini));
         let req = ShareCacheRequest::new("pbs", None, None, Some(5)).unwrap();
-        let p = f.path();
-        apply_in(
-            &p.join("shares.ini"),
-            &p.join("var.ini"),
-            &p.join("emhttpd.sock"),
-            &req,
-        )
-        .unwrap();
+        run(&f, &req).unwrap();
         srv.join().unwrap();
     }
 
@@ -697,6 +699,7 @@ cachePool2=\"\"
             let req = ShareCacheRequest::new(share, None, None, Some(1)).unwrap();
             apply_in(
                 &p.join("shares.ini"),
+                p,
                 &p.join("var.ini"),
                 &p.join("none.sock"),
                 &req,
