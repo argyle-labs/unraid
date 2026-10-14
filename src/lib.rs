@@ -46,6 +46,7 @@ pub mod permissions;
 pub mod procfs;
 pub mod registration;
 pub mod schema_pull;
+pub mod share_cache;
 pub mod smb_share_write;
 pub mod smb_shares;
 #[cfg(test)]

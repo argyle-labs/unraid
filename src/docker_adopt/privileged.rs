@@ -83,6 +83,13 @@ pub enum PrivilegedOp {
         read_list: Vec<String>,
         write_list: Vec<String>,
     },
+    /// Set a user share's cache mode, pool and/or floor through emhttp.
+    SetShareCache {
+        share: String,
+        use_cache: Option<String>,
+        cache_pool: Option<String>,
+        floor_kib: Option<u64>,
+    },
     Rebuild {
         name: String,
     },
@@ -699,6 +706,21 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
             let conf = Path::new(crate::smb_shares::SHARES_CONF);
             Ok(apply_in(&cfg, conf, &req, reload_smbd).await?.join("; "))
         }
+        PrivilegedOp::SetShareCache {
+            share,
+            use_cache,
+            cache_pool,
+            floor_kib,
+        } => {
+            use crate::share_cache::{ShareCacheRequest, apply};
+            let req = ShareCacheRequest::new(
+                share,
+                use_cache.as_deref(),
+                cache_pool.as_deref(),
+                *floor_kib,
+            )?;
+            apply(&req)
+        }
         PrivilegedOp::Rebuild { name } => {
             validate_name("container name", name)?;
             if safefs::read_file(Path::new(&template::template_path(name)))?.is_none() {
@@ -958,7 +980,7 @@ pub fn policy(op: &PrivilegedOp) -> CallerPolicy {
         | PrivilegedOp::VolumeEmpty { .. }
         | PrivilegedOp::RetireStack { .. } => CallerPolicy::RootOrDockerGroup,
         PrivilegedOp::SetVmAutostart { .. } | PrivilegedOp::ReadVmXml { .. } => CallerPolicy::Root,
-        PrivilegedOp::SetSmbShare { .. } => CallerPolicy::Root,
+        PrivilegedOp::SetSmbShare { .. } | PrivilegedOp::SetShareCache { .. } => CallerPolicy::Root,
     }
 }
 
