@@ -10,13 +10,13 @@ query ArrayStatus {
       status progress speed errors correcting paused running
     }
     disks {
-      id idx name device size status type fsSize fsFree fsUsed fsType temp numErrors
+      id idx name device size status type fsSize fsFree fsUsed fsType temp numErrors warning critical
     }
     parities {
       id idx name device size status type fsType temp numErrors
     }
     caches {
-      id idx name device size status type fsSize fsFree fsUsed fsType
+      id idx name device size status type fsSize fsFree fsUsed fsType numErrors warning critical
     }
   }
 }
