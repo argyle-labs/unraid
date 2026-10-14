@@ -4,7 +4,9 @@
 //! CPU virtualization flags and the VM Manager on/off state come from the
 //! Unraid API. The daemon layer beneath an enabled VM Manager has no API, so it
 //! is probed locally (`/etc/libvirt` mount, libvirtd pid file, virtiofsd); the
-//! local probes also stand in for the API when it is unreachable. An endpoint
+//! local probes also stand in for the API when it is unreachable, but only when
+//! no endpoint is registered or the auto-picked endpoint is loopback: probing
+//! this box for a remote host would answer for the wrong machine. An endpoint
 //! that cannot be resolved is an error, not an unreachable API.
 //!
 //! VM verbs refuse with [`VmUnavailable`] when the stack is down, so a caller
@@ -244,16 +246,25 @@ pub(crate) fn assess(
 }
 
 async fn api_view(endpoint: Option<String>) -> Result<ApiView> {
+    if endpoint.is_none() && crate::endpoint::endpoint_db::list()?.is_empty() {
+        return Ok(ApiView::default());
+    }
     let explicit = endpoint.is_some();
     let client = crate::tools::surface_client(endpoint, None, None, None).await?;
+    let local = !explicit && crate::endpoint::is_loopback_url(client.endpoint());
+    api_view_from(&client, local).await
+}
+
+/// Query `client`; on failure, `local` degrades to local probes instead of erroring.
+async fn api_view_from(client: &crate::Client, local: bool) -> Result<ApiView> {
     let cpu_flags = match client.cpu_flags().await {
         Ok(flags) => flags,
-        Err(e) if explicit => return Err(e.into()),
-        Err(_) => None,
+        Err(_) if local => None,
+        Err(e) => return Err(e.into()),
     };
     let vms = client.vms().await;
     let vm_manager = match (classify(&vms), vms) {
-        (VmManager::Unavailable, Err(e)) if explicit => return Err(e.into()),
+        (VmManager::Unavailable, Err(e)) if !local => return Err(e.into()),
         (VmManager::Unavailable, _) => None,
         (s, _) => Some(s),
     };
@@ -519,5 +530,38 @@ pub(crate) mod tests {
     fn named_endpoint_query_failure_is_returned_not_probed_locally() {
         let (e, _) = require_on_failing_endpoint();
         assert!(e.downcast_ref::<VmUnavailable>().is_none(), "{e}");
+    }
+
+    #[test]
+    fn remote_endpoint_query_failure_is_returned_not_probed_locally() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let rt = crate::endpoint::tests::rt();
+        let e = rt.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            let client = crate::Client::new(crate::Config::new(server.uri(), "k"));
+            api_view_from(&client, false).await.unwrap_err()
+        });
+        assert!(e.downcast_ref::<VmUnavailable>().is_none(), "{e}");
+    }
+
+    #[test]
+    fn only_a_loopback_endpoint_counts_as_this_host() {
+        use crate::endpoint::is_loopback_url;
+        assert!(is_loopback_url("http://127.0.0.1/graphql"));
+        assert!(is_loopback_url("http://localhost:8080/graphql"));
+        assert!(!is_loopback_url("https://10.0.0.5/graphql"));
+        assert!(!is_loopback_url("https://tower.local/graphql"));
+    }
+
+    #[test]
+    fn no_endpoint_registered_probes_locally() {
+        let a = crate::endpoint::tests::isolated(|| {
+            plugin_toolkit::reactor::block_on(availability(None))
+        });
+        assert!(a.is_ok(), "{a:?}");
     }
 }

@@ -80,7 +80,7 @@ fn url_host(url: &str) -> Option<&str> {
     (!host.is_empty()).then_some(host)
 }
 
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     url_host(url).is_some_and(|h| {
         h.eq_ignore_ascii_case("localhost")
             || h.parse::<std::net::IpAddr>()

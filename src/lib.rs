@@ -281,6 +281,11 @@ impl Client {
         Ok(Self::new_with(cfg, api))
     }
 
+    /// Full GraphQL URL this client queries.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     /// The schema version this client routes through.
     pub fn api_version(&self) -> ApiVersion {
         self.api
