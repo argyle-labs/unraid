@@ -19,6 +19,8 @@ fn main() {
     let schemas_dir = manifest_dir.join("schemas");
     let queries_dir = manifest_dir.join("queries");
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    println!("cargo:rerun-if-changed=queries");
+    println!("cargo:rerun-if-changed=schemas");
     plugin_toolkit_build::graphql::generate(&schemas_dir, &queries_dir)
         .expect("unraid graphql codegen");
 
