@@ -355,25 +355,84 @@ impl UnraidExports {
     }
 
     fn write_atomic(path: &Path, contents: &str) -> Result<(), StorageError> {
+        use std::hash::{BuildHasher, Hasher};
+        use std::os::unix::fs::OpenOptionsExt;
         let fail =
             |e: std::io::Error| StorageError::Other(format!("write {}: {e}", path.display()));
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let tmp = path.with_file_name(format!(".{name}.tmp"));
-        let mut file = fs::File::create(&tmp).map_err(fail)?;
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            hasher.write_u128(d.as_nanos());
+        }
+        let tmp = dir.join(format!(".{name}.{:016x}.tmp", hasher.finish()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(&tmp)
+            .map_err(fail)?;
         let result = (|| {
             file.write_all(contents.as_bytes())?;
-            if let Ok(meta) = fs::metadata(path)
+            if let Ok(meta) = fs::symlink_metadata(path)
                 && file.metadata()?.permissions() != meta.permissions()
             {
-                file.set_permissions(meta.permissions())?;
+                file.set_permissions(meta.permissions()).ok();
             }
             file.sync_all()?;
+            drop(file);
             fs::rename(&tmp, path)
         })();
         if result.is_err() {
             fs::remove_file(&tmp).ok();
         }
-        result.map_err(fail)
+        result.map_err(fail)?;
+        fs::File::open(dir).and_then(|d| d.sync_all()).map_err(fail)
+    }
+
+    fn validate_entry(entry: &ExportEntry) -> Result<(), StorageError> {
+        let bad = |what: &str, v: &str| {
+            StorageError::Other(format!("invalid export {what} '{}'", v.escape_debug()))
+        };
+        let token_ok = |v: &str, extra: &[char]| {
+            !v.is_empty()
+                && v.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || "._-:/=@*".contains(c) || extra.contains(&c)
+                })
+        };
+        if entry
+            .path
+            .chars()
+            .any(|c| c.is_control() || c == '"' || c == '\\')
+        {
+            return Err(bad("path", &entry.path));
+        }
+        if entry.allowed_clients.is_empty() {
+            return Err(StorageError::Other(
+                "export needs at least one client".into(),
+            ));
+        }
+        for c in &entry.allowed_clients {
+            if !token_ok(c, &['[', ']']) {
+                return Err(bad("client", c));
+            }
+        }
+        for o in &entry.options {
+            if !token_ok(o, &[]) || o.contains(':') || o.contains('@') || o.contains('*') {
+                return Err(bad("option", o));
+            }
+        }
+        if let Some(f) = entry.fsid.as_deref().filter(|s| !s.is_empty())
+            && !token_ok(f, &[])
+        {
+            return Err(bad("fsid", f));
+        }
+        Ok(())
     }
 
     /// Re-read the live export table so callers see what was actually applied.
@@ -434,6 +493,7 @@ impl StorageBackend for UnraidExports {
 
     async fn upsert_export(&self, entry: &ExportEntry) -> Result<ExportEntry, StorageError> {
         let name = Self::share_name(&entry.path)?;
+        Self::validate_entry(entry)?;
         let cfg = Self::cfg_path(&name);
         // The share must already exist: creating one is array/disk business
         // (`Capability::Create`), not export authoring.
@@ -454,7 +514,12 @@ impl StorageBackend for UnraidExports {
         // 2. Make it live.
         let current = fs::read_to_string(EXPORTS_FILE).unwrap_or_default();
         let next = Self::rewrite_exports(&current, &entry.path, Some(&Self::exports_line(entry)));
-        Self::write_atomic(Path::new(EXPORTS_FILE), &next)?;
+        if let Err(e) = Self::write_atomic(Path::new(EXPORTS_FILE), &next) {
+            return Err(match Self::write_atomic(&cfg, &text) {
+                Ok(()) => e,
+                Err(r) => StorageError::Other(format!("{e}; cfg rollback also failed: {r}")),
+            });
+        }
         Self::reexport()?;
 
         // 3. Read back rather than echo the request, so a value the host
@@ -725,8 +790,42 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o640
         );
-        assert!(!dir.join(".exports.tmp").exists());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_refuses_to_follow_or_reuse_a_planted_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exports");
+        let target = dir.path().join("victim");
+        fs::write(&target, "keep\n").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(".exports.tmp")).unwrap();
+        UnraidExports::write_atomic(&path, "new\n").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn entries_with_injection_characters_are_rejected() {
+        assert!(UnraidExports::validate_entry(&entry(&["rw"])).is_ok());
+        assert!(UnraidExports::validate_entry(&entry(&["rw)\n/ *(rw"])).is_err());
+        assert!(UnraidExports::validate_entry(&entry(&["rw,no_root_squash"])).is_err());
+        let mut e = entry(&["rw"]);
+        e.allowed_clients = vec!["10.0.0.17 *".to_string()];
+        assert!(UnraidExports::validate_entry(&e).is_err());
+        let mut e = entry(&["rw"]);
+        e.allowed_clients = vec!["10.0.0.0/24".to_string(), "[fd00::1]".to_string()];
+        assert!(UnraidExports::validate_entry(&e).is_ok());
+        let mut e = entry(&["rw"]);
+        e.fsid = Some("1\"x".to_string());
+        assert!(UnraidExports::validate_entry(&e).is_err());
+        let mut e = entry(&["rw"]);
+        e.path = "/mnt/user/a\"\n/ *".to_string();
+        assert!(UnraidExports::validate_entry(&e).is_err());
+        e.allowed_clients.clear();
+        e.path = "/mnt/user/pbs".to_string();
+        assert!(UnraidExports::validate_entry(&e).is_err());
     }
 
     #[test]
