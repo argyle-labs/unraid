@@ -322,16 +322,27 @@ mod tests {
 
     #[tokio::test]
     async fn surface_client_rejects_connection_overrides() {
-        for (from, key, insecure) in [
+        for (endpoint, from, key, insecure) in [
             (
-                Some("http://10.0.0.5".to_string()),
-                Some("tok".to_string()),
+                None,
+                Some("http://10.0.0.5".into()),
+                Some("tok".into()),
                 None,
             ),
-            (None, Some("tok".to_string()), None),
-            (None, None, Some(true)),
+            (None, Some("http://10.0.0.5".into()), None, None),
+            (
+                Some("tower".into()),
+                Some("http://10.0.0.5".into()),
+                None,
+                None,
+            ),
+            (None, None, Some("tok".into()), None),
+            (None, None, None, Some(true)),
         ] {
-            let err = surface_client(None, from, key, insecure)
+            let endpoint: Option<String> = endpoint;
+            let from: Option<String> = from;
+            let key: Option<String> = key;
+            let err = surface_client(endpoint, from, key, insecure)
                 .await
                 .err()
                 .unwrap();
