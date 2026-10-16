@@ -1,0 +1,20 @@
+query GetCustomization {
+  customization {
+    activationCode {
+      code
+    }
+    onboarding {
+      status
+      isPartnerBuild
+      completed
+      completedAtVersion
+      activationCode
+      shouldOpen
+    }
+    availableLanguages {
+      code
+      name
+      url
+    }
+  }
+}

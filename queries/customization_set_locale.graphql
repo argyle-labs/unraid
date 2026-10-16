@@ -1,0 +1,5 @@
+mutation CustomizationSetLocale($locale: String!) {
+  customization {
+    setLocale(locale: $locale)
+  }
+}

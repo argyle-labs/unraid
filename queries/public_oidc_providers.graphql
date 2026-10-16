@@ -1,0 +1,10 @@
+query PublicOidcProviders {
+  publicOidcProviders {
+    id
+    name
+    buttonText
+    buttonIcon
+    buttonVariant
+    buttonStyle
+  }
+}

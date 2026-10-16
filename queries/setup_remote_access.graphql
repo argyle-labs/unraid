@@ -1,0 +1,3 @@
+mutation SetupRemoteAccess($input: SetupRemoteAccessInput!) {
+  setupRemoteAccess(input: $input)
+}

@@ -1,0 +1,3 @@
+mutation EnableDynamicRemoteAccess($input: EnableDynamicRemoteAccessInput!) {
+  enableDynamicRemoteAccess(input: $input)
+}

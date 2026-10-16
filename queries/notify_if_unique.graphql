@@ -1,0 +1,13 @@
+mutation NotifyIfUnique($input: NotificationData!) {
+  notifyIfUnique(input: $input) {
+    id
+    title
+    subject
+    description
+    importance
+    link
+    type
+    timestamp
+    formattedTimestamp
+  }
+}

@@ -1,0 +1,7 @@
+query Owner {
+  owner {
+    username
+    url
+    avatar
+  }
+}

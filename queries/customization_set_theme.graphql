@@ -1,0 +1,13 @@
+mutation CustomizationSetTheme($theme: ThemeName!) {
+  customization {
+    setTheme(theme: $theme) {
+      name
+      showBannerImage
+      showBannerGradient
+      showHeaderDescription
+      headerBackgroundColor
+      headerPrimaryTextColor
+      headerSecondaryTextColor
+    }
+  }
+}

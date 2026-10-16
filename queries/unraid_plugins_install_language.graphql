@@ -1,0 +1,14 @@
+mutation UnraidPluginsInstallLanguage($input: InstallPluginInput!) {
+  unraidPlugins {
+    installLanguage(input: $input) {
+      id
+      url
+      name
+      status
+      createdAt
+      updatedAt
+      finishedAt
+      output
+    }
+  }
+}

@@ -1,0 +1,23 @@
+query OidcProviders {
+  oidcProviders {
+    id
+    name
+    clientId
+    clientSecret
+    issuer
+    authorizationEndpoint
+    tokenEndpoint
+    jwksUri
+    scopes
+    authorizationRules {
+      claim
+      operator
+      value
+    }
+    authorizationRuleMode
+    buttonText
+    buttonIcon
+    buttonVariant
+    buttonStyle
+  }
+}

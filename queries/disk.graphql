@@ -1,0 +1,28 @@
+query Disk($id: PrefixedID!) {
+  disk(id: $id) {
+    id
+    device
+    type
+    name
+    vendor
+    size
+    bytesPerSector
+    totalCylinders
+    totalHeads
+    totalSectors
+    totalTracks
+    tracksPerCylinder
+    sectorsPerTrack
+    firmwareRevision
+    serialNum
+    interfaceType
+    smartStatus
+    temperature
+    partitions {
+      name
+      fsType
+      size
+    }
+    isSpinning
+  }
+}

@@ -1,0 +1,5 @@
+mutation RcloneDeleteRCloneRemote($input: DeleteRCloneRemoteInput!) {
+  rclone {
+    deleteRCloneRemote(input: $input)
+  }
+}

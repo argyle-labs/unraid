@@ -1,0 +1,8 @@
+query LogFile($path: String!, $lines: Int, $startLine: Int) {
+  logFile(path: $path, lines: $lines, startLine: $startLine) {
+    path
+    content
+    totalLines
+    startLine
+  }
+}

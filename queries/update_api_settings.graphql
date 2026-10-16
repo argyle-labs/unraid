@@ -1,0 +1,7 @@
+mutation UpdateApiSettings($input: ConnectSettingsInput!) {
+  updateApiSettings(input: $input) {
+    accessType
+    forwardType
+    port
+  }
+}

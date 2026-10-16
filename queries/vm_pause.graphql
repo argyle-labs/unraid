@@ -1,0 +1,5 @@
+mutation VmPause($id: PrefixedID!) {
+  vm {
+    pause(id: $id)
+  }
+}

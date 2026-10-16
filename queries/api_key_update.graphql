@@ -1,0 +1,12 @@
+mutation ApiKeyUpdate($input: UpdateApiKeyInput!) {
+  apiKey {
+    update(input: $input) {
+      id
+      key
+      name
+      description
+      roles
+      createdAt
+    }
+  }
+}

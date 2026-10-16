@@ -1,0 +1,5 @@
+mutation DeleteNotification($id: PrefixedID!, $type: NotificationType!) {
+  deleteNotification(id: $id, type: $type) {
+    __typename
+  }
+}

@@ -1,0 +1,5 @@
+mutation ApiKeyRemoveRole($input: RemoveRoleFromApiKeyInput!) {
+  apiKey {
+    removeRole(input: $input)
+  }
+}

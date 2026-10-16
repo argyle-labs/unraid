@@ -1,0 +1,26 @@
+query Display {
+  display {
+    id
+    case {
+      id
+      url
+      icon
+      error
+      base64
+    }
+    theme
+    unit
+    scale
+    tabs
+    resize
+    wwn
+    total
+    usage
+    text
+    warning
+    critical
+    hot
+    max
+    locale
+  }
+}

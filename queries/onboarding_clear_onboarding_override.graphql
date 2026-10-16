@@ -1,0 +1,12 @@
+mutation OnboardingClearOnboardingOverride {
+  onboarding {
+    clearOnboardingOverride {
+      status
+      isPartnerBuild
+      completed
+      completedAtVersion
+      activationCode
+      shouldOpen
+    }
+  }
+}

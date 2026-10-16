@@ -1,0 +1,5 @@
+mutation UpdateDockerViewPreferences($viewId: String, $prefs: JSON!) {
+  updateDockerViewPreferences(viewId: $viewId, prefs: $prefs) {
+    version
+  }
+}

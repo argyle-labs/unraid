@@ -25,6 +25,8 @@ pub mod surface {
     include!(concat!(env!("OUT_DIR"), "/unraid_surface.rs"));
 }
 
+#[cfg(test)]
+mod api_coverage;
 pub mod authz;
 pub mod backup;
 pub mod checks;

@@ -1,0 +1,5 @@
+mutation MoveDockerEntriesToFolder($sourceEntryIds: [String!]!, $destinationFolderId: String!) {
+  moveDockerEntriesToFolder(sourceEntryIds: $sourceEntryIds, destinationFolderId: $destinationFolderId) {
+    version
+  }
+}

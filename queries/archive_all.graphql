@@ -1,0 +1,5 @@
+mutation ArchiveAll($importance: NotificationImportance) {
+  archiveAll(importance: $importance) {
+    __typename
+  }
+}

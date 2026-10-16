@@ -1,0 +1,14 @@
+query GetApiKey($id: PrefixedID!) {
+  apiKey(id: $id) {
+    id
+    key
+    name
+    description
+    roles
+    createdAt
+    permissions {
+      resource
+      actions
+    }
+  }
+}

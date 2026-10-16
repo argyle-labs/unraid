@@ -1,0 +1,43 @@
+query Metrics {
+  metrics {
+    id
+    cpu {
+      id
+      percentTotal
+    }
+    memory {
+      id
+      total
+      used
+      free
+      available
+      active
+      buffcache
+      percentTotal
+      swapTotal
+      swapUsed
+      swapFree
+      percentSwapTotal
+    }
+    temperature {
+      id
+    }
+    network {
+      id
+      name
+      operstate
+      bytesReceived
+      bytesSent
+      packetsReceived
+      packetsSent
+      receiveErrors
+      transmitErrors
+      receiveDropped
+      transmitDropped
+      rxSec
+      txSec
+      utilizationPercent
+      lastUpdated
+    }
+  }
+}

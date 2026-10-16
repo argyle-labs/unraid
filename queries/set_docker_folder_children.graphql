@@ -1,0 +1,5 @@
+mutation SetDockerFolderChildren($folderId: String, $childrenIds: [String!]!) {
+  setDockerFolderChildren(folderId: $folderId, childrenIds: $childrenIds) {
+    version
+  }
+}

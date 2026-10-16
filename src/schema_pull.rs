@@ -17,6 +17,7 @@
 
 use crate::{Client, Config};
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::serde_json::{self, Value};
 use std::path::{Path, PathBuf};
 
 /// Drift report: live server schema vs the committed one for the
@@ -36,6 +37,15 @@ pub struct DriftReport {
 /// the probed Unraid version. Returns a report so callers can decide
 /// whether to warn-and-continue or hard-fail.
 pub async fn check_drift(cfg: Config) -> Result<DriftReport> {
+    bounded(
+        &cfg.endpoint(),
+        PULL_TIMEOUT,
+        check_drift_inner(cfg.clone()),
+    )
+    .await
+}
+
+async fn check_drift_inner(cfg: Config) -> Result<DriftReport> {
     let client = Client::new(cfg.clone());
     let probed_version = client
         .probe_version()
@@ -44,7 +54,8 @@ pub async fn check_drift(cfg: Config) -> Result<DriftReport> {
     let live = run_introspection(&cfg).await?;
     let live_sha256 = sha256_hex(live.as_bytes());
     let embedded_sha256 = embedded_for(&probed_version).map(|s| sha256_hex(s.as_bytes()));
-    let identical = embedded_sha256.as_deref() == Some(&live_sha256);
+    let identical =
+        embedded_for(&probed_version).is_some_and(|embedded| same_schema(embedded, &live));
     Ok(DriftReport {
         probed_version,
         embedded_sha256,
@@ -66,6 +77,17 @@ pub fn embedded_for(probed: &str) -> Option<&'static str> {
         .map(|(_, s)| *s)
 }
 
+fn same_schema(a: &str, b: &str) -> bool {
+    let schema = |raw: &str| {
+        serde_json::from_str::<Value>(raw)
+            .ok()
+            .and_then(|v| v.pointer("/data/__schema").cloned())
+    };
+    schema(a).is_some_and(|a| Some(a) == schema(b))
+}
+
+pub(crate) const INTROSPECTION_QUERY: &str = include_str!("../scripts/introspection.graphql");
+
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     plugin_toolkit::hash::sha256_hex(bytes)
 }
@@ -86,6 +108,33 @@ pub struct SchemaPull {
 /// Run the schema pull. `dir` is the directory to write into — the file
 /// name is always `<version>.introspection.json`. Overwrites if present.
 pub async fn schema_pull(cfg: Config, dir: &Path) -> Result<SchemaPull> {
+    bounded(
+        &cfg.endpoint(),
+        PULL_TIMEOUT,
+        schema_pull_inner(cfg.clone(), dir),
+    )
+    .await
+}
+
+const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+const INTROSPECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn bounded<T>(
+    endpoint: &str,
+    limit: std::time::Duration,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(limit, work).await.map_err(|_| {
+        anyhow!(
+            "unraid schema pull from {} timed out after {}s; check the host is reachable \
+                 and the API key is valid",
+            endpoint,
+            limit.as_secs()
+        )
+    })?
+}
+
+async fn schema_pull_inner(cfg: Config, dir: &Path) -> Result<SchemaPull> {
     let client = Client::new(cfg.clone());
 
     let version = client
@@ -126,11 +175,14 @@ pub async fn introspect_raw(
     insecure: bool,
 ) -> Result<String> {
     let body = json!({
-        "query": graphql::INTROSPECTION_QUERY,
+        "query": INTROSPECTION_QUERY,
         "operationName": "IntrospectionQuery",
     });
     let http = http::Client::new();
-    let mut builder = http.post(endpoint).json(body);
+    let mut builder = http
+        .post(endpoint)
+        .json(body)
+        .timeout(INTROSPECTION_TIMEOUT);
     for (k, v) in headers {
         builder = builder.header(k, v);
     }
@@ -176,6 +228,43 @@ mod tests {
         let embedded = r.embedded_sha256.expect("7.3.1 is committed");
         assert_eq!(embedded.len(), 64);
         assert_ne!(embedded, r.live_sha256);
+    }
+
+    #[test]
+    fn drift_compares_schemas_not_bytes() {
+        let (_, committed) = crate::generated::SCHEMAS[0];
+        let v: Value = serde_json::from_str(committed).unwrap();
+        assert!(same_schema(
+            committed,
+            &serde_json::to_string_pretty(&v).unwrap()
+        ));
+        assert!(!same_schema(committed, r#"{"data":{"__schema":{}}}"#));
+    }
+
+    #[test]
+    fn introspection_requests_what_codegen_needs() {
+        for field in ["inputFields", "possibleTypes", "interfaces", "directives"] {
+            assert!(INTROSPECTION_QUERY.contains(field), "{field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_host_times_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+        let cfg = Config::new(server.uri(), "tok");
+        let e = bounded(
+            &cfg.endpoint(),
+            std::time::Duration::from_millis(50),
+            check_drift_inner(cfg.clone()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("timed out"), "{e}");
     }
 
     #[tokio::test]

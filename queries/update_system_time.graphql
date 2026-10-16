@@ -1,0 +1,8 @@
+mutation UpdateSystemTime($input: UpdateSystemTimeInput!) {
+  updateSystemTime(input: $input) {
+    currentTime
+    timeZone
+    useNtp
+    ntpServers
+  }
+}

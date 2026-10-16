@@ -1,0 +1,6 @@
+mutation InitiateFlashBackup($input: InitiateFlashBackupInput!) {
+  initiateFlashBackup(input: $input) {
+    status
+    jobId
+  }
+}

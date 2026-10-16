@@ -1,0 +1,11 @@
+query PublicTheme {
+  publicTheme {
+    name
+    showBannerImage
+    showBannerGradient
+    showHeaderDescription
+    headerBackgroundColor
+    headerPrimaryTextColor
+    headerSecondaryTextColor
+  }
+}

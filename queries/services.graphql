@@ -1,0 +1,11 @@
+query Services {
+  services {
+    id
+    name
+    online
+    uptime {
+      timestamp
+    }
+    version
+  }
+}

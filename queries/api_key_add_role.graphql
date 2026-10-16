@@ -1,0 +1,5 @@
+mutation ApiKeyAddRole($input: AddRoleForApiKeyInput!) {
+  apiKey {
+    addRole(input: $input)
+  }
+}

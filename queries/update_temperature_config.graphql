@@ -1,0 +1,3 @@
+mutation UpdateTemperatureConfig($input: TemperatureConfigInput!) {
+  updateTemperatureConfig(input: $input)
+}

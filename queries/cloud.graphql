@@ -1,0 +1,25 @@
+query Cloud {
+  cloud {
+    error
+    apiKey {
+      valid
+      error
+    }
+    relay {
+      status
+      timeout
+      error
+    }
+    minigraphql {
+      status
+      timeout
+      error
+    }
+    cloud {
+      status
+      ip
+      error
+    }
+    allowedOrigins
+  }
+}

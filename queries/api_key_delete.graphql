@@ -1,0 +1,5 @@
+mutation ApiKeyDelete($input: DeleteApiKeyInput!) {
+  apiKey {
+    delete(input: $input)
+  }
+}

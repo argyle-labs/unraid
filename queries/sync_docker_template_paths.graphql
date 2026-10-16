@@ -1,0 +1,8 @@
+mutation SyncDockerTemplatePaths {
+  syncDockerTemplatePaths {
+    scanned
+    matched
+    skipped
+    errors
+  }
+}

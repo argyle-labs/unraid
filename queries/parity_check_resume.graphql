@@ -1,0 +1,5 @@
+mutation ParityCheckResume {
+  parityCheck {
+    resume
+  }
+}

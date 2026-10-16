@@ -1,0 +1,13 @@
+mutation OnboardingRefreshInternalBootContext {
+  onboarding {
+    refreshInternalBootContext {
+      arrayStopped
+      bootEligible
+      bootedFromFlashWithInternalBootSetup
+      enableBootTransfer
+      reservedNames
+      shareNames
+      poolNames
+    }
+  }
+}
