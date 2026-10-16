@@ -5,6 +5,7 @@ query DockerContainers {
       id
       names
       image
+      imageId
       state
       status
       autoStart

@@ -6,6 +6,7 @@ use plugin_toolkit::contract::unit::{
     VerbOutcome,
 };
 use plugin_toolkit::schemars::{JsonSchema, schema_for};
+use plugin_toolkit::secrets;
 use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::serde_json::{self, Value, json};
 
@@ -27,10 +28,34 @@ const ACTION_RESTART: &str = "restart";
 const ACTION_AUTOSTART: &str = "autostart";
 const ACTION_REMOVE: &str = "remove";
 
+const FORCE_ACTIONS: &[&str] = &["stop", "pause", ACTION_RESTART, ACTION_REMOVE];
+
+pub(crate) const DEFAULT_PROTECTED: &[&str] = &[
+    "orca",
+    "orca-server",
+    "hydra",
+    "gitea",
+    "gitea-runner",
+    "act_runner",
+    "pbs",
+    "proxmox-backup-server",
+    "zot",
+    "adguard",
+    "adguardhome",
+    "pihole",
+    "unbound",
+    "bind9",
+];
+
+pub(crate) const MAX_AUTOSTART_WAIT: i64 = 3600;
+
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde", deny_unknown_fields)]
 #[schemars(crate = "plugin_toolkit::schemars")]
-pub struct DryRunOptIn {
+pub struct ActionPayload {
+    /// Act on a protected container.
+    #[serde(default)]
+    pub force: bool,
     /// Return the plan and change nothing. Omitted, applies.
     #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
@@ -42,7 +67,7 @@ pub struct DryRunOptIn {
 pub struct AutostartPayload {
     /// Start the container at boot.
     pub enabled: bool,
-    /// Seconds to wait after starting it; omitted keeps the current value.
+    /// Seconds (0..=3600) to wait after starting it; omitted keeps the current value.
     #[serde(default)]
     pub wait: Option<i64>,
     /// Return the plan and change nothing. Omitted, applies.
@@ -54,9 +79,12 @@ pub struct AutostartPayload {
 #[serde(crate = "plugin_toolkit::serde", deny_unknown_fields)]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct RemovePayload {
-    /// Also remove the container's image.
+    /// Also remove the container's image; refused while another container uses it.
     #[serde(default, rename = "withImage")]
     pub with_image: bool,
+    /// Act on a protected container.
+    #[serde(default)]
+    pub force: bool,
     /// Return the plan and change nothing. Omitted, applies.
     #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
@@ -99,6 +127,10 @@ fn bare_id(id: &str) -> &str {
     id.rsplit_once(':').map_or(id, |(_, b)| b)
 }
 
+fn server_prefix(id: &str) -> Option<&str> {
+    id.rsplit_once(':').map(|(p, _)| p)
+}
+
 pub(crate) fn manager_for(endpoint: &str) -> String {
     format!("{MANAGER}@{endpoint}")
 }
@@ -125,6 +157,15 @@ pub(crate) fn resolve<'a>(containers: &'a [Container], target: &str) -> Result<&
     if target.is_empty() {
         bail!("no container id or name given");
     }
+    if let Some(want) = server_prefix(target) {
+        let servers: Vec<&str> = containers
+            .iter()
+            .filter_map(|c| server_prefix(&c.id))
+            .collect();
+        if !servers.is_empty() && !servers.contains(&want) {
+            bail!("container id '{target}' belongs to another Unraid server than this endpoint");
+        }
+    }
     if let Some(c) = containers
         .iter()
         .find(|c| c.id == target || bare_id(&c.id) == bare_id(target))
@@ -148,22 +189,59 @@ fn image_repo(image: &str) -> &str {
     last.split(':').next().unwrap_or(last)
 }
 
-pub(crate) fn is_orca(c: &Container, hostname: Option<&str>) -> bool {
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn hex64_in(text: &str) -> Option<String> {
+    text.split(['/', '-', '.', ':', ' '])
+        .find(|t| is_hex64(t))
+        .map(str::to_string)
+}
+
+pub(crate) fn container_id_from_mountinfo(mountinfo: &str) -> Option<String> {
+    mountinfo.lines().find_map(|line| {
+        let (_, after) = line.split_once("/containers/")?;
+        let id = after.split('/').next()?;
+        is_hex64(id).then(|| id.to_string())
+    })
+}
+
+pub(crate) fn container_id_from_cgroup(cgroup: &str) -> Option<String> {
+    cgroup
+        .lines()
+        .filter_map(|line| line.splitn(3, ':').nth(2))
+        .find_map(hex64_in)
+}
+
+pub(crate) fn own_container_id_from(
+    mountinfo: Option<&str>,
+    cgroup: Option<&str>,
+) -> Option<String> {
+    mountinfo
+        .and_then(container_id_from_mountinfo)
+        .or_else(|| cgroup.and_then(container_id_from_cgroup))
+}
+
+fn own_container_id() -> Option<String> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok();
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
+    own_container_id_from(mountinfo.as_deref(), cgroup.as_deref())
+}
+
+pub(crate) fn is_orca(c: &Container, own_id: Option<&str>) -> bool {
+    let own = own_id.is_some_and(|id| bare_id(&c.id).eq_ignore_ascii_case(id));
     let named = c
         .names
         .iter()
         .any(|n| n.trim_start_matches('/').eq_ignore_ascii_case("orca"));
     let repo = image_repo(&c.image);
     let image = repo.eq_ignore_ascii_case("orca") || repo.eq_ignore_ascii_case("orca-server");
-    let own = hostname
-        .filter(|h| h.len() >= 12 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-        .is_some_and(|h| bare_id(&c.id).starts_with(h));
-    named || image || own
+    own || named || image
 }
 
 fn refuse_orca(c: &Container) -> Result<()> {
-    let hostname = std::env::var("HOSTNAME").ok();
-    if is_orca(c, hostname.as_deref()) {
+    if is_orca(c, own_container_id().as_deref()) {
         bail!(
             "refusing to act on '{}' ({}): it is orca's own container",
             first_name(&c.names),
@@ -171,6 +249,81 @@ fn refuse_orca(c: &Container) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn protected_secret(endpoint: &str) -> String {
+    secrets::scoped_name(MANAGER, endpoint, "protected")
+}
+
+pub(crate) fn protected_set(extra: Option<&str>) -> Vec<String> {
+    DEFAULT_PROTECTED
+        .iter()
+        .map(|s| s.to_string())
+        .chain(
+            extra
+                .unwrap_or("")
+                .split([',', '\n'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        )
+        .collect()
+}
+
+fn endpoint_protected(endpoint: &str) -> Vec<String> {
+    let extra = secrets::get(&protected_secret(endpoint)).ok().flatten();
+    protected_set(extra.as_deref())
+}
+
+pub(crate) fn protected_match(c: &Container, protected: &[String]) -> Option<String> {
+    let repo = image_repo(&c.image);
+    protected
+        .iter()
+        .find(|p| {
+            c.id == **p
+                || bare_id(&c.id) == p.as_str()
+                || c.names
+                    .iter()
+                    .any(|n| n.trim_start_matches('/').eq_ignore_ascii_case(p))
+                || repo.eq_ignore_ascii_case(p)
+        })
+        .cloned()
+}
+
+fn require_force(action: &str, protected_by: Option<&str>, force: bool) -> Result<()> {
+    match protected_by {
+        Some(p) if FORCE_ACTIONS.contains(&action) && !force => {
+            bail!("container is protected (matches '{p}'); {action} requires {{\"force\": true}}")
+        }
+        _ => Ok(()),
+    }
+}
+
+fn protection_note(protected_by: Option<&str>) -> String {
+    protected_by
+        .map(|p| format!("; protected (matches '{p}'), force required"))
+        .unwrap_or_default()
+}
+
+pub(crate) fn image_sharers<'a>(
+    containers: &'a [Container],
+    target: &Container,
+) -> Vec<&'a Container> {
+    containers
+        .iter()
+        .filter(|c| c.id != target.id)
+        .filter(|c| {
+            c.image == target.image
+                || (!target.image_id.is_empty() && c.image_id == target.image_id)
+        })
+        .collect()
+}
+
+fn names_of(cs: &[&Container]) -> String {
+    cs.iter()
+        .map(|c| first_name(&c.names))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub(crate) fn simple_document(field: &str) -> String {
@@ -183,15 +336,37 @@ pub(crate) const REMOVE_DOCUMENT: &str = "mutation DockerRemoveContainer($id: Pr
 
 pub(crate) const AUTOSTART_DOCUMENT: &str = "mutation DockerAutostart($entries: [DockerAutostartEntryInput!]!) { docker { updateAutostartConfiguration(entries: $entries) } }";
 
+type AutostartRow = (String, bool, Option<i64>, Option<i64>);
+
+pub(crate) fn autostart_snapshot(containers: &[Container]) -> Vec<AutostartRow> {
+    let mut rows: Vec<AutostartRow> = containers
+        .iter()
+        .map(|c| {
+            (
+                c.id.clone(),
+                c.auto_start,
+                c.auto_start_order,
+                c.auto_start_wait,
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
 pub(crate) fn autostart_entries(
     containers: &[Container],
     target: &str,
     enabled: bool,
     wait: Option<i64>,
-) -> Vec<Value> {
+) -> Result<Vec<Value>> {
+    if containers.is_empty() {
+        bail!("refusing to rewrite autostart from an empty container list");
+    }
+    let current = containers.iter().filter(|c| c.auto_start).count();
     let mut ordered: Vec<&Container> = containers.iter().collect();
     ordered.sort_by_key(|c| c.auto_start_order.unwrap_or(i64::MAX));
-    ordered
+    let entries: Vec<Value> = ordered
         .into_iter()
         .map(|c| {
             let is_target = c.id == target;
@@ -207,7 +382,17 @@ pub(crate) fn autostart_entries(
             }
             e
         })
-        .collect()
+        .collect();
+    let kept = entries.iter().filter(|e| e["autoStart"] == true).count();
+    let target_was_on = containers.iter().any(|c| c.id == target && c.auto_start);
+    let floor = current - usize::from(target_was_on && !enabled);
+    if kept < floor {
+        bail!(
+            "autostart entries would drop {} container(s) from autostart",
+            floor - kept
+        );
+    }
+    Ok(entries)
 }
 
 fn parse_payload<T: Default + for<'de> Deserialize<'de>>(
@@ -248,7 +433,7 @@ fn expect_container(data: &Value, field: &str) -> Result<()> {
     if data["docker"][field]["id"].is_string() {
         Ok(())
     } else {
-        bail!("unexpected response to docker.{field}: {data}")
+        bail!("unexpected response to docker.{field}: missing docker.{field}.id")
     }
 }
 
@@ -256,13 +441,14 @@ fn expect_true(data: &Value, field: &str) -> Result<()> {
     match data["docker"][field].as_bool() {
         Some(true) => Ok(()),
         Some(false) => bail!("Unraid reported docker.{field} did not succeed"),
-        None => bail!("unexpected response to docker.{field}: {data}"),
+        None => bail!("unexpected response to docker.{field}: docker.{field} is not a boolean"),
     }
 }
 
 pub(crate) async fn update_with(
     client: &Client,
     endpoint: &str,
+    protected: &[String],
     args: UpdateArgs,
 ) -> Result<VerbOutcome> {
     let all = containers(client).await?;
@@ -272,30 +458,34 @@ pub(crate) async fn update_with(
     let name = id.name.clone();
     let action = args.action.as_str();
     let payload = args.payload.as_deref();
+    let protected_by = protected_match(c, protected);
+    let note = protection_note(protected_by.as_deref());
     if let Some((_, field)) = SIMPLE_ACTIONS.iter().find(|(a, _)| *a == action) {
-        let opt: DryRunOptIn = parse_payload(action, payload)?;
-        if opt.dry_run {
+        let p: ActionPayload = parse_payload(action, payload)?;
+        if p.dry_run {
             return Ok(plan(
                 id,
-                format!("docker.{field} container '{name}' ({})", c.id),
+                format!("docker.{field} container '{name}' ({}){note}", c.id),
             ));
         }
+        require_force(action, protected_by.as_deref(), p.force)?;
         let data = mutate(client, &simple_document(field), json!({ "id": c.id })).await?;
         expect_container(&data, field)?;
         return Ok(changed(format!("{action} {name}")));
     }
     match action {
         ACTION_RESTART => {
-            let opt: DryRunOptIn = parse_payload(action, payload)?;
-            if opt.dry_run {
+            let p: ActionPayload = parse_payload(action, payload)?;
+            if p.dry_run {
                 return Ok(plan(
                     id,
                     format!(
-                        "docker.stop then docker.start container '{name}' ({})",
+                        "docker.stop then docker.start container '{name}' ({}){note}",
                         c.id
                     ),
                 ));
             }
+            require_force(action, protected_by.as_deref(), p.force)?;
             for field in ["stop", "start"] {
                 let data = mutate(client, &simple_document(field), json!({ "id": c.id })).await?;
                 expect_container(&data, field)?;
@@ -307,30 +497,57 @@ pub(crate) async fn update_with(
                 .ok_or_else(|| anyhow!("autostart requires a payload {{\"enabled\": bool}}"))?;
             let p: AutostartPayload =
                 serde_json::from_str(raw).map_err(|e| anyhow!("autostart payload: {e}"))?;
+            if let Some(w) = p.wait
+                && !(0..=MAX_AUTOSTART_WAIT).contains(&w)
+            {
+                bail!("autostart wait must be 0..={MAX_AUTOSTART_WAIT} seconds, got {w}");
+            }
+            let entries = autostart_entries(&all, &c.id, p.enabled, p.wait)?;
             if p.dry_run {
                 return Ok(plan(
                     id,
                     format!(
-                        "docker.updateAutostartConfiguration: '{name}' autoStart {} -> {}",
-                        c.auto_start, p.enabled
+                        "docker.updateAutostartConfiguration: '{name}' autoStart {} -> {}, {} entries rewritten{note}",
+                        c.auto_start,
+                        p.enabled,
+                        entries.len()
                     ),
                 ));
             }
-            let entries = autostart_entries(&all, &c.id, p.enabled, p.wait);
+            let fresh = containers(client).await?;
+            if autostart_snapshot(&fresh) != autostart_snapshot(&all) {
+                bail!("autostart configuration changed while planning; nothing was written, retry");
+            }
             let data = mutate(client, AUTOSTART_DOCUMENT, json!({ "entries": entries })).await?;
             expect_true(&data, "updateAutostartConfiguration")?;
             Ok(changed(format!("autostart {name} = {}", p.enabled)))
         }
         ACTION_REMOVE => {
             let p: RemovePayload = parse_payload(action, payload)?;
+            let sharers = image_sharers(&all, c);
+            let shared = if p.with_image && !sharers.is_empty() {
+                format!(
+                    "; withImage refused: image also used by {}",
+                    names_of(&sharers)
+                )
+            } else {
+                String::new()
+            };
             if p.dry_run {
                 return Ok(plan(
                     id,
                     format!(
-                        "docker.removeContainer '{name}' ({}), withImage={}",
+                        "docker.removeContainer '{name}' ({}), withImage={}{shared}{note}",
                         c.id, p.with_image
                     ),
                 ));
+            }
+            require_force(action, protected_by.as_deref(), p.force)?;
+            if !shared.is_empty() {
+                bail!(
+                    "refusing withImage: image of '{name}' is also used by {}",
+                    names_of(&sharers)
+                );
             }
             let data = mutate(
                 client,
@@ -348,14 +565,16 @@ pub(crate) async fn update_with(
 pub(crate) async fn delete_with(
     client: &Client,
     endpoint: &str,
+    protected: &[String],
     args: DeleteArgs,
 ) -> Result<VerbOutcome> {
     let all = containers(client).await?;
     let c = resolve(&all, &args.id.id)?;
     refuse_orca(c)?;
     let id = unit_id(endpoint, c);
+    let note = protection_note(protected_match(c, protected).as_deref());
     let text = format!(
-        "docker.removeContainer '{}' ({}); apply with update action={ACTION_REMOVE}",
+        "docker.removeContainer '{}' ({}); apply with update action={ACTION_REMOVE}{note}",
         id.name, c.id
     );
     Ok(plan(id, text))
@@ -433,14 +652,14 @@ impl UnraidUnitProvider {
         require_admin("unraid container update", args.caller.as_ref())?;
         let endpoint = endpoint_of(&args.id)?.to_string();
         let client = client_for(&endpoint).await?;
-        update_with(&client, &endpoint, args).await
+        update_with(&client, &endpoint, &endpoint_protected(&endpoint), args).await
     }
 
     async fn delete(&self, args: DeleteArgs) -> Result<VerbOutcome> {
         require_admin("unraid container delete", args.caller.as_ref())?;
         let endpoint = endpoint_of(&args.id)?.to_string();
         let client = client_for(&endpoint).await?;
-        delete_with(&client, &endpoint, args).await
+        delete_with(&client, &endpoint, &endpoint_protected(&endpoint), args).await
     }
 
     async fn detail(&self, args: DetailArgs) -> Result<VerbOutcome> {
@@ -451,14 +670,13 @@ impl UnraidUnitProvider {
 }
 
 fn update_actions() -> Vec<ActionDecl> {
-    let opt_in = || Some(schema_for!(DryRunOptIn));
     let mut out: Vec<ActionDecl> = SIMPLE_ACTIONS
         .iter()
         .map(|(a, _)| *a)
         .chain([ACTION_RESTART])
         .map(|a| ActionDecl {
             action: a.into(),
-            payload_schema: opt_in(),
+            payload_schema: Some(schema_for!(ActionPayload)),
             response_schema: None,
         })
         .collect();
