@@ -8,6 +8,8 @@ query DockerContainers {
       state
       status
       autoStart
+      autoStartOrder
+      autoStartWait
       iconUrl
       webUiUrl
       isUpdateAvailable

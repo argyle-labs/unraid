@@ -157,6 +157,8 @@ mod tests {
             state,
             status: "Up 1 hour".to_string(),
             auto_start: false,
+            auto_start_order: None,
+            auto_start_wait: None,
             icon_url: icon.map(str::to_string),
             web_ui_url: webui.map(str::to_string),
             is_update_available: update,
