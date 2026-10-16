@@ -186,7 +186,7 @@ pub struct UnraidCreateOutput {
 
 /// Register an Unraid endpoint. The API key goes to the secrets domain, never
 /// the endpoint row.
-#[orca_tool(domain = "unraid", verb = "create")]
+#[orca_tool(domain = "unraid", verb = "create", role = "admin")]
 pub(crate) async fn unraid_create(
     args: UnraidCreateArgs,
     _ctx: &ToolCtx,
@@ -241,7 +241,7 @@ pub struct UnraidUpdateOutput {
 }
 
 /// Patch an Unraid endpoint. `api_key` is written to the secrets domain.
-#[orca_tool(domain = "unraid", verb = "update")]
+#[orca_tool(domain = "unraid", verb = "update", role = "admin")]
 async fn unraid_update(args: UnraidUpdateArgs, _ctx: &ToolCtx) -> Result<UnraidUpdateOutput> {
     validate_name(&args.name)?;
     if args.api_key.as_deref().is_some_and(|k| k.trim().is_empty()) {
@@ -294,7 +294,7 @@ pub struct UnraidDeleteOutput {
 }
 
 /// Remove an Unraid endpoint and its stored API key.
-#[orca_tool(domain = "unraid", verb = "delete")]
+#[orca_tool(domain = "unraid", verb = "delete", role = "admin")]
 async fn unraid_delete(args: UnraidDeleteArgs, _ctx: &ToolCtx) -> Result<UnraidDeleteOutput> {
     validate_name(&args.name)?;
     let changed = endpoint_db::remove(&args.name)?;

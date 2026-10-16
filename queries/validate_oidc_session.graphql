@@ -1,6 +1,0 @@
-query ValidateOidcSession($token: String!) {
-  validateOidcSession(token: $token) {
-    valid
-    username
-  }
-}

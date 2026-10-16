@@ -48,6 +48,11 @@ fn main() {
     for scalar in ["BigInt", "DateTime", "JSON", "Port", "PrefixedID", "URL"] {
         src = hoist_scalar(&src, scalar);
     }
+    std::fs::write(
+        out_dir.join("unraid_surface_text.rs"),
+        format!("pub(crate) const SURFACE_SOURCE: &str = {src:?};\n"),
+    )
+    .expect("write unraid_surface_text.rs");
     std::fs::write(&surface, src).expect("write unraid_surface.rs");
 }
 

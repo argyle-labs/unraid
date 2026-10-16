@@ -3,8 +3,6 @@ mutation RcloneCreateRCloneRemote($input: CreateRCloneRemoteInput!) {
     createRCloneRemote(input: $input) {
       name
       type
-      parameters
-      config
     }
   }
 }

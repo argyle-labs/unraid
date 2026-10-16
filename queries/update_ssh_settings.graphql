@@ -147,6 +147,5 @@ mutation UpdateSshSettings($input: UpdateSshInput!) {
     shareNfsCount
     shareAfpCount
     shareMoverActive
-    csrfToken
   }
 }

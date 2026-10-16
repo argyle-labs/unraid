@@ -27,8 +27,7 @@ fn from_config(from: &str, api_key: impl Into<String>, insecure: bool) -> Result
 
 /// Resolve a [`Client`] for an auto-generated surface tool (`crate::surface`).
 ///
-/// Connection selection, in order: an explicit `from` + `api_key` override wins
-/// (paired with optional `insecure`); otherwise the named endpoint from the
+/// Connection selection: the named endpoint from the
 /// registry (`unraid.{list,create,...}`); otherwise, when `endpoint` is omitted
 /// and exactly one endpoint is registered, that sole endpoint. Anything else is
 /// an error naming the fix.
@@ -38,13 +37,10 @@ pub(crate) async fn surface_client(
     api_key: Option<String>,
     insecure: Option<bool>,
 ) -> Result<Client> {
-    if let Some(url) = from {
-        let key = api_key.ok_or_else(|| anyhow!("`api_key` is required when `from` is set"))?;
-        return Ok(Client::new(from_config(
-            &url,
-            key,
-            insecure.unwrap_or(false),
-        )?));
+    if from.is_some() || api_key.is_some() || insecure.is_some() {
+        bail!(
+            "`from`/`api_key`/`insecure` overrides are not accepted on surface tools — register an endpoint with `unraid.create`"
+        );
     }
     let row = match endpoint {
         Some(name) => endpoint_db::get(&name)?
@@ -53,14 +49,8 @@ pub(crate) async fn surface_client(
             let mut all = endpoint_db::list()?;
             match all.len() {
                 1 => all.remove(0),
-                0 => bail!(
-                    "no unraid endpoints registered — add one with `unraid.create`, \
-                     or pass `from` + `api_key`"
-                ),
-                n => bail!(
-                    "{n} unraid endpoints registered — pass `endpoint` to pick one, \
-                     or `from` + `api_key`"
-                ),
+                0 => bail!("no unraid endpoints registered — add one with `unraid.create`"),
+                n => bail!("{n} unraid endpoints registered — pass `endpoint` to pick one"),
             }
         }
     };
@@ -132,7 +122,7 @@ pub struct UnraidSchemaOutput {
 /// Without args: lists embedded versions. With `from` + `api_key`: probes a
 /// live host and either pulls a fresh introspection (when `dir` set) or
 /// reports drift (when `check_drift` set).
-#[orca_tool(domain = "unraid", verb = "schema")]
+#[orca_tool(domain = "unraid", verb = "schema", role = "admin")]
 async fn unraid_schema(args: UnraidSchemaArgs, _ctx: &ToolCtx) -> Result<UnraidSchemaOutput> {
     let embedded_versions = crate::generated::SCHEMAS
         .iter()
@@ -328,14 +318,36 @@ mod tests {
             err.to_string().contains("`from` must not be blank"),
             "{err}"
         );
-        let err = surface_client(None, Some(String::new()), Some("tok".into()), None)
-            .await
-            .err()
-            .unwrap();
-        assert!(
-            err.to_string().contains("`from` must not be blank"),
-            "{err}"
-        );
+    }
+
+    #[tokio::test]
+    async fn surface_client_rejects_connection_overrides() {
+        for (endpoint, from, key, insecure) in [
+            (
+                None,
+                Some("http://10.0.0.5".into()),
+                Some("tok".into()),
+                None,
+            ),
+            (None, Some("http://10.0.0.5".into()), None, None),
+            (
+                Some("tower".into()),
+                Some("http://10.0.0.5".into()),
+                None,
+                None,
+            ),
+            (None, None, Some("tok".into()), None),
+            (None, None, None, Some(true)),
+        ] {
+            let endpoint: Option<String> = endpoint;
+            let from: Option<String> = from;
+            let key: Option<String> = key;
+            let err = surface_client(endpoint, from, key, insecure)
+                .await
+                .err()
+                .unwrap();
+            assert!(err.to_string().contains("not accepted"), "{err}");
+        }
     }
 
     #[test]
