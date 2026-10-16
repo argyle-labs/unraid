@@ -53,6 +53,7 @@ pub mod smb_shares;
 pub(crate) mod test_support;
 pub mod tools;
 pub mod topology;
+pub mod unit_provider;
 pub mod ups;
 pub mod version;
 pub mod vm_autostart;

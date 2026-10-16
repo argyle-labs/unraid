@@ -45,6 +45,7 @@ fn main() -> plugin_toolkit::anyhow::Result<()> {
         .version(env!("CARGO_PKG_VERSION"))
         .tools(["unraid."])
         .topology(unraid::topology::UnraidTopology)
+        .unit(unraid::unit_provider::UnraidUnitProvider)
         .diagnostics(unraid::registration::UnraidDiagnostics)
         .ups(unraid::registration::UnraidUps)
         .permissions(unraid::permissions::UnraidPermissions)
