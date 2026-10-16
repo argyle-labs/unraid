@@ -309,13 +309,11 @@ fn selected_leaves(doc: &str) -> Vec<String> {
     out
 }
 
-fn surface_source() -> String {
-    std::fs::read_to_string(concat!(env!("OUT_DIR"), "/unraid_surface.rs")).unwrap()
-}
+include!(concat!(env!("OUT_DIR"), "/unraid_surface_text.rs"));
 
 #[test]
 fn every_mutation_tool_is_admin() {
-    let surface = surface_source();
+    let surface = SURFACE_SOURCE;
     let attrs: Vec<&str> = surface
         .lines()
         .filter(|l| l.starts_with("#[orca_tool("))
@@ -354,7 +352,7 @@ fn no_operation_selects_a_secret_leaf() {
 
 #[test]
 fn install_plugin_is_not_surfaced() {
-    let surface = surface_source();
+    let surface = SURFACE_SOURCE;
     assert!(!surface.contains("verb = \"install_plugin\""));
 }
 
