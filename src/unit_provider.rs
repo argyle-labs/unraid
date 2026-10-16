@@ -28,7 +28,13 @@ const ACTION_RESTART: &str = "restart";
 const ACTION_AUTOSTART: &str = "autostart";
 const ACTION_REMOVE: &str = "remove";
 
-const FORCE_ACTIONS: &[&str] = &["stop", "pause", ACTION_RESTART, ACTION_REMOVE];
+const FORCE_ACTIONS: &[&str] = &[
+    "stop",
+    "pause",
+    ACTION_RESTART,
+    ACTION_REMOVE,
+    ACTION_AUTOSTART,
+];
 
 pub(crate) const DEFAULT_PROTECTED: &[&str] = &[
     "orca",
@@ -67,6 +73,9 @@ pub struct ActionPayload {
 pub struct AutostartPayload {
     /// Start the container at boot.
     pub enabled: bool,
+    /// Disable autostart on a protected container.
+    #[serde(default)]
+    pub force: bool,
     /// Seconds (0..=3600) to wait after starting it; omitted keeps the current value.
     #[serde(default)]
     pub wait: Option<i64>,
@@ -199,11 +208,21 @@ fn hex64_in(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+const RUNTIME_MOUNTS: &[&str] = &["/etc/hostname", "/etc/hosts", "/etc/resolv.conf"];
+
 pub(crate) fn container_id_from_mountinfo(mountinfo: &str) -> Option<String> {
     mountinfo.lines().find_map(|line| {
-        let (_, after) = line.split_once("/containers/")?;
-        let id = after.split('/').next()?;
-        is_hex64(id).then(|| id.to_string())
+        let fields: Vec<&str> = line.split(' ').collect();
+        let (root, mount_point) = (fields.get(3)?, fields.get(4)?);
+        if !RUNTIME_MOUNTS.contains(mount_point) {
+            return None;
+        }
+        let mut dirs = root.rsplit('/').skip(1);
+        let mut id = dirs.next()?;
+        if id == "userdata" {
+            id = dirs.next()?;
+        }
+        is_hex64(id).then(|| id.to_ascii_lowercase())
     })
 }
 
@@ -218,9 +237,9 @@ pub(crate) fn own_container_id_from(
     mountinfo: Option<&str>,
     cgroup: Option<&str>,
 ) -> Option<String> {
-    mountinfo
-        .and_then(container_id_from_mountinfo)
-        .or_else(|| cgroup.and_then(container_id_from_cgroup))
+    cgroup
+        .and_then(container_id_from_cgroup)
+        .or_else(|| mountinfo.and_then(container_id_from_mountinfo))
 }
 
 fn own_container_id() -> Option<String> {
@@ -270,24 +289,120 @@ pub(crate) fn protected_set(extra: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-fn endpoint_protected(endpoint: &str) -> Vec<String> {
-    let extra = secrets::get(&protected_secret(endpoint)).ok().flatten();
-    protected_set(extra.as_deref())
+fn endpoint_protected(endpoint: &str) -> Result<Vec<String>> {
+    let extra = secrets::get(&protected_secret(endpoint)).map_err(|e| {
+        anyhow!("cannot read the protected list for endpoint '{endpoint}'; refusing to act: {e}")
+    })?;
+    Ok(protected_set(extra.as_deref()))
+}
+
+fn image_path(image: &str) -> &str {
+    let no_digest = image.split('@').next().unwrap_or(image);
+    match no_digest.rsplit_once(':') {
+        Some((path, tag)) if !tag.contains('/') => path,
+        _ => no_digest,
+    }
+}
+
+fn protects(p: &str, c: &Container) -> bool {
+    let id_prefix = p.len() >= 12
+        && p.bytes().all(|b| b.is_ascii_hexdigit())
+        && bare_id(&c.id)
+            .to_ascii_lowercase()
+            .starts_with(&p.to_ascii_lowercase());
+    let image = if p.contains('/') {
+        image_path(&c.image).eq_ignore_ascii_case(p)
+    } else {
+        image_repo(&c.image).eq_ignore_ascii_case(p)
+    };
+    c.id.eq_ignore_ascii_case(p)
+        || id_prefix
+        || image
+        || c.names
+            .iter()
+            .any(|n| n.trim_start_matches('/').eq_ignore_ascii_case(p))
 }
 
 pub(crate) fn protected_match(c: &Container, protected: &[String]) -> Option<String> {
-    let repo = image_repo(&c.image);
+    protected.iter().find(|p| protects(p, c)).cloned()
+}
+
+pub(crate) fn unmatched_protected<'a>(
+    containers: &[Container],
+    protected: &'a [String],
+) -> Vec<&'a str> {
     protected
         .iter()
-        .find(|p| {
-            c.id == **p
-                || bare_id(&c.id) == p.as_str()
-                || c.names
-                    .iter()
-                    .any(|n| n.trim_start_matches('/').eq_ignore_ascii_case(p))
-                || repo.eq_ignore_ascii_case(p)
+        .filter(|p| !DEFAULT_PROTECTED.contains(&p.as_str()))
+        .filter(|p| !containers.iter().any(|c| protects(p, c)))
+        .map(String::as_str)
+        .collect()
+}
+
+fn warn_unmatched(endpoint: &str, containers: &[Container], protected: &[String]) {
+    for p in unmatched_protected(containers, protected) {
+        plugin_toolkit::tracing::warn!(
+            endpoint = %endpoint,
+            entry = %p,
+            "unraid protected entry matches no container"
+        );
+    }
+}
+
+fn is_stopped(c: &Container) -> bool {
+    matches!(
+        c.state,
+        crate::generated::v7_3_1::docker_containers::ContainerState::EXITED
+    )
+}
+
+fn state_of(c: &Container) -> String {
+    format!("{:?}", c.state).to_lowercase()
+}
+
+type EndpointLocks =
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>;
+
+fn autostart_lock(endpoint: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<EndpointLocks> = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(endpoint.to_string())
+        .or_default()
+        .clone()
+}
+
+pub(crate) fn expected_after(
+    before: &[Container],
+    target: &str,
+    enabled: bool,
+) -> Vec<(String, bool)> {
+    let mut rows: Vec<(String, bool)> = before
+        .iter()
+        .map(|c| {
+            (
+                c.id.clone(),
+                if c.id == target {
+                    enabled
+                } else {
+                    c.auto_start
+                },
+            )
         })
-        .cloned()
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn autostart_flags(containers: &[Container]) -> Vec<(String, bool)> {
+    let mut rows: Vec<(String, bool)> = containers
+        .iter()
+        .map(|c| (c.id.clone(), c.auto_start))
+        .collect();
+    rows.sort();
+    rows
 }
 
 fn require_force(action: &str, protected_by: Option<&str>, force: bool) -> Result<()> {
@@ -313,7 +428,7 @@ pub(crate) fn image_sharers<'a>(
         .iter()
         .filter(|c| c.id != target.id)
         .filter(|c| {
-            c.image == target.image
+            image_path(&c.image).eq_ignore_ascii_case(image_path(&target.image))
                 || (!target.image_id.is_empty() && c.image_id == target.image_id)
         })
         .collect()
@@ -458,6 +573,7 @@ pub(crate) async fn update_with(
     let name = id.name.clone();
     let action = args.action.as_str();
     let payload = args.payload.as_deref();
+    warn_unmatched(endpoint, &all, protected);
     let protected_by = protected_match(c, protected);
     let note = protection_note(protected_by.as_deref());
     if let Some((_, field)) = SIMPLE_ACTIONS.iter().find(|(a, _)| *a == action) {
@@ -503,6 +619,7 @@ pub(crate) async fn update_with(
                 bail!("autostart wait must be 0..={MAX_AUTOSTART_WAIT} seconds, got {w}");
             }
             let entries = autostart_entries(&all, &c.id, p.enabled, p.wait)?;
+            let disabling = c.auto_start && !p.enabled;
             if p.dry_run {
                 return Ok(plan(
                     id,
@@ -514,18 +631,32 @@ pub(crate) async fn update_with(
                     ),
                 ));
             }
+            if disabling {
+                require_force(ACTION_AUTOSTART, protected_by.as_deref(), p.force)?;
+            }
+            let lock = autostart_lock(endpoint);
+            let _held = lock.lock().await;
             let fresh = containers(client).await?;
             if autostart_snapshot(&fresh) != autostart_snapshot(&all) {
                 bail!("autostart configuration changed while planning; nothing was written, retry");
             }
             let data = mutate(client, AUTOSTART_DOCUMENT, json!({ "entries": entries })).await?;
             expect_true(&data, "updateAutostartConfiguration")?;
+            let after = containers(client).await?;
+            if autostart_flags(&after) != expected_after(&all, &c.id, p.enabled) {
+                bail!(
+                    "autostart for '{name}' was written but the configuration read back differs; \
+                     another writer changed it concurrently (lost update), re-check before retrying"
+                );
+            }
             Ok(changed(format!("autostart {name} = {}", p.enabled)))
         }
         ACTION_REMOVE => {
             let p: RemovePayload = parse_payload(action, payload)?;
             let sharers = image_sharers(&all, c);
-            let shared = if p.with_image && !sharers.is_empty() {
+            let shared = if p.with_image && c.image_id.is_empty() {
+                "; withImage refused: Unraid reported no imageId".to_string()
+            } else if p.with_image && !sharers.is_empty() {
                 format!(
                     "; withImage refused: image also used by {}",
                     names_of(&sharers)
@@ -533,21 +664,27 @@ pub(crate) async fn update_with(
             } else {
                 String::new()
             };
+            let state = state_of(c);
+            let running = if is_stopped(c) {
+                String::new()
+            } else {
+                format!("; container is {state}, force required")
+            };
             if p.dry_run {
                 return Ok(plan(
                     id,
                     format!(
-                        "docker.removeContainer '{name}' ({}), withImage={}{shared}{note}",
+                        "docker.removeContainer '{name}' ({}), state={state}, withImage={}{shared}{running}{note}",
                         c.id, p.with_image
                     ),
                 ));
             }
             require_force(action, protected_by.as_deref(), p.force)?;
+            if !is_stopped(c) && !p.force {
+                bail!("'{name}' is {state}; stop it first or pass {{\"force\": true}}");
+            }
             if !shared.is_empty() {
-                bail!(
-                    "refusing withImage: image of '{name}' is also used by {}",
-                    names_of(&sharers)
-                );
+                bail!("refusing withImage for '{name}'{shared}");
             }
             let data = mutate(
                 client,
@@ -572,6 +709,7 @@ pub(crate) async fn delete_with(
     let c = resolve(&all, &args.id.id)?;
     refuse_orca(c)?;
     let id = unit_id(endpoint, c);
+    warn_unmatched(endpoint, &all, protected);
     let note = protection_note(protected_match(c, protected).as_deref());
     let text = format!(
         "docker.removeContainer '{}' ({}); apply with update action={ACTION_REMOVE}{note}",
@@ -652,14 +790,14 @@ impl UnraidUnitProvider {
         require_admin("unraid container update", args.caller.as_ref())?;
         let endpoint = endpoint_of(&args.id)?.to_string();
         let client = client_for(&endpoint).await?;
-        update_with(&client, &endpoint, &endpoint_protected(&endpoint), args).await
+        update_with(&client, &endpoint, &endpoint_protected(&endpoint)?, args).await
     }
 
     async fn delete(&self, args: DeleteArgs) -> Result<VerbOutcome> {
         require_admin("unraid container delete", args.caller.as_ref())?;
         let endpoint = endpoint_of(&args.id)?.to_string();
         let client = client_for(&endpoint).await?;
-        delete_with(&client, &endpoint, &endpoint_protected(&endpoint), args).await
+        delete_with(&client, &endpoint, &endpoint_protected(&endpoint)?, args).await
     }
 
     async fn detail(&self, args: DetailArgs) -> Result<VerbOutcome> {
