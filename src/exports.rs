@@ -39,6 +39,7 @@
 //! `Stale file handle` on whichever mount loses the race.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -75,7 +76,7 @@ impl UnraidExports {
                      only user shares have a persistent share config"
                 ))
             })?;
-        if rest.is_empty() || rest.contains('/') {
+        if rest.is_empty() || rest == "." || rest == ".." || rest.contains('/') {
             return Err(StorageError::Other(format!(
                 "'{path}' is not a single user share directly under {USER_SHARE_ROOT}"
             )));
@@ -338,14 +339,41 @@ impl UnraidExports {
         if let Some(fsid) = entry.fsid.as_deref().filter(|s| !s.is_empty()) {
             export_opts.push(format!("fsid={fsid}"));
         }
-        export_opts.push("async".to_string());
-        export_opts.push("no_subtree_check".to_string());
+        let has = |names: &[&str]| entry.options.iter().any(|o| names.contains(&o.as_str()));
+        if !has(&["sync", "async"]) {
+            export_opts.push("sync".to_string());
+        }
+        if !has(&["subtree_check", "no_subtree_check"]) {
+            export_opts.push("no_subtree_check".to_string());
+        }
         format!(
             "\"{}\" -{} {}",
             entry.path,
             export_opts.join(","),
             Self::render_host_list(&entry.allowed_clients, &entry.options)
         )
+    }
+
+    fn write_atomic(path: &Path, contents: &str) -> Result<(), StorageError> {
+        let fail =
+            |e: std::io::Error| StorageError::Other(format!("write {}: {e}", path.display()));
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let tmp = path.with_file_name(format!(".{name}.tmp"));
+        let mut file = fs::File::create(&tmp).map_err(fail)?;
+        let result = (|| {
+            file.write_all(contents.as_bytes())?;
+            if let Ok(meta) = fs::metadata(path)
+                && file.metadata()?.permissions() != meta.permissions()
+            {
+                file.set_permissions(meta.permissions())?;
+            }
+            file.sync_all()?;
+            fs::rename(&tmp, path)
+        })();
+        if result.is_err() {
+            fs::remove_file(&tmp).ok();
+        }
+        result.map_err(fail)
     }
 
     /// Re-read the live export table so callers see what was actually applied.
@@ -421,14 +449,12 @@ impl StorageBackend for UnraidExports {
                 Self::render_host_list(&entry.allowed_clients, &entry.options),
             ),
         ];
-        fs::write(&cfg, Self::write_cfg_keys(&text, &updates))
-            .map_err(|e| StorageError::Other(format!("write {}: {e}", cfg.display())))?;
+        Self::write_atomic(&cfg, &Self::write_cfg_keys(&text, &updates))?;
 
         // 2. Make it live.
         let current = fs::read_to_string(EXPORTS_FILE).unwrap_or_default();
         let next = Self::rewrite_exports(&current, &entry.path, Some(&Self::exports_line(entry)));
-        fs::write(EXPORTS_FILE, next)
-            .map_err(|e| StorageError::Other(format!("write {EXPORTS_FILE}: {e}")))?;
+        Self::write_atomic(Path::new(EXPORTS_FILE), &next)?;
         Self::reexport()?;
 
         // 3. Read back rather than echo the request, so a value the host
@@ -453,8 +479,7 @@ impl StorageBackend for UnraidExports {
         match fs::read_to_string(&cfg) {
             Ok(text) => {
                 let updates = vec![("shareExportNFS", "-".to_string())];
-                fs::write(&cfg, Self::write_cfg_keys(&text, &updates))
-                    .map_err(|e| StorageError::Other(format!("write {}: {e}", cfg.display())))?;
+                Self::write_atomic(&cfg, &Self::write_cfg_keys(&text, &updates))?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(Self::cfg_read_error(&name, &cfg, &e)),
@@ -462,8 +487,7 @@ impl StorageBackend for UnraidExports {
 
         let current = fs::read_to_string(EXPORTS_FILE).unwrap_or_default();
         let next = Self::rewrite_exports(&current, path, None);
-        fs::write(EXPORTS_FILE, next)
-            .map_err(|e| StorageError::Other(format!("write {EXPORTS_FILE}: {e}")))?;
+        Self::write_atomic(Path::new(EXPORTS_FILE), &next)?;
         Self::reexport()
     }
 }
@@ -653,9 +677,56 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         let e = UnraidExports::entry_from_cfg("pbs", PBS_CFG).unwrap();
         assert_eq!(
             UnraidExports::exports_line(&e),
-            "\"/mnt/user/pbs\" -fsid=209,async,no_subtree_check \
-             10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
+            "\"/mnt/user/pbs\" -fsid=209 10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         );
+    }
+
+    fn entry(options: &[&str]) -> ExportEntry {
+        ExportEntry {
+            path: "/mnt/user/pbs".to_string(),
+            allowed_clients: vec!["10.0.0.17".to_string()],
+            options: options.iter().map(|o| o.to_string()).collect(),
+            fsid: Some("209".to_string()),
+        }
+    }
+
+    #[test]
+    fn exports_line_defaults_to_sync_and_never_forces_async() {
+        assert_eq!(
+            UnraidExports::exports_line(&entry(&["rw"])),
+            "\"/mnt/user/pbs\" -fsid=209,sync,no_subtree_check 10.0.0.17(rw)"
+        );
+        assert_eq!(
+            UnraidExports::exports_line(&entry(&["rw", "async", "subtree_check"])),
+            "\"/mnt/user/pbs\" -fsid=209 10.0.0.17(rw,async,subtree_check)"
+        );
+    }
+
+    #[test]
+    fn no_root_squash_is_emitted_only_when_requested() {
+        assert!(!UnraidExports::exports_line(&entry(&["rw", "sync"])).contains("no_root_squash"));
+        assert!(
+            UnraidExports::exports_line(&entry(&["rw", "no_root_squash"]))
+                .contains("(rw,no_root_squash)")
+        );
+    }
+
+    #[test]
+    fn atomic_write_replaces_contents_and_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("unraid-exports-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("exports");
+        fs::write(&path, "old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        UnraidExports::write_atomic(&path, "new\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!dir.join(".exports.tmp").exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -682,6 +753,8 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         assert!(UnraidExports::share_name("/mnt/disk1/pbs").is_err());
         assert!(UnraidExports::share_name("/mnt/user").is_err());
         assert!(UnraidExports::share_name("/mnt/user/a/b").is_err());
+        assert!(UnraidExports::share_name("/mnt/user/.").is_err());
+        assert!(UnraidExports::share_name("/mnt/user/..").is_err());
         assert_eq!(UnraidExports::share_name("/mnt/user/pbs").unwrap(), "pbs");
         assert_eq!(UnraidExports::share_name("/mnt/user/pbs/").unwrap(), "pbs");
     }
