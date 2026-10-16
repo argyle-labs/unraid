@@ -374,35 +374,130 @@ fn autostart_lock(endpoint: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-pub(crate) fn expected_after(
-    before: &[Container],
-    target: &str,
-    enabled: bool,
-) -> Vec<(String, bool)> {
-    let mut rows: Vec<(String, bool)> = before
-        .iter()
-        .map(|c| {
-            (
-                c.id.clone(),
-                if c.id == target {
-                    enabled
-                } else {
-                    c.auto_start
-                },
-            )
-        })
-        .collect();
-    rows.sort();
-    rows
+pub(crate) const AUTOSTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AutostartVerdict {
+    Applied,
+    OthersChanged(Vec<String>),
+    NotApplied,
 }
 
-fn autostart_flags(containers: &[Container]) -> Vec<(String, bool)> {
-    let mut rows: Vec<(String, bool)> = containers
+#[derive(Debug, PartialEq, Eq)]
+struct AutostartState {
+    auto_start: bool,
+    wait: Option<i64>,
+    rank: Option<usize>,
+}
+
+fn sent_states(entries: &[Value]) -> Vec<(String, AutostartState)> {
+    let mut rank = 0;
+    entries
         .iter()
-        .map(|c| (c.id.clone(), c.auto_start))
+        .map(|e| {
+            let auto_start = e["autoStart"] == true;
+            let state = AutostartState {
+                auto_start,
+                wait: e["wait"].as_i64(),
+                rank: auto_start.then_some(rank),
+            };
+            rank += usize::from(auto_start);
+            (e["id"].as_str().unwrap_or_default().to_string(), state)
+        })
+        .collect()
+}
+
+fn read_states(containers: &[Container]) -> Vec<(String, AutostartState)> {
+    let mut enabled: Vec<&Container> = containers.iter().filter(|c| c.auto_start).collect();
+    enabled.sort_by_key(|c| c.auto_start_order.unwrap_or(i64::MAX));
+    containers
+        .iter()
+        .map(|c| {
+            let rank = c
+                .auto_start_order
+                .and_then(|_| enabled.iter().position(|e| e.id == c.id));
+            let state = AutostartState {
+                auto_start: c.auto_start,
+                wait: c.auto_start_wait,
+                rank,
+            };
+            (c.id.clone(), state)
+        })
+        .collect()
+}
+
+fn landed(sent: &AutostartState, read: &AutostartState) -> bool {
+    sent.auto_start == read.auto_start
+        && (sent.wait.is_none() || sent.wait == read.wait)
+        && (read.rank.is_none() || sent.rank == read.rank)
+}
+
+pub(crate) fn verify_autostart(
+    entries: &[Value],
+    after: &[Container],
+    target: &str,
+) -> AutostartVerdict {
+    let sent = sent_states(entries);
+    let read = read_states(after);
+    let read_of = |id: &str| read.iter().find(|(i, _)| i == id).map(|(_, s)| s);
+    let name_of = |id: &str| {
+        after
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| first_name(&c.names))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| id.to_string())
+    };
+    let ours = sent.iter().find(|(id, _)| id == target);
+    if !ours.is_some_and(|(id, s)| read_of(id).is_some_and(|r| landed(s, r))) {
+        return AutostartVerdict::NotApplied;
+    }
+    let mut others: Vec<String> = sent
+        .iter()
+        .filter(|(id, _)| id != target)
+        .filter(|(id, s)| !read_of(id).is_some_and(|r| landed(s, r)))
+        .map(|(id, _)| name_of(id))
+        .chain(
+            read.iter()
+                .filter(|(id, _)| !sent.iter().any(|(s, _)| s == id))
+                .map(|(id, _)| name_of(id)),
+        )
         .collect();
-    rows.sort();
-    rows
+    others.sort();
+    if others.is_empty() {
+        AutostartVerdict::Applied
+    } else {
+        AutostartVerdict::OthersChanged(others)
+    }
+}
+
+pub(crate) async fn write_autostart(
+    client: &Client,
+    endpoint: &str,
+    planned: &[Container],
+    entries: &[Value],
+    target: &str,
+    limit: std::time::Duration,
+) -> Result<AutostartVerdict> {
+    let section = async {
+        let lock = autostart_lock(endpoint);
+        let _held = lock.lock().await;
+        let fresh = containers(client).await?;
+        if autostart_snapshot(&fresh) != autostart_snapshot(planned) {
+            bail!("autostart configuration changed while planning; nothing was written, retry");
+        }
+        let data = mutate(client, AUTOSTART_DOCUMENT, json!({ "entries": entries })).await?;
+        expect_true(&data, "updateAutostartConfiguration")?;
+        let after = containers(client).await?;
+        Ok(verify_autostart(entries, &after, target))
+    };
+    tokio::time::timeout(limit, section).await.map_err(|_| {
+        anyhow!(
+            "autostart update on endpoint '{endpoint}' timed out after {}s; the lock was released \
+             and the write may or may not have landed, re-check the configuration before retrying",
+            limit.as_secs()
+        )
+    })?
 }
 
 fn require_force(action: &str, protected_by: Option<&str>, force: bool) -> Result<()> {
@@ -412,6 +507,14 @@ fn require_force(action: &str, protected_by: Option<&str>, force: bool) -> Resul
         }
         _ => Ok(()),
     }
+}
+
+fn remove_guards(protected_by: Option<&str>, c: &Container) -> Vec<String> {
+    protected_by
+        .map(|p| format!("protected (matches '{p}')"))
+        .into_iter()
+        .chain((!is_stopped(c)).then(|| format!("running (state={})", state_of(c))))
+        .collect()
 }
 
 fn protection_note(protected_by: Option<&str>) -> String {
@@ -619,37 +722,44 @@ pub(crate) async fn update_with(
                 bail!("autostart wait must be 0..={MAX_AUTOSTART_WAIT} seconds, got {w}");
             }
             let entries = autostart_entries(&all, &c.id, p.enabled, p.wait)?;
-            let disabling = c.auto_start && !p.enabled;
+            let gated_by = protected_by
+                .as_deref()
+                .filter(|_| c.auto_start && !p.enabled);
+            let force_note = match gated_by {
+                Some(g) if p.force => format!("; force overrides protected (matches '{g}')"),
+                Some(g) => format!(
+                    "; protected (matches '{g}'), disabling autostart requires {{\"force\": true}}"
+                ),
+                None => String::new(),
+            };
             if p.dry_run {
                 return Ok(plan(
                     id,
                     format!(
-                        "docker.updateAutostartConfiguration: '{name}' autoStart {} -> {}, {} entries rewritten{note}",
+                        "docker.updateAutostartConfiguration: '{name}' autoStart {} -> {}, {} entries rewritten{force_note}",
                         c.auto_start,
                         p.enabled,
                         entries.len()
                     ),
                 ));
             }
-            if disabling {
-                require_force(ACTION_AUTOSTART, protected_by.as_deref(), p.force)?;
+            require_force(ACTION_AUTOSTART, gated_by, p.force)?;
+            match write_autostart(client, endpoint, &all, &entries, &c.id, AUTOSTART_TIMEOUT)
+                .await?
+            {
+                AutostartVerdict::Applied => {
+                    Ok(changed(format!("autostart {name} = {}", p.enabled)))
+                }
+                AutostartVerdict::OthersChanged(others) => Ok(changed(format!(
+                    "autostart {name} = {} applied, but other containers changed concurrently: {}",
+                    p.enabled,
+                    others.join(", ")
+                ))),
+                AutostartVerdict::NotApplied => bail!(
+                    "autostart for '{name}' was not applied: the configuration read back does not \
+                     match what was sent (another writer overwrote it); retrying is safe"
+                ),
             }
-            let lock = autostart_lock(endpoint);
-            let _held = lock.lock().await;
-            let fresh = containers(client).await?;
-            if autostart_snapshot(&fresh) != autostart_snapshot(&all) {
-                bail!("autostart configuration changed while planning; nothing was written, retry");
-            }
-            let data = mutate(client, AUTOSTART_DOCUMENT, json!({ "entries": entries })).await?;
-            expect_true(&data, "updateAutostartConfiguration")?;
-            let after = containers(client).await?;
-            if autostart_flags(&after) != expected_after(&all, &c.id, p.enabled) {
-                bail!(
-                    "autostart for '{name}' was written but the configuration read back differs; \
-                     another writer changed it concurrently (lost update), re-check before retrying"
-                );
-            }
-            Ok(changed(format!("autostart {name} = {}", p.enabled)))
         }
         ACTION_REMOVE => {
             let p: RemovePayload = parse_payload(action, payload)?;
@@ -665,23 +775,27 @@ pub(crate) async fn update_with(
                 String::new()
             };
             let state = state_of(c);
-            let running = if is_stopped(c) {
-                String::new()
-            } else {
-                format!("; container is {state}, force required")
+            let guards = remove_guards(protected_by.as_deref(), c);
+            let guard_note = match (guards.is_empty(), p.force) {
+                (true, _) => String::new(),
+                (false, true) => format!("; force overrides: {}", guards.join(", ")),
+                (false, false) => format!("; force required by: {}", guards.join(", ")),
             };
             if p.dry_run {
                 return Ok(plan(
                     id,
                     format!(
-                        "docker.removeContainer '{name}' ({}), state={state}, withImage={}{shared}{running}{note}",
+                        "docker.removeContainer '{name}' ({}), state={state}, withImage={}{shared}{guard_note}",
                         c.id, p.with_image
                     ),
                 ));
             }
-            require_force(action, protected_by.as_deref(), p.force)?;
-            if !is_stopped(c) && !p.force {
-                bail!("'{name}' is {state}; stop it first or pass {{\"force\": true}}");
+            if !guards.is_empty() && !p.force {
+                bail!(
+                    "refusing to remove '{name}': {}; pass {{\"force\": true}} to override {}",
+                    guards.join(", "),
+                    if guards.len() > 1 { "both" } else { "it" }
+                );
             }
             if !shared.is_empty() {
                 bail!("refusing withImage for '{name}'{shared}");

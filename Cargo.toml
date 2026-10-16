@@ -58,7 +58,7 @@ rustix = { version = "1.1", features = ["fs", "process", "std"] }
 sha2 = "0.11"
 # Pipes the privileged request to sudo; the toolkit `Command` cannot close
 # stdin. Already in the toolkit's dependency graph.
-tokio = { version = "1", features = ["process", "io-util", "macros", "sync"] }
+tokio = { version = "1", features = ["process", "io-util", "macros", "sync", "time"] }
 # Tokenizes libvirt domain XML so `unraid.vm.xml` redaction sees attributes
 # exactly as a parser does; the toolkit exposes no XML reader.
 quick-xml = "0.42.0"

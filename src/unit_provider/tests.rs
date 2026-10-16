@@ -703,7 +703,10 @@ fn remove_needs_a_stopped_container_unless_forced() {
         panic!("expected plan")
     };
     assert!(i.payload.contains("state=running"), "{}", i.payload);
-    assert!(refused.to_string().contains("is running"), "{refused}");
+    assert!(
+        refused.to_string().contains("running (state=running)"),
+        "{refused}"
+    );
     assert!(forced.is_ok());
     assert_eq!(n, 1);
 }
@@ -731,25 +734,191 @@ fn with_image_needs_an_image_id() {
     assert!(e.to_string().contains("no imageId"), "{e}");
 }
 
+async fn autostart_outcome(after: impl FnOnce(&mut Value)) -> Result<VerbOutcome> {
+    let s = autostart_server(2, after).await;
+    update_with(
+        &client(&s),
+        "willow",
+        &prot(),
+        update("sabnzbd", "autostart", Some(r#"{"enabled":false}"#)),
+    )
+    .await
+}
+
 #[test]
-fn autostart_reports_a_lost_update() {
-    let rt = rt();
-    let e = rt.block_on(async {
-        let s = autostart_server(2, |f| {
+fn autostart_confirms_our_write_landed() {
+    let out = rt()
+        .block_on(autostart_outcome(|f| {
+            f["data"]["docker"]["containers"][0]["autoStart"] = json!(false);
+        }))
+        .unwrap();
+    let VerbOutcome::Action(a) = out else {
+        panic!("expected action outcome")
+    };
+    assert_eq!(a.message, "autostart sabnzbd = false");
+}
+
+#[test]
+fn autostart_reports_others_changed_concurrently() {
+    let out = rt()
+        .block_on(autostart_outcome(|f| {
             f["data"]["docker"]["containers"][0]["autoStart"] = json!(false);
             f["data"]["docker"]["containers"][1]["autoStart"] = json!(false);
-        })
-        .await;
-        update_with(
+            f["data"]["docker"]["containers"][3]["autoStartWait"] = json!(5);
+        }))
+        .unwrap();
+    let VerbOutcome::Action(a) = out else {
+        panic!("expected action outcome")
+    };
+    assert!(a.changed);
+    assert!(
+        a.message.ends_with("changed concurrently: plex"),
+        "{}",
+        a.message
+    );
+}
+
+#[test]
+fn autostart_reports_not_applied_when_our_entry_is_lost() {
+    let e = rt()
+        .block_on(autostart_outcome(|f| {
+            f["data"]["docker"]["containers"][1]["autoStart"] = json!(false);
+        }))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("not applied") && e.contains("retrying is safe"),
+        "{e}"
+    );
+}
+
+#[test]
+fn verify_autostart_checks_wait_and_order() {
+    let all = containers_fixture();
+    let entries = autostart_entries(&all, SAB, true, Some(7)).unwrap();
+    assert_eq!(
+        verify_autostart(&entries, &all, SAB),
+        AutostartVerdict::NotApplied
+    );
+    let mut after = containers_fixture();
+    after[0].auto_start_wait = Some(7);
+    assert_eq!(
+        verify_autostart(&entries, &after, SAB),
+        AutostartVerdict::Applied
+    );
+    after[0].auto_start_order = Some(0);
+    after[1].auto_start_order = Some(1);
+    assert_eq!(
+        verify_autostart(&entries, &after, SAB),
+        AutostartVerdict::NotApplied
+    );
+}
+
+#[test]
+fn autostart_times_out_and_releases_the_lock() {
+    let rt = rt();
+    let e = rt.block_on(async {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(fixture())
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&s)
+            .await;
+        let all = containers_fixture();
+        let entries = autostart_entries(&all, SAB, false, None).unwrap();
+        let e = write_autostart(
             &client(&s),
-            "willow",
-            &prot(),
-            update("sabnzbd", "autostart", Some(r#"{"enabled":false}"#)),
+            "timeout-ep",
+            &all,
+            &entries,
+            SAB,
+            std::time::Duration::from_millis(50),
         )
         .await
-        .unwrap_err()
+        .unwrap_err();
+        assert!(autostart_lock("timeout-ep").try_lock().is_ok());
+        e
     });
-    assert!(e.to_string().contains("lost update"), "{e}");
+    assert!(e.to_string().contains("timed out"), "{e}");
+}
+
+#[test]
+fn autostart_dry_run_states_when_force_is_needed() {
+    let rt = rt();
+    let mut f = fixture();
+    f["data"]["docker"]["containers"][3]["autoStart"] = json!(true);
+    let (needs, overrides, enabling) = rt.block_on(async {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(f))
+            .mount(&s)
+            .await;
+        let c = client(&s);
+        let mut out = Vec::new();
+        for payload in [
+            r#"{"enabled":false,"dryRun":true}"#,
+            r#"{"enabled":false,"force":true,"dryRun":true}"#,
+            r#"{"enabled":true,"dryRun":true}"#,
+        ] {
+            let VerbOutcome::Item(i) = update_with(
+                &c,
+                "willow",
+                &prot(),
+                update("registry", "autostart", Some(payload)),
+            )
+            .await
+            .unwrap() else {
+                panic!("expected plan")
+            };
+            out.push(i.payload);
+        }
+        (out[0].clone(), out[1].clone(), out[2].clone())
+    });
+    assert!(needs.contains("requires"), "{needs}");
+    assert!(
+        overrides.contains("force overrides protected"),
+        "{overrides}"
+    );
+    assert!(!enabling.contains("force"), "{enabling}");
+}
+
+#[test]
+fn forced_remove_names_both_guards() {
+    let rt = rt();
+    let (refused, planned) = rt.block_on(async {
+        let s = server("removeContainer", json!(true)).await;
+        let c = client(&s);
+        let refused = update_with(&c, "willow", &prot(), update("registry", "remove", None))
+            .await
+            .unwrap_err()
+            .to_string();
+        let VerbOutcome::Item(i) = update_with(
+            &c,
+            "willow",
+            &prot(),
+            update(
+                "registry",
+                "remove",
+                Some(r#"{"force":true,"dryRun":true}"#),
+            ),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected plan")
+        };
+        (refused, i.payload)
+    });
+    for text in [&refused, &planned] {
+        assert!(
+            text.contains("protected (matches 'zot')") && text.contains("running (state=running)"),
+            "{text}"
+        );
+    }
+    assert!(refused.contains("override both"), "{refused}");
+    assert!(planned.contains("force overrides"), "{planned}");
 }
 
 #[test]
