@@ -1,0 +1,10 @@
+mutation RcloneCreateRCloneRemote($input: CreateRCloneRemoteInput!) {
+  rclone {
+    createRCloneRemote(input: $input) {
+      name
+      type
+      parameters
+      config
+    }
+  }
+}

@@ -1,0 +1,8 @@
+mutation ArrayRemoveDiskFromArray($input: ArrayDiskInput!) {
+  array {
+    removeDiskFromArray(input: $input) {
+      id
+      state
+    }
+  }
+}

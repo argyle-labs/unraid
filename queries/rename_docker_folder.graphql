@@ -1,0 +1,5 @@
+mutation RenameDockerFolder($folderId: String!, $newName: String!) {
+  renameDockerFolder(folderId: $folderId, newName: $newName) {
+    version
+  }
+}

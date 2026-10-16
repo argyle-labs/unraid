@@ -1,0 +1,3 @@
+mutation ConnectSignIn($input: ConnectSignInInput!) {
+  connectSignIn(input: $input)
+}

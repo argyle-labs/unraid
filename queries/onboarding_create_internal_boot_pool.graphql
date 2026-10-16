@@ -1,0 +1,9 @@
+mutation OnboardingCreateInternalBootPool($input: CreateInternalBootPoolInput!) {
+  onboarding {
+    createInternalBootPool(input: $input) {
+      ok
+      code
+      output
+    }
+  }
+}

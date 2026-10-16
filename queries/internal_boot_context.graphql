@@ -1,0 +1,37 @@
+query InternalBootContext {
+  internalBootContext {
+    arrayStopped
+    bootEligible
+    bootedFromFlashWithInternalBootSetup
+    enableBootTransfer
+    reservedNames
+    shareNames
+    poolNames
+    assignableDisks {
+      id
+      device
+      type
+      name
+      vendor
+      size
+      bytesPerSector
+      totalCylinders
+      totalHeads
+      totalSectors
+      totalTracks
+      tracksPerCylinder
+      sectorsPerTrack
+      firmwareRevision
+      serialNum
+      interfaceType
+      smartStatus
+      temperature
+      isSpinning
+    }
+    driveWarnings {
+      diskId
+      device
+      warnings
+    }
+  }
+}

@@ -1,0 +1,5 @@
+mutation DeleteArchivedNotifications {
+  deleteArchivedNotifications {
+    __typename
+  }
+}

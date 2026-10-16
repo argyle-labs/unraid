@@ -1,0 +1,6 @@
+query GetPermissionsForRoles($roles: [Role!]!) {
+  getPermissionsForRoles(roles: $roles) {
+    resource
+    actions
+  }
+}

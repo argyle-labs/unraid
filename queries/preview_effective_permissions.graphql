@@ -1,0 +1,6 @@
+query PreviewEffectivePermissions($roles: [Role!], $permissions: [AddPermissionInput!]) {
+  previewEffectivePermissions(roles: $roles, permissions: $permissions) {
+    resource
+    actions
+  }
+}

@@ -1,0 +1,20 @@
+query UpsDeviceById($id: String!) {
+  upsDeviceById(id: $id) {
+    id
+    name
+    model
+    status
+    battery {
+      chargeLevel
+      estimatedRuntime
+      health
+    }
+    power {
+      inputVoltage
+      outputVoltage
+      loadPercentage
+      nominalPower
+      currentPower
+    }
+  }
+}

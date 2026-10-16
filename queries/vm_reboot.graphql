@@ -1,0 +1,5 @@
+mutation VmReboot($id: PrefixedID!) {
+  vm {
+    reboot(id: $id)
+  }
+}

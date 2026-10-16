@@ -1,0 +1,21 @@
+query OidcConfiguration {
+  oidcConfiguration {
+    providers {
+      id
+      name
+      clientId
+      clientSecret
+      issuer
+      authorizationEndpoint
+      tokenEndpoint
+      jwksUri
+      scopes
+      authorizationRuleMode
+      buttonText
+      buttonIcon
+      buttonVariant
+      buttonStyle
+    }
+    defaultAllowedOrigins
+  }
+}

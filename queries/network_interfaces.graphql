@@ -1,0 +1,34 @@
+query NetworkInterfaces {
+  networkInterfaces {
+    id
+    name
+    description
+    macAddress
+    mtu
+    speed
+    duplex
+    internal
+    virtual
+    operstate
+    type
+    vlanId
+    ipv4Addresses {
+      address
+      netmask
+    }
+    ipv6Addresses {
+      address
+      prefixLength
+    }
+    status
+    protocol
+    ipAddress
+    netmask
+    gateway
+    useDhcp
+    ipv6Address
+    ipv6Netmask
+    ipv6Gateway
+    useDhcp6
+  }
+}

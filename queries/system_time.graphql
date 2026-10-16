@@ -1,0 +1,8 @@
+query SystemTime {
+  systemTime {
+    currentTime
+    timeZone
+    useNtp
+    ntpServers
+  }
+}

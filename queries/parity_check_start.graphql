@@ -1,0 +1,5 @@
+mutation ParityCheckStart($correct: Boolean!) {
+  parityCheck {
+    start(correct: $correct)
+  }
+}

@@ -1,0 +1,5 @@
+mutation VmReset($id: PrefixedID!) {
+  vm {
+    reset(id: $id)
+  }
+}

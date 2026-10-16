@@ -1,0 +1,23 @@
+name: Schema drift
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch: {}
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Diff live schema against committed
+        env:
+          UNRAID_URL: ${{ vars.UNRAID_URL }}
+          UNRAID_API_KEY: ${{ secrets.UNRAID_API_KEY }}
+          UNRAID_INSECURE: ${{ vars.UNRAID_INSECURE }}
+        run: |
+          if [ -z "$UNRAID_URL" ] || [ -z "$UNRAID_API_KEY" ]; then
+            echo "UNRAID_URL / UNRAID_API_KEY not configured; skipping"
+            exit 0
+          fi
+          scripts/schema-drift.sh

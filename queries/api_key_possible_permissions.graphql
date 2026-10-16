@@ -1,0 +1,6 @@
+query ApiKeyPossiblePermissions {
+  apiKeyPossiblePermissions {
+    resource
+    actions
+  }
+}

@@ -1,0 +1,5 @@
+mutation DeleteDockerEntries($entryIds: [String!]!) {
+  deleteDockerEntries(entryIds: $entryIds) {
+    version
+  }
+}

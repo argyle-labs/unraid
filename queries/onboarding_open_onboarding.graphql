@@ -1,0 +1,12 @@
+mutation OnboardingOpenOnboarding {
+  onboarding {
+    openOnboarding {
+      status
+      isPartnerBuild
+      completed
+      completedAtVersion
+      activationCode
+      shouldOpen
+    }
+  }
+}

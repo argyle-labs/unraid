@@ -1,0 +1,14 @@
+mutation UpdateServerIdentity($name: String!, $comment: String, $sysModel: String) {
+  updateServerIdentity(name: $name, comment: $comment, sysModel: $sysModel) {
+    id
+    guid
+    apikey
+    name
+    comment
+    status
+    wanip
+    lanip
+    localurl
+    remoteurl
+  }
+}

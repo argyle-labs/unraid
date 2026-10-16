@@ -1,0 +1,12 @@
+mutation OnboardingBypassOnboarding {
+  onboarding {
+    bypassOnboarding {
+      status
+      isPartnerBuild
+      completed
+      completedAtVersion
+      activationCode
+      shouldOpen
+    }
+  }
+}

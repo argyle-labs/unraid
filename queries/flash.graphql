@@ -1,0 +1,8 @@
+query Flash {
+  flash {
+    id
+    guid
+    vendor
+    product
+  }
+}

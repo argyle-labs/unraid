@@ -1,0 +1,8 @@
+query GetApiKeyCreationFormSchema {
+  getApiKeyCreationFormSchema {
+    id
+    dataSchema
+    uiSchema
+    values
+  }
+}

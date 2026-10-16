@@ -1,0 +1,8 @@
+mutation ArrayAddDiskToArray($input: ArrayDiskInput!) {
+  array {
+    addDiskToArray(input: $input) {
+      id
+      state
+    }
+  }
+}

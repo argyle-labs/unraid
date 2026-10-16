@@ -1,0 +1,12 @@
+mutation OnboardingSetOnboardingOverride($input: OnboardingOverrideInput!) {
+  onboarding {
+    setOnboardingOverride(input: $input) {
+      status
+      isPartnerBuild
+      completed
+      completedAtVersion
+      activationCode
+      shouldOpen
+    }
+  }
+}

@@ -1,0 +1,239 @@
+use std::collections::BTreeSet;
+
+use plugin_toolkit::serde_json::Value;
+
+const EXCLUDED: &[(&str, &str)] = &[];
+
+#[derive(Debug, PartialEq, Eq)]
+enum Tok {
+    Ident(String),
+    Open,
+    Close,
+    ParenOpen,
+    ParenClose,
+    Colon,
+}
+
+fn tokens(doc: &str) -> Vec<Tok> {
+    let text: String = doc
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => out.push(Tok::Open),
+            '}' => out.push(Tok::Close),
+            '(' => out.push(Tok::ParenOpen),
+            ')' => out.push(Tok::ParenClose),
+            ':' => out.push(Tok::Colon),
+            '"' => {
+                for n in chars.by_ref() {
+                    if n == '"' {
+                        break;
+                    }
+                }
+            }
+            c if c.is_alphanumeric() || c == '_' || c == '$' => {
+                let mut ident = c.to_string();
+                while let Some(&n) = chars.peek() {
+                    if n.is_alphanumeric() || n == '_' {
+                        ident.push(n);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                out.push(Tok::Ident(ident));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+struct Selection {
+    field: String,
+    children: Vec<String>,
+}
+
+fn operation(doc: &str) -> (String, Vec<Selection>) {
+    let toks = tokens(doc);
+    let kind = match toks.first() {
+        Some(Tok::Ident(k)) => k.clone(),
+        _ => "query".into(),
+    };
+    let mut roots: Vec<Selection> = Vec::new();
+    let (mut depth, mut parens) = (0usize, 0usize);
+    for (i, t) in toks.iter().enumerate() {
+        match t {
+            Tok::ParenOpen => parens += 1,
+            Tok::ParenClose => parens -= 1,
+            Tok::Open if parens == 0 => depth += 1,
+            Tok::Close if parens == 0 => depth -= 1,
+            Tok::Ident(name) if parens == 0 && !name.starts_with('$') => {
+                if toks.get(i + 1) == Some(&Tok::Colon) {
+                    continue;
+                }
+                match depth {
+                    1 => roots.push(Selection {
+                        field: name.clone(),
+                        children: Vec::new(),
+                    }),
+                    2 => {
+                        if let Some(r) = roots.last_mut() {
+                            r.children.push(name.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    (kind, roots)
+}
+
+fn schema() -> Value {
+    let (_, raw) = crate::generated::SCHEMAS
+        .iter()
+        .find(|(v, _)| *v == "7.3.1")
+        .expect("7.3.1 schema is committed");
+    let v: Value = plugin_toolkit::serde_json::from_str(raw).unwrap();
+    v.pointer("/data/__schema").unwrap().clone()
+}
+
+fn type_fields(schema: &Value, name: &str) -> Vec<Value> {
+    schema["types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == name)
+        .and_then(|t| t["fields"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+fn base_type(t: &Value) -> &Value {
+    if t["ofType"].is_object() {
+        base_type(&t["ofType"])
+    } else {
+        t
+    }
+}
+
+fn namespace(field: &Value) -> Option<String> {
+    let b = base_type(&field["type"]);
+    let name = b["name"].as_str()?;
+    (b["kind"] == "OBJECT"
+        && name.ends_with("Mutations")
+        && field["args"].as_array().is_some_and(|a| a.is_empty()))
+    .then(|| name.to_string())
+}
+
+fn schema_ops(schema: &Value) -> BTreeSet<(String, String)> {
+    let mut ops = BTreeSet::new();
+    let query = schema["queryType"]["name"].as_str().unwrap();
+    for f in type_fields(schema, query) {
+        ops.insert((query.to_string(), f["name"].as_str().unwrap().to_string()));
+    }
+    let mutation = schema["mutationType"]["name"].as_str().unwrap();
+    for f in type_fields(schema, mutation) {
+        match namespace(&f) {
+            Some(ns) => {
+                for nf in type_fields(schema, &ns) {
+                    ops.insert((ns.clone(), nf["name"].as_str().unwrap().to_string()));
+                }
+            }
+            None => {
+                ops.insert((
+                    mutation.to_string(),
+                    f["name"].as_str().unwrap().to_string(),
+                ));
+            }
+        }
+    }
+    ops
+}
+
+fn bound_ops(schema: &Value) -> BTreeSet<(String, String)> {
+    let query = schema["queryType"]["name"].as_str().unwrap().to_string();
+    let mutation = schema["mutationType"]["name"].as_str().unwrap().to_string();
+    let mutation_fields = type_fields(schema, &mutation);
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("queries");
+    let mut bound = BTreeSet::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("graphql") {
+            continue;
+        }
+        let (kind, roots) = operation(&std::fs::read_to_string(&path).unwrap());
+        for root in roots {
+            if kind != "mutation" {
+                bound.insert((query.clone(), root.field));
+                continue;
+            }
+            let ns = mutation_fields
+                .iter()
+                .find(|f| f["name"] == root.field.as_str())
+                .and_then(namespace);
+            match ns {
+                Some(ns) => {
+                    for child in root.children {
+                        bound.insert((ns.clone(), child));
+                    }
+                }
+                None => {
+                    bound.insert((mutation.clone(), root.field));
+                }
+            }
+        }
+    }
+    bound
+}
+
+#[test]
+fn every_schema_operation_is_bound_or_excluded() {
+    let schema = schema();
+    let ops = schema_ops(&schema);
+    let bound = bound_ops(&schema);
+    let excluded: BTreeSet<(String, String)> = EXCLUDED
+        .iter()
+        .map(|(t, f)| (t.to_string(), f.to_string()))
+        .collect();
+    let stale: Vec<_> = excluded.difference(&ops).collect();
+    assert!(stale.is_empty(), "exclusions not in the schema: {stale:?}");
+    let unknown: Vec<_> = bound.difference(&ops).collect();
+    assert!(
+        unknown.is_empty(),
+        "bound ops not in the schema: {unknown:?}"
+    );
+    let unbound: Vec<String> = ops
+        .iter()
+        .filter(|op| !bound.contains(*op) && !excluded.contains(*op))
+        .map(|(t, f)| format!("{t}.{f}"))
+        .collect();
+    println!(
+        "unraid api coverage: {}/{} bound, {} excluded",
+        ops.intersection(&bound).count(),
+        ops.len(),
+        excluded.len()
+    );
+    assert!(
+        unbound.is_empty(),
+        "{} unbound ops: {unbound:#?}",
+        unbound.len()
+    );
+}
+
+#[test]
+fn operation_parser_reads_roots_and_namespaces() {
+    let (kind, roots) = operation(
+        "# c { x }\nmutation M($id: PrefixedID!) { docker { start(id: $id) { id } a: stop(id: $id) { id } } }",
+    );
+    assert_eq!(kind, "mutation");
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].field, "docker");
+    assert_eq!(roots[0].children, vec!["start", "stop"]);
+}

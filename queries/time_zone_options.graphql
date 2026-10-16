@@ -1,0 +1,6 @@
+query TimeZoneOptions {
+  timeZoneOptions {
+    value
+    label
+  }
+}

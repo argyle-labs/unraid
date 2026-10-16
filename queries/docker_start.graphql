@@ -1,0 +1,35 @@
+mutation DockerStart($id: PrefixedID!) {
+  docker {
+    start(id: $id) {
+      id
+      names
+      image
+      imageId
+      command
+      created
+      lanIpPorts
+      sizeRootFs
+      sizeRw
+      sizeLog
+      labels
+      state
+      status
+      networkSettings
+      mounts
+      autoStart
+      autoStartOrder
+      autoStartWait
+      templatePath
+      projectUrl
+      registryUrl
+      supportUrl
+      iconUrl
+      webUiUrl
+      shell
+      isOrphaned
+      isUpdateAvailable
+      isRebuildReady
+      tailscaleEnabled
+    }
+  }
+}

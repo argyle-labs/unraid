@@ -1,0 +1,5 @@
+mutation DockerRemoveContainer($id: PrefixedID!, $withImage: Boolean) {
+  docker {
+    removeContainer(id: $id, withImage: $withImage)
+  }
+}

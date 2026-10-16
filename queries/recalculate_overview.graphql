@@ -1,0 +1,5 @@
+mutation RecalculateOverview {
+  recalculateOverview {
+    __typename
+  }
+}

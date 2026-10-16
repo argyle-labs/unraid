@@ -1,0 +1,30 @@
+mutation ArrayUnmountArrayDisk($id: PrefixedID!) {
+  array {
+    unmountArrayDisk(id: $id) {
+      id
+      idx
+      name
+      device
+      size
+      status
+      rotational
+      temp
+      numReads
+      numWrites
+      numErrors
+      fsSize
+      fsFree
+      fsUsed
+      exportable
+      type
+      warning
+      critical
+      fsType
+      comment
+      format
+      transport
+      color
+      isSpinning
+    }
+  }
+}

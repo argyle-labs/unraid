@@ -1,0 +1,5 @@
+mutation CreateDockerFolder($name: String!, $parentId: String, $childrenIds: [String!]) {
+  createDockerFolder(name: $name, parentId: $parentId, childrenIds: $childrenIds) {
+    version
+  }
+}

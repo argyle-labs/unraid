@@ -1,0 +1,19 @@
+query GetRclone {
+  rclone {
+    configForm {
+      id
+      dataSchema
+      uiSchema
+    }
+    drives {
+      name
+      options
+    }
+    remotes {
+      name
+      type
+      parameters
+      config
+    }
+  }
+}

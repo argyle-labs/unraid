@@ -1,0 +1,5 @@
+mutation ArrayClearArrayDiskStatistics($id: PrefixedID!) {
+  array {
+    clearArrayDiskStatistics(id: $id)
+  }
+}
