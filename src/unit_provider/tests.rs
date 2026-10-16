@@ -7,19 +7,29 @@ const SERVER: &str = "abc123";
 const PLEX: &str = "abc123:1111111111111111111111111111111111111111111111111111111111111111";
 const ORCA: &str = "abc123:2222222222222222222222222222222222222222222222222222222222222222";
 const SAB: &str = "abc123:3333333333333333333333333333333333333333333333333333333333333333";
+const ZOT: &str = "abc123:4444444444444444444444444444444444444444444444444444444444444444";
+const PLEX2: &str = "abc123:5555555555555555555555555555555555555555555555555555555555555555";
 
 fn fixture() -> Value {
     json!({ "data": { "docker": { "id": SERVER, "containers": [
-        { "id": SAB, "names": ["/sabnzbd"], "image": "lscr.io/linuxserver/sabnzbd:latest",
+        { "id": SAB, "names": ["/sabnzbd"], "image": "lscr.io/linuxserver/sabnzbd:latest", "imageId": "sha256:aa",
           "state": "EXITED", "status": "Exited (0)", "autoStart": true,
           "autoStartOrder": 1, "autoStartWait": 0, "iconUrl": null, "webUiUrl": null,
           "isUpdateAvailable": false },
-        { "id": PLEX, "names": ["/plex"], "image": "plexinc/pms-docker:latest",
+        { "id": PLEX, "names": ["/plex"], "image": "plexinc/pms-docker:latest", "imageId": "sha256:bb",
           "state": "RUNNING", "status": "Up 2 days", "autoStart": true,
           "autoStartOrder": 0, "autoStartWait": 10, "iconUrl": null, "webUiUrl": null,
           "isUpdateAvailable": false },
-        { "id": ORCA, "names": ["/orca"], "image": "gitea.example/argyle-labs/orca:rc",
+        { "id": ORCA, "names": ["/orca"], "image": "gitea.example/argyle-labs/orca:rc", "imageId": "sha256:cc",
           "state": "RUNNING", "status": "Up", "autoStart": true,
+          "autoStartOrder": null, "autoStartWait": null, "iconUrl": null, "webUiUrl": null,
+          "isUpdateAvailable": false },
+        { "id": ZOT, "names": ["/registry"], "image": "ghcr.io/project-zot/zot:v2", "imageId": "sha256:dd",
+          "state": "RUNNING", "status": "Up", "autoStart": false,
+          "autoStartOrder": null, "autoStartWait": null, "iconUrl": null, "webUiUrl": null,
+          "isUpdateAvailable": false },
+        { "id": PLEX2, "names": ["/plex-dev"], "image": "plexinc/pms-docker:beta", "imageId": "sha256:bb",
+          "state": "EXITED", "status": "Exited", "autoStart": false,
           "autoStartOrder": null, "autoStartWait": null, "iconUrl": null, "webUiUrl": null,
           "isUpdateAvailable": false }
     ] } } })
@@ -46,6 +56,10 @@ async fn server(mutation_field: &str, mutation_result: Value) -> MockServer {
         .mount(&server)
         .await;
     server
+}
+
+fn prot() -> Vec<String> {
+    protected_set(Some("sabnzbd-extra"))
 }
 
 fn client(server: &MockServer) -> Client {
@@ -133,14 +147,12 @@ fn resolves_by_exact_id_bare_id_or_name_only() {
 }
 
 #[test]
-fn orca_is_recognized_by_name_image_or_hostname() {
+fn orca_is_recognized_by_name_or_image() {
     let all = containers_fixture();
     let orca = resolve(&all, ORCA).unwrap();
     let plex = resolve(&all, PLEX).unwrap();
     assert!(is_orca(orca, None));
     assert!(!is_orca(plex, None));
-    assert!(is_orca(plex, Some("111111111111")));
-    assert!(!is_orca(plex, Some("tower")));
 }
 
 #[test]
@@ -154,10 +166,11 @@ fn manager_names_the_endpoint() {
 #[test]
 fn autostart_entries_keep_every_other_container() {
     let all = containers_fixture();
-    let e = autostart_entries(&all, SAB, false, None);
+    let e = autostart_entries(&all, SAB, false, None).unwrap();
     assert_eq!(e[0], json!({"id": PLEX, "autoStart": true, "wait": 10}));
     assert_eq!(e[1], json!({"id": SAB, "autoStart": false, "wait": 0}));
     assert_eq!(e[2], json!({"id": ORCA, "autoStart": true}));
+    assert_eq!(e.len(), 5);
 }
 
 #[test]
@@ -165,7 +178,7 @@ fn stop_executes_by_default() {
     let rt = rt();
     let (out, bodies) = rt.block_on(async {
         let s = server("stop", json!({"id": PLEX, "state": "EXITED"})).await;
-        let out = update_with(&client(&s), "willow", update("plex", "stop", None)).await;
+        let out = update_with(&client(&s), "willow", &prot(), update("plex", "stop", None)).await;
         (out, mutation_bodies(&s).await)
     });
     let VerbOutcome::Action(a) = out.unwrap() else {
@@ -190,6 +203,7 @@ fn dry_run_sends_no_mutation() {
         let out = update_with(
             &client(&s),
             "willow",
+            &prot(),
             update("plex", "remove", Some(r#"{"dryRun":true}"#)),
         )
         .await;
@@ -210,7 +224,8 @@ fn remove_passes_with_image() {
         update_with(
             &client(&s),
             "willow",
-            update(PLEX, "remove", Some(r#"{"withImage":true}"#)),
+            &prot(),
+            update(SAB, "remove", Some(r#"{"withImage":true}"#)),
         )
         .await
         .unwrap();
@@ -218,7 +233,7 @@ fn remove_passes_with_image() {
     });
     assert_eq!(
         bodies[0]["variables"],
-        json!({"id": PLEX, "withImage": true})
+        json!({"id": SAB, "withImage": true})
     );
 }
 
@@ -241,9 +256,14 @@ fn restart_is_stop_then_start() {
                 .mount(&s)
                 .await;
         }
-        update_with(&client(&s), "willow", update("plex", "restart", None))
-            .await
-            .unwrap();
+        update_with(
+            &client(&s),
+            "willow",
+            &prot(),
+            update("plex", "restart", None),
+        )
+        .await
+        .unwrap();
         mutation_bodies(&s).await
     });
     let q: Vec<&str> = bodies
@@ -261,6 +281,7 @@ fn autostart_sends_the_full_list() {
         update_with(
             &client(&s),
             "willow",
+            &prot(),
             update("sabnzbd", "autostart", Some(r#"{"enabled":false}"#)),
         )
         .await
@@ -268,7 +289,12 @@ fn autostart_sends_the_full_list() {
         mutation_bodies(&s).await
     });
     let entries = bodies[0]["variables"]["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 3);
+    assert_eq!(entries.len(), 5);
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["id"] == PLEX && e["autoStart"] == true)
+    );
     assert!(
         entries
             .iter()
@@ -281,9 +307,14 @@ fn a_false_result_is_an_error() {
     let rt = rt();
     let e = rt.block_on(async {
         let s = server("removeContainer", json!(false)).await;
-        update_with(&client(&s), "willow", update("plex", "remove", None))
-            .await
-            .unwrap_err()
+        update_with(
+            &client(&s),
+            "willow",
+            &prot(),
+            update("plex", "remove", None),
+        )
+        .await
+        .unwrap_err()
     });
     assert!(e.to_string().contains("did not succeed"), "{e}");
 }
@@ -294,7 +325,7 @@ fn refuses_orca_and_unknown_targets_without_mutating() {
     for (target, want) in [("orca", "orca's own"), ("nope", "no container")] {
         let (e, bodies) = rt.block_on(async {
             let s = server("stop", json!({"id": ORCA, "state": "EXITED"})).await;
-            let e = update_with(&client(&s), "willow", update(target, "stop", None))
+            let e = update_with(&client(&s), "willow", &prot(), update(target, "stop", None))
                 .await
                 .unwrap_err();
             (e, mutation_bodies(&s).await)
@@ -312,6 +343,7 @@ fn delete_only_plans() {
         let out = delete_with(
             &client(&s),
             "willow",
+            &prot(),
             DeleteArgs {
                 id: uid("plex"),
                 caller: None,
@@ -363,4 +395,223 @@ fn declares_every_update_action() {
         ]
     );
     assert!(d[0].verbs.iter().any(|v| v.verb == Verb::Delete));
+}
+
+const H: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[test]
+fn own_container_id_comes_from_the_kernel() {
+    let mountinfo = format!(
+        "1 0 0:1 / / rw - overlay overlay rw\n2 1 8:1 /var/lib/docker/containers/{H}/hostname /etc/hostname rw - ext4 /dev/sda1 rw\n"
+    );
+    assert_eq!(container_id_from_mountinfo(&mountinfo).as_deref(), Some(H));
+    let v1 = format!("12:memory:/docker/{H}\n11:cpu:/docker/{H}\n");
+    assert_eq!(container_id_from_cgroup(&v1).as_deref(), Some(H));
+    let v2 = format!("0::/system.slice/docker-{H}.scope\n");
+    assert_eq!(container_id_from_cgroup(&v2).as_deref(), Some(H));
+    assert_eq!(container_id_from_cgroup("0::/\n"), None);
+    assert_eq!(
+        container_id_from_cgroup("0::/user.slice/user-1000.slice/session-2.scope\n"),
+        None
+    );
+    assert_eq!(
+        own_container_id_from(
+            Some("1 0 0:1 / / rw - ext4 /dev/sda1 rw\n"),
+            Some("0::/init.scope\n")
+        ),
+        None
+    );
+    assert_eq!(
+        own_container_id_from(Some(&mountinfo), Some("0::/\n")).as_deref(),
+        Some(H)
+    );
+}
+
+#[test]
+fn own_id_must_match_the_full_bare_id() {
+    let all = containers_fixture();
+    let plex = resolve(&all, PLEX).unwrap();
+    assert!(is_orca(plex, Some(bare_id(PLEX))));
+    assert!(!is_orca(plex, Some("111111111111")));
+    assert!(!is_orca(plex, Some(H)));
+}
+
+#[test]
+fn with_image_is_refused_while_another_container_uses_it() {
+    let rt = rt();
+    let (plan_out, err, bodies) = rt.block_on(async {
+        let s = server("removeContainer", json!(true)).await;
+        let plan_out = update_with(
+            &client(&s),
+            "willow",
+            &prot(),
+            update(
+                "plex",
+                "remove",
+                Some(r#"{"withImage":true,"dryRun":true}"#),
+            ),
+        )
+        .await
+        .unwrap();
+        let err = update_with(
+            &client(&s),
+            "willow",
+            &prot(),
+            update("plex", "remove", Some(r#"{"withImage":true}"#)),
+        )
+        .await
+        .unwrap_err();
+        (plan_out, err, mutation_bodies(&s).await)
+    });
+    let VerbOutcome::Item(i) = plan_out else {
+        panic!("expected plan")
+    };
+    assert!(i.payload.contains("plex-dev"), "{}", i.payload);
+    assert!(err.to_string().contains("plex-dev"), "{err}");
+    assert!(bodies.is_empty());
+}
+
+#[test]
+fn autostart_aborts_when_the_config_changes_before_writing() {
+    let rt = rt();
+    let (e, bodies) = rt.block_on(async {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("DockerContainers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture()))
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        let mut changed = fixture();
+        changed["data"]["docker"]["containers"][1]["autoStart"] = json!(false);
+        Mock::given(method("POST"))
+            .and(body_string_contains("DockerContainers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(changed))
+            .mount(&s)
+            .await;
+        let e = update_with(
+            &client(&s),
+            "willow",
+            &prot(),
+            update("sabnzbd", "autostart", Some(r#"{"enabled":false}"#)),
+        )
+        .await
+        .unwrap_err();
+        (e, mutation_bodies(&s).await)
+    });
+    assert!(e.to_string().contains("changed while planning"), "{e}");
+    assert!(bodies.is_empty());
+}
+
+#[test]
+fn autostart_refuses_an_empty_list_and_an_unbounded_wait() {
+    assert!(autostart_entries(&[], SAB, false, None).is_err());
+    let rt = rt();
+    let e = rt.block_on(async {
+        let s = server("updateAutostartConfiguration", json!(true)).await;
+        update_with(
+            &client(&s),
+            "willow",
+            &prot(),
+            update(
+                "sabnzbd",
+                "autostart",
+                Some(r#"{"enabled":true,"wait":3601}"#),
+            ),
+        )
+        .await
+        .unwrap_err()
+    });
+    assert!(e.to_string().contains("0..=3600"), "{e}");
+}
+
+#[test]
+fn protected_targets_need_force_and_the_plan_says_so() {
+    let all = containers_fixture();
+    let zot = resolve(&all, ZOT).unwrap();
+    assert_eq!(protected_match(zot, &prot()).as_deref(), Some("zot"));
+    let sab = resolve(&all, SAB).unwrap();
+    assert!(protected_match(sab, &protected_set(None)).is_none());
+    assert!(protected_match(sab, &protected_set(Some("gitea, sabnzbd"))).is_some());
+    assert!(protected_match(sab, &protected_set(Some(SAB))).is_some());
+
+    let rt = rt();
+    let (plan_out, refused, forced, bodies) = rt.block_on(async {
+        let s = server("stop", json!({"id": ZOT, "state": "EXITED"})).await;
+        let c = client(&s);
+        let plan_out = update_with(
+            &c,
+            "willow",
+            &prot(),
+            update("registry", "stop", Some(r#"{"dryRun":true}"#)),
+        )
+        .await
+        .unwrap();
+        let refused = update_with(&c, "willow", &prot(), update("registry", "stop", None))
+            .await
+            .unwrap_err();
+        let before = mutation_bodies(&s).await.len();
+        let forced = update_with(
+            &c,
+            "willow",
+            &prot(),
+            update("registry", "stop", Some(r#"{"force":true}"#)),
+        )
+        .await;
+        (
+            plan_out,
+            refused,
+            forced,
+            (before, mutation_bodies(&s).await.len()),
+        )
+    });
+    let VerbOutcome::Item(i) = plan_out else {
+        panic!("expected plan")
+    };
+    assert!(i.payload.contains("protected"), "{}", i.payload);
+    assert!(refused.to_string().contains("force"), "{refused}");
+    assert!(forced.is_ok());
+    assert_eq!(bodies, (0, 1));
+}
+
+#[test]
+fn start_on_a_protected_target_needs_no_force() {
+    let rt = rt();
+    let out = rt.block_on(async {
+        let s = server("start", json!({"id": ZOT, "state": "RUNNING"})).await;
+        update_with(
+            &client(&s),
+            "willow",
+            &prot(),
+            update("registry", "start", None),
+        )
+        .await
+    });
+    assert!(out.is_ok());
+}
+
+#[test]
+fn errors_name_fields_not_data() {
+    let data = json!({"docker": {"stop": {"secret": "s3cr3t"}}});
+    let e = expect_container(&data, "stop").unwrap_err().to_string();
+    assert!(!e.contains("s3cr3t") && e.contains("docker.stop.id"), "{e}");
+    let data = json!({"docker": {"removeContainer": {"secret": "s3cr3t"}}});
+    let e = expect_true(&data, "removeContainer")
+        .unwrap_err()
+        .to_string();
+    assert!(!e.contains("s3cr3t"), "{e}");
+}
+
+#[test]
+fn a_foreign_server_prefix_is_rejected() {
+    let all = containers_fixture();
+    let foreign = format!("other:{}", bare_id(PLEX));
+    let e = resolve(&all, &foreign).unwrap_err().to_string();
+    assert!(e.contains("another Unraid server"), "{e}");
+    assert_eq!(
+        resolve(&all, &format!("{SERVER}:{}", bare_id(PLEX)))
+            .unwrap()
+            .id,
+        PLEX
+    );
 }
