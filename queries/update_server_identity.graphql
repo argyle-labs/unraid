@@ -2,7 +2,6 @@ mutation UpdateServerIdentity($name: String!, $comment: String, $sysModel: Strin
   updateServerIdentity(name: $name, comment: $comment, sysModel: $sysModel) {
     id
     guid
-    apikey
     name
     comment
     status

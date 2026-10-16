@@ -2,7 +2,20 @@ use std::collections::BTreeSet;
 
 use plugin_toolkit::serde_json::Value;
 
-const EXCLUDED: &[(&str, &str)] = &[];
+const EXCLUDED: &[(&str, &str)] = &[
+    ("Query", "apiKey"),
+    ("Query", "apiKeys"),
+    ("Query", "connect"),
+    ("Query", "oidcConfiguration"),
+    ("Query", "oidcProvider"),
+    ("Query", "oidcProviders"),
+    ("Query", "rclone"),
+    ("Query", "registration"),
+    ("Query", "server"),
+    ("Query", "servers"),
+    ("Query", "settings"),
+    ("UnraidPluginsMutations", "installPlugin"),
+];
 
 #[derive(Debug, PartialEq, Eq)]
 enum Tok {
@@ -236,4 +249,105 @@ fn operation_parser_reads_roots_and_namespaces() {
     assert_eq!(roots.len(), 1);
     assert_eq!(roots[0].field, "docker");
     assert_eq!(roots[0].children, vec!["start", "stop"]);
+}
+
+const SECRET_FIELDS: &[&str] = &[
+    "key",
+    "clientSecret",
+    "apikey",
+    "contents",
+    "config",
+    "parameters",
+    "password",
+    "token",
+    "secret",
+    "csrfToken",
+];
+
+fn query_docs() -> Vec<(String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("queries");
+    let mut docs = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("graphql") {
+            continue;
+        }
+        let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
+        docs.push((stem, std::fs::read_to_string(&path).unwrap()));
+    }
+    docs
+}
+
+fn selected_leaves(doc: &str) -> Vec<String> {
+    let toks = tokens(doc);
+    let mut depth = 0usize;
+    let mut parens = 0usize;
+    let mut out = Vec::new();
+    for (i, tok) in toks.iter().enumerate() {
+        match tok {
+            Tok::Open => depth += 1,
+            Tok::Close => depth -= 1,
+            Tok::ParenOpen => parens += 1,
+            Tok::ParenClose => parens -= 1,
+            Tok::Ident(id) if depth > 0 && parens == 0 => {
+                let mut j = i + 1;
+                if toks.get(j) == Some(&Tok::ParenOpen) {
+                    while toks.get(j).is_some_and(|t| *t != Tok::ParenClose) {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                if !matches!(toks.get(j), Some(Tok::Open) | Some(Tok::Colon)) {
+                    out.push(id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn every_mutation_tool_is_admin() {
+    let surface = include_str!(concat!(env!("OUT_DIR"), "/unraid_surface.rs"));
+    let attrs: Vec<&str> = surface
+        .lines()
+        .filter(|l| l.starts_with("#[orca_tool("))
+        .collect();
+    for attr in &attrs {
+        if attr.contains("data_mutation = true") {
+            assert!(attr.contains("role = \"admin\""), "{attr}");
+        }
+    }
+    for (stem, doc) in query_docs() {
+        if operation(&doc).0 != "mutation" {
+            continue;
+        }
+        let verb = format!("verb = \"{stem}\"");
+        let Some(attr) = attrs.iter().find(|a| a.contains(&verb)) else {
+            continue;
+        };
+        assert!(
+            attr.contains("role = \"admin\"") && attr.contains("data_mutation = true"),
+            "{attr}"
+        );
+    }
+}
+
+#[test]
+fn no_operation_selects_a_secret_leaf() {
+    for (stem, doc) in query_docs() {
+        for field in selected_leaves(&doc) {
+            assert!(
+                !SECRET_FIELDS.contains(&field.as_str()),
+                "{stem} selects secret field `{field}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn install_plugin_is_not_surfaced() {
+    let surface = include_str!(concat!(env!("OUT_DIR"), "/unraid_surface.rs"));
+    assert!(!surface.contains("verb = \"install_plugin\""));
 }

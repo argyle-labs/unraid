@@ -2,7 +2,6 @@ mutation ApiKeyCreate($input: CreateApiKeyInput!) {
   apiKey {
     create(input: $input) {
       id
-      key
       name
       description
       roles
