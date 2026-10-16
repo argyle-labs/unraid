@@ -58,6 +58,32 @@ async fn server(mutation_field: &str, mutation_result: Value) -> MockServer {
     server
 }
 
+async fn autostart_server(original_reads: u64, after: impl FnOnce(&mut Value)) -> MockServer {
+    let s = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("DockerContainers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture()))
+        .up_to_n_times(original_reads)
+        .mount(&s)
+        .await;
+    let mut later = fixture();
+    after(&mut later);
+    Mock::given(method("POST"))
+        .and(body_string_contains("DockerContainers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(later))
+        .mount(&s)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("updateAutostartConfiguration"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": {"docker": {"updateAutostartConfiguration": true}}})),
+        )
+        .mount(&s)
+        .await;
+    s
+}
+
 fn prot() -> Vec<String> {
     protected_set(Some("sabnzbd-extra"))
 }
@@ -277,7 +303,10 @@ fn restart_is_stop_then_start() {
 fn autostart_sends_the_full_list() {
     let rt = rt();
     let bodies = rt.block_on(async {
-        let s = server("updateAutostartConfiguration", json!(true)).await;
+        let s = autostart_server(2, |f| {
+            f["data"]["docker"]["containers"][0]["autoStart"] = json!(false);
+        })
+        .await;
         update_with(
             &client(&s),
             "willow",
@@ -311,7 +340,7 @@ fn a_false_result_is_an_error() {
             &client(&s),
             "willow",
             &prot(),
-            update("plex", "remove", None),
+            update("sabnzbd", "remove", None),
         )
         .await
         .unwrap_err()
@@ -457,7 +486,7 @@ fn with_image_is_refused_while_another_container_uses_it() {
             &client(&s),
             "willow",
             &prot(),
-            update("plex", "remove", Some(r#"{"withImage":true}"#)),
+            update("plex", "remove", Some(r#"{"withImage":true,"force":true}"#)),
         )
         .await
         .unwrap_err();
@@ -614,4 +643,173 @@ fn a_foreign_server_prefix_is_rejected() {
             .id,
         PLEX
     );
+}
+
+#[test]
+fn mountinfo_id_comes_only_from_runtime_file_mounts() {
+    let docker = format!(
+        "1 0 0:1 / / rw - overlay overlay rw\n\
+         2 1 8:1 /var/lib/docker/containers/{H}/resolv.conf /etc/resolv.conf rw - ext4 /dev/sda1 rw\n"
+    );
+    assert_eq!(container_id_from_mountinfo(&docker).as_deref(), Some(H));
+    let podman = format!(
+        "3 1 0:2 /containers/storage/overlay-containers/{H}/userdata/hostname /etc/hostname rw - tmpfs tmpfs rw\n"
+    );
+    assert_eq!(container_id_from_mountinfo(&podman).as_deref(), Some(H));
+    let other = format!("4 1 8:1 /var/lib/docker/containers/{H}/x /data rw - ext4 /dev/sda1 rw\n");
+    assert_eq!(container_id_from_mountinfo(&other), None);
+}
+
+#[test]
+fn cgroup_id_wins_when_sources_disagree() {
+    let other = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    let mountinfo = format!(
+        "2 1 8:1 /var/lib/docker/containers/{other}/hostname /etc/hostname rw - ext4 /dev/sda1 rw\n"
+    );
+    let cgroup = format!("0::/system.slice/docker-{H}.scope\n");
+    assert_eq!(
+        own_container_id_from(Some(&mountinfo), Some(&cgroup)).as_deref(),
+        Some(H)
+    );
+}
+
+#[test]
+fn remove_needs_a_stopped_container_unless_forced() {
+    let rt = rt();
+    let (plan_out, refused, forced, n) = rt.block_on(async {
+        let s = server("removeContainer", json!(true)).await;
+        let c = client(&s);
+        let plan_out = update_with(
+            &c,
+            "willow",
+            &prot(),
+            update("plex", "remove", Some(r#"{"dryRun":true}"#)),
+        )
+        .await
+        .unwrap();
+        let refused = update_with(&c, "willow", &prot(), update("plex", "remove", None))
+            .await
+            .unwrap_err();
+        let forced = update_with(
+            &c,
+            "willow",
+            &prot(),
+            update("plex", "remove", Some(r#"{"force":true}"#)),
+        )
+        .await;
+        (plan_out, refused, forced, mutation_bodies(&s).await.len())
+    });
+    let VerbOutcome::Item(i) = plan_out else {
+        panic!("expected plan")
+    };
+    assert!(i.payload.contains("state=running"), "{}", i.payload);
+    assert!(refused.to_string().contains("is running"), "{refused}");
+    assert!(forced.is_ok());
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn with_image_needs_an_image_id() {
+    let rt = rt();
+    let e = rt.block_on(async {
+        let s = MockServer::start().await;
+        let mut f = fixture();
+        f["data"]["docker"]["containers"][0]["imageId"] = json!("");
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(f))
+            .mount(&s)
+            .await;
+        update_with(
+            &client(&s),
+            "willow",
+            &prot(),
+            update("sabnzbd", "remove", Some(r#"{"withImage":true}"#)),
+        )
+        .await
+        .unwrap_err()
+    });
+    assert!(e.to_string().contains("no imageId"), "{e}");
+}
+
+#[test]
+fn autostart_reports_a_lost_update() {
+    let rt = rt();
+    let e = rt.block_on(async {
+        let s = autostart_server(2, |f| {
+            f["data"]["docker"]["containers"][0]["autoStart"] = json!(false);
+            f["data"]["docker"]["containers"][1]["autoStart"] = json!(false);
+        })
+        .await;
+        update_with(
+            &client(&s),
+            "willow",
+            &prot(),
+            update("sabnzbd", "autostart", Some(r#"{"enabled":false}"#)),
+        )
+        .await
+        .unwrap_err()
+    });
+    assert!(e.to_string().contains("lost update"), "{e}");
+}
+
+#[test]
+fn autostart_lock_is_per_endpoint() {
+    let a = autostart_lock("willow");
+    let b = autostart_lock("willow");
+    let c = autostart_lock("maple");
+    assert!(std::sync::Arc::ptr_eq(&a, &b));
+    assert!(!std::sync::Arc::ptr_eq(&a, &c));
+}
+
+#[test]
+fn disabling_autostart_on_a_protected_container_needs_force() {
+    let rt = rt();
+    let mut f = fixture();
+    f["data"]["docker"]["containers"][3]["autoStart"] = json!(true);
+    let (refused, n) = rt.block_on(async {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("DockerContainers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(f))
+            .mount(&s)
+            .await;
+        let e = update_with(
+            &client(&s),
+            "willow",
+            &prot(),
+            update("registry", "autostart", Some(r#"{"enabled":false}"#)),
+        )
+        .await
+        .unwrap_err();
+        (e, mutation_bodies(&s).await.len())
+    });
+    assert!(refused.to_string().contains("force"), "{refused}");
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn protected_entries_match_id_prefixes_and_full_repo_paths() {
+    let all = containers_fixture();
+    let zot = resolve(&all, ZOT).unwrap();
+    let plex = resolve(&all, PLEX).unwrap();
+    assert!(protects("444444444444", zot));
+    assert!(protects("444444444444".to_uppercase().as_str(), zot));
+    assert!(!protects("44444444444", zot));
+    assert!(protects("ghcr.io/project-zot/zot", zot));
+    assert!(!protects("docker.io/project-zot/zot", zot));
+    assert!(!protects("ghcr.io/project-zot/zot", plex));
+    let list = protected_set(Some("plex, ghost-thing"));
+    assert_eq!(unmatched_protected(&all, &list), vec!["ghost-thing"]);
+}
+
+#[test]
+fn a_secret_backend_error_fails_closed() {
+    let e = endpoint_protected("willow").unwrap_err().to_string();
+    assert!(e.contains("refusing to act"), "{e}");
+}
+
+#[test]
+fn a_missing_protected_secret_means_defaults_only() {
+    let got = crate::test_support::isolated(|| endpoint_protected("willow")).unwrap();
+    assert_eq!(got.len(), DEFAULT_PROTECTED.len());
 }
