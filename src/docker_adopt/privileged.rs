@@ -90,6 +90,14 @@ pub enum PrivilegedOp {
         cache_pool: Option<String>,
         floor_kib: Option<u64>,
     },
+    SetShareNfs {
+        path: String,
+        clients: Vec<String>,
+        options: Vec<String>,
+    },
+    RemoveShareNfs {
+        path: String,
+    },
     Rebuild {
         name: String,
     },
@@ -721,6 +729,20 @@ pub async fn execute(op: &PrivilegedOp) -> Result<String> {
             )?;
             apply(&req)
         }
+        PrivilegedOp::SetShareNfs {
+            path,
+            clients,
+            options,
+        } => {
+            let entry = plugin_toolkit::storage::ExportEntry {
+                path: path.clone(),
+                allowed_clients: clients.clone(),
+                options: options.clone(),
+                fsid: None,
+            };
+            crate::exports::apply_nfs(path, Some(&entry))
+        }
+        PrivilegedOp::RemoveShareNfs { path } => crate::exports::apply_nfs(path, None),
         PrivilegedOp::Rebuild { name } => {
             validate_name("container name", name)?;
             if safefs::read_file(Path::new(&template::template_path(name)))?.is_none() {
@@ -980,7 +1002,10 @@ pub fn policy(op: &PrivilegedOp) -> CallerPolicy {
         | PrivilegedOp::VolumeEmpty { .. }
         | PrivilegedOp::RetireStack { .. } => CallerPolicy::RootOrDockerGroup,
         PrivilegedOp::SetVmAutostart { .. } | PrivilegedOp::ReadVmXml { .. } => CallerPolicy::Root,
-        PrivilegedOp::SetSmbShare { .. } | PrivilegedOp::SetShareCache { .. } => CallerPolicy::Root,
+        PrivilegedOp::SetSmbShare { .. }
+        | PrivilegedOp::SetShareCache { .. }
+        | PrivilegedOp::SetShareNfs { .. }
+        | PrivilegedOp::RemoveShareNfs { .. } => CallerPolicy::Root,
     }
 }
 

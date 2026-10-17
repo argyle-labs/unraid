@@ -1,49 +1,30 @@
 //! Unraid NFS export authoring — the `storage` facet's export read/write side.
 //!
-//! Unraid keeps a user share's definition in two places that must agree:
+//! Reads come from `/etc/exports`, which is world-readable and is the live
+//! table the kernel serves. Writes go through Unraid's own share API: the NFS
+//! Security Settings forms of unraid/webgui `SecurityNFS.page`
+//! (`changeShareAccessNFS`, then `changeShareSecurityNFS`), posted to emhttpd's
+//! local socket the way [`crate::share_cache`] posts `cmdEditShare`. emhttp
+//! persists the share cfg, regenerates `/etc/exports` and re-exports. The
+//! socket and the root-only cfg need root, so the write runs as
+//! [`PrivilegedOp::SetShareNfs`] / [`PrivilegedOp::RemoveShareNfs`].
 //!
-//! * `/boot/config/shares/<name>.cfg` — the persistent intent, surviving reboot.
-//! * `/etc/exports` (+ `exportfs -ra`) — the live export table.
+//! `/etc/exports` keeps options **per client**, while `ExportEntry` models one
+//! option set. Reads union them; authoring writes every client with one set.
 //!
-//! **Writing one without the other is the bug this module exists to prevent.**
-//! Editing the cfg alone does not re-export (the change appears only after a
-//! reboot or an array restart); running `exportfs -ra` alone does not persist
-//! (the change vanishes on reboot). Either half on its own leaves declared
-//! intent and observed reality diverged — silently, because both files look
-//! internally consistent. Every write here does both, cfg first so a crash
-//! between the two leaves the durable record ahead of the live table rather
-//! than behind it.
-//!
-//! **Reads and writes use different sources, on purpose.** `list_exports` reads
-//! `/etc/exports`, never the cfgs: `/boot` is vfat mounted
-//! `fmask=0177,dmask=0077`, so its permissions are synthesized by the mount and
-//! every file is 0600 root — an unprivileged daemon cannot read them and no
-//! chmod/chown can change that. `/etc/exports` is world-readable and carries
-//! strictly more (path, fsid, and per-client option sets), and being the live
-//! table it reports what the kernel actually serves.
-//!
-//! Writes therefore need privilege that the daemon does not have (root-only cfg
-//! plus `exportfs -ra`). They fail with an explicit message naming what is
-//! required rather than a bare EACCES that sends someone hunting for a chmod
-//! that cannot exist. See unraid#44.
-//!
-//! One asymmetry follows: `/etc/exports` keeps options **per client**, while
-//! `ExportEntry` models one option set. Reads union them (identical groups — the
-//! normal case — collapse losslessly); authoring cannot reproduce genuinely
-//! differing per-client options.
-//!
-//! `fsid` is carried, never invented. Uniqueness is fleet-level — no single host
-//! can see that a *different* server already uses an fsid — so allocation is
-//! orca's, and this backend persists exactly what it is handed. Duplicate fsids
-//! across two servers give clients NFS file-handle collisions that present as
-//! `Stale file handle` on whichever mount loses the race.
+//! `fsid` is assigned by Unraid and cannot be set through its share API. A
+//! requested fsid must already be the live one, or the write is refused.
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
+use plugin_toolkit::prelude::{Result, anyhow, bail};
 use plugin_toolkit::storage::{Capability, ExportEntry, StorageBackend, StorageError, StorageKind};
+
+use crate::docker_adopt::privileged::{self, PrivilegedOp};
+use crate::docker_adopt::safefs;
+use crate::share_cache::{self, EMHTTPD_SOCKET, SHARES_INI, VAR_INI};
 
 /// Where Unraid persists per-share settings.
 const SHARE_CFG_DIR: &str = "/boot/config/shares";
@@ -53,6 +34,7 @@ const USER_SHARE_ROOT: &str = "/mnt/user";
 const EXPORTS_FILE: &str = "/etc/exports";
 /// `shareExportNFS` value meaning "exported". `-` means not exported.
 const NFS_ENABLED: &str = "e";
+const NFS_KEYS: &[&str] = &["shareExportNFS", "shareSecurityNFS", "shareHostListNFS"];
 
 /// The `storage` facet unraid registers: authoritative for the exports this
 /// Unraid host serves. It deliberately does **not** implement mount/unmount —
@@ -88,64 +70,6 @@ impl UnraidExports {
         Path::new(SHARE_CFG_DIR).join(format!("{name}.cfg"))
     }
 
-    /// Read `key="value"` pairs from a share cfg. Unknown keys are preserved by
-    /// [`write_cfg_keys`], so a partial understanding of the format never drops
-    /// settings this plugin does not model.
-    fn parse_cfg(text: &str) -> Vec<(String, String)> {
-        text.lines()
-            .filter_map(|l| {
-                let l = l.trim();
-                if l.is_empty() || l.starts_with('#') {
-                    return None;
-                }
-                let (k, v) = l.split_once('=')?;
-                Some((k.trim().to_string(), v.trim().trim_matches('"').to_string()))
-            })
-            .collect()
-    }
-
-    fn cfg_get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
-        pairs
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
-    }
-
-    /// Split `shareHostListNFS` into (clients, options).
-    ///
-    /// Unraid stores `10.0.0.5(rw,sync) 10.0.0.6(ro)` — per-client options.
-    /// [`ExportEntry`] models one flat `options` list, so the first client's
-    /// options represent the entry.
-    ///
-    /// Write-path only: reads come from `/etc/exports` via
-    /// [`Self::entry_from_exports`], which unions the per-client groups instead.
-    /// This is used to interpret the cfg during an `upsert_export` read-back, and
-    /// `upsert_export` rewrites every client with one option set — so genuinely
-    /// differing per-client options do not round-trip. Callers needing per-client
-    /// divergence must edit the cfg directly until the contract grows a
-    /// per-client shape.
-    fn parse_host_list(raw: &str) -> (Vec<String>, Vec<String>) {
-        let mut clients = Vec::new();
-        let mut options = Vec::new();
-        for spec in raw.split_whitespace() {
-            match spec.split_once('(') {
-                Some((client, opts)) => {
-                    clients.push(client.to_string());
-                    if options.is_empty() {
-                        options = opts
-                            .trim_end_matches(')')
-                            .split(',')
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .collect();
-                    }
-                }
-                None => clients.push(spec.to_string()),
-            }
-        }
-        (clients, options)
-    }
-
     /// Render (clients, options) back into Unraid's `shareHostListNFS` form.
     fn render_host_list(clients: &[String], options: &[String]) -> String {
         let opts = options.join(",");
@@ -160,50 +84,6 @@ impl UnraidExports {
             })
             .collect::<Vec<_>>()
             .join(" ")
-    }
-
-    /// Turn one share cfg into an [`ExportEntry`], or `None` when that share is
-    /// not NFS-exported (`shareExportNFS` != `e`).
-    fn entry_from_cfg(name: &str, text: &str) -> Option<ExportEntry> {
-        let pairs = Self::parse_cfg(text);
-        if Self::cfg_get(&pairs, "shareExportNFS") != Some(NFS_ENABLED) {
-            return None;
-        }
-        let (allowed_clients, options) =
-            Self::parse_host_list(Self::cfg_get(&pairs, "shareHostListNFS").unwrap_or_default());
-        Some(ExportEntry {
-            path: format!("{USER_SHARE_ROOT}/{name}"),
-            allowed_clients,
-            options,
-            fsid: Self::cfg_get(&pairs, "shareExportNFSFsid")
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-        })
-    }
-
-    /// Error for a share cfg the daemon cannot read.
-    ///
-    /// EACCES here is structural, not a misconfiguration: `/boot` is vfat mounted
-    /// `fmask=0177,dmask=0077`, so permissions come from the mount and every file
-    /// is 0600 root regardless of chmod. Authoring additionally needs
-    /// `exportfs -ra`. So an unprivileged daemon can never write exports, and a
-    /// bare "Permission denied" invites someone to go hunting for a chmod that
-    /// cannot exist. Say what is actually required instead.
-    pub(crate) fn cfg_read_error(name: &str, cfg: &Path, e: &std::io::Error) -> StorageError {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            return StorageError::Other(format!(
-                "cannot author exports as an unprivileged daemon: {} is root-only \
-                 (/boot is vfat, mounted fmask=0177,dmask=0077 — no chmod can change this), \
-                 and applying an export also requires `exportfs -ra`. \
-                 Export *reads* work unprivileged via /etc/exports; writes need a privileged \
-                 helper or Unraid's own share API. See unraid#44",
-                cfg.display()
-            ));
-        }
-        StorageError::Other(format!(
-            "share '{name}' has no config at {}: {e}",
-            cfg.display()
-        ))
     }
 
     /// Parse one `/etc/exports` line into an [`ExportEntry`].
@@ -308,93 +188,6 @@ impl UnraidExports {
         joined
     }
 
-    /// Rewrite `/etc/exports`, replacing any line for `path` with `line`.
-    /// `line = None` removes the export. Returns the new file contents.
-    ///
-    /// Lines are matched on the quoted path Unraid writes (`"/mnt/user/pbs"`)
-    /// and on the bare path, so a hand-edited table is still matched rather
-    /// than silently duplicated.
-    fn rewrite_exports(current: &str, path: &str, line: Option<&str>) -> String {
-        let quoted = format!("\"{path}\"");
-        let mut out: Vec<String> = current
-            .lines()
-            .filter(|l| {
-                let t = l.trim();
-                let first = t.split_whitespace().next().unwrap_or_default();
-                first != quoted && first != path
-            })
-            .map(str::to_string)
-            .collect();
-        if let Some(l) = line {
-            out.push(l.to_string());
-        }
-        let mut joined = out.join("\n");
-        joined.push('\n');
-        joined
-    }
-
-    /// The `/etc/exports` line for an entry, in Unraid's own shape.
-    fn exports_line(entry: &ExportEntry) -> String {
-        let mut export_opts = Vec::new();
-        if let Some(fsid) = entry.fsid.as_deref().filter(|s| !s.is_empty()) {
-            export_opts.push(format!("fsid={fsid}"));
-        }
-        let has = |names: &[&str]| entry.options.iter().any(|o| names.contains(&o.as_str()));
-        if !has(&["sync", "async"]) {
-            export_opts.push("sync".to_string());
-        }
-        if !has(&["subtree_check", "no_subtree_check"]) {
-            export_opts.push("no_subtree_check".to_string());
-        }
-        format!(
-            "\"{}\" -{} {}",
-            entry.path,
-            export_opts.join(","),
-            Self::render_host_list(&entry.allowed_clients, &entry.options)
-        )
-    }
-
-    fn write_atomic(path: &Path, contents: &str) -> Result<(), StorageError> {
-        use std::hash::{BuildHasher, Hasher};
-        use std::os::unix::fs::OpenOptionsExt;
-        let fail =
-            |e: std::io::Error| StorageError::Other(format!("write {}: {e}", path.display()));
-        let dir = match path.parent() {
-            Some(d) if !d.as_os_str().is_empty() => d,
-            _ => Path::new("."),
-        };
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-        hasher.write_u32(std::process::id());
-        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            hasher.write_u128(d.as_nanos());
-        }
-        let tmp = dir.join(format!(".{name}.{:016x}.tmp", hasher.finish()));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(&tmp)
-            .map_err(fail)?;
-        let result = (|| {
-            file.write_all(contents.as_bytes())?;
-            if let Ok(meta) = fs::symlink_metadata(path)
-                && file.metadata()?.permissions() != meta.permissions()
-            {
-                file.set_permissions(meta.permissions()).ok();
-            }
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&tmp, path)
-        })();
-        if result.is_err() {
-            fs::remove_file(&tmp).ok();
-        }
-        result.map_err(fail)?;
-        fs::File::open(dir).and_then(|d| d.sync_all()).map_err(fail)
-    }
-
     fn validate_entry(entry: &ExportEntry) -> Result<(), StorageError> {
         let bad = |what: &str, v: &str| {
             StorageError::Other(format!("invalid export {what} '{}'", v.escape_debug()))
@@ -434,21 +227,205 @@ impl UnraidExports {
         }
         Ok(())
     }
+}
 
-    /// Re-read the live export table so callers see what was actually applied.
-    fn reexport() -> Result<(), StorageError> {
-        let out = Command::new("exportfs")
-            .arg("-ra")
-            .output()
-            .map_err(|e| StorageError::Other(format!("run `exportfs -ra`: {e}")))?;
-        if !out.status.success() {
-            return Err(StorageError::Other(format!(
-                "`exportfs -ra` failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        Ok(())
+fn read_live() -> Result<Vec<ExportEntry>, StorageError> {
+    let text = fs::read_to_string(EXPORTS_FILE)
+        .map_err(|e| StorageError::Other(format!("read {EXPORTS_FILE}: {e}")))?;
+    let mut out: Vec<ExportEntry> = text
+        .lines()
+        .filter_map(UnraidExports::entry_from_exports)
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+async fn run_privileged(op: PrivilegedOp) -> Result<String, StorageError> {
+    let runner = privileged::runner()
+        .ok_or_else(|| StorageError::Other(privileged::missing_runner_blocker()))?;
+    runner
+        .run(&op)
+        .await
+        .map_err(|e| StorageError::Other(format!("{e:#}")))
+}
+
+fn nfs_form(
+    share: &str,
+    entry: Option<&ExportEntry>,
+    security: &str,
+) -> Vec<Vec<(&'static str, String)>> {
+    let name = ("shareName", share.to_string());
+    match entry {
+        Some(e) => vec![
+            vec![
+                name.clone(),
+                (
+                    "shareHostListNFS",
+                    UnraidExports::render_host_list(&e.allowed_clients, &e.options),
+                ),
+                ("changeShareAccessNFS", "Apply".into()),
+            ],
+            vec![
+                name,
+                ("shareExportNFS", NFS_ENABLED.into()),
+                ("shareSecurityNFS", "private".into()),
+                ("changeShareSecurityNFS", "Apply".into()),
+            ],
+        ],
+        None => vec![vec![
+            name,
+            ("shareExportNFS", "-".into()),
+            ("shareSecurityNFS", security.to_string()),
+            ("changeShareSecurityNFS", "Apply".into()),
+        ]],
     }
+}
+
+fn nfs_query(fields: &[(&str, String)], csrf: &str) -> String {
+    fields
+        .iter()
+        .map(|(k, v)| format!("{k}={}", share_cache::urlencode(v)))
+        .chain(std::iter::once(format!(
+            "csrf_token={}",
+            share_cache::urlencode(csrf)
+        )))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn check_cfg(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+    wanted: &[(&str, String)],
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (k, v) in wanted {
+        let got = after.get(*k).map(String::as_str);
+        if got != Some(v.as_str()) {
+            problems.push(format!("{k}: wanted {v:?}, got {got:?}"));
+        }
+    }
+    for (k, b) in before {
+        if !NFS_KEYS.contains(&k.as_str()) && after.get(k) != Some(b) {
+            problems.push(format!(
+                "{k} changed unexpectedly: {b:?} -> {:?}",
+                after.get(k)
+            ));
+        }
+    }
+    problems
+}
+
+fn check_live(exports: &str, path: &str, entry: Option<&ExportEntry>) -> Vec<String> {
+    let live = exports
+        .lines()
+        .filter_map(UnraidExports::entry_from_exports)
+        .find(|e| e.path == path);
+    match (entry, live) {
+        (None, None) => Vec::new(),
+        (None, Some(_)) => vec![format!("{path} is still exported")],
+        (Some(_), None) => vec![format!("{path} is not exported")],
+        (Some(want), Some(got)) => {
+            let mut problems = Vec::new();
+            let mut wc = want.allowed_clients.clone();
+            let mut gc = got.allowed_clients.clone();
+            wc.sort();
+            gc.sort();
+            if wc != gc {
+                problems.push(format!("clients: wanted {wc:?}, got {gc:?}"));
+            }
+            let missing: Vec<&String> = want
+                .options
+                .iter()
+                .filter(|o| !got.options.contains(o))
+                .collect();
+            if !missing.is_empty() {
+                problems.push(format!("options missing: {missing:?}"));
+            }
+            problems
+        }
+    }
+}
+
+pub(crate) fn apply_nfs_in(
+    shares_ini: &Path,
+    cfg_dir: &Path,
+    var_ini: &Path,
+    socket: &Path,
+    exports: &Path,
+    path: &str,
+    entry: Option<&ExportEntry>,
+) -> Result<String> {
+    let share = UnraidExports::share_name(path).map_err(|e| anyhow!("{e}"))?;
+    if let Some(e) = entry {
+        UnraidExports::validate_entry(e).map_err(|e| anyhow!("{e}"))?;
+    }
+    let read_exports =
+        || fs::read_to_string(exports).map_err(|e| anyhow!("read {}: {e}", exports.display()));
+    let ini = fs::read_to_string(shares_ini)
+        .map_err(|e| anyhow!("read {}: {e}", shares_ini.display()))?;
+    if !share_cache::parse_ini(&ini)
+        .iter()
+        .skip(1)
+        .any(|(s, _)| *s == share)
+    {
+        if entry.is_none() && check_live(&read_exports()?, path, None).is_empty() {
+            return Ok("not exported".into());
+        }
+        bail!("no share '{share}' in {}", shares_ini.display());
+    }
+    let csrf = share_cache::read_csrf(var_ini)?;
+    let cfg = cfg_dir.join(format!("{share}.cfg"));
+    let snapshot = |p: &Path| -> Result<BTreeMap<String, String>> {
+        Ok(match safefs::read_file(p)? {
+            Some(b) => {
+                share_cache::parse_ini(&String::from_utf8_lossy(&b))
+                    .remove(0)
+                    .1
+            }
+            None => BTreeMap::new(),
+        })
+    };
+    let before = snapshot(&cfg)?;
+    let security = before
+        .get("shareSecurityNFS")
+        .cloned()
+        .unwrap_or_else(|| "public".into());
+    let forms = nfs_form(&share, entry, &security);
+    for form in &forms {
+        share_cache::emhttp_get(socket, &nfs_query(form, &csrf))?;
+    }
+    let wanted: Vec<(&str, String)> = forms
+        .iter()
+        .flatten()
+        .filter(|(k, _)| NFS_KEYS.contains(k))
+        .cloned()
+        .collect();
+    let mut problems = check_cfg(&before, &snapshot(&cfg)?, &wanted);
+    problems.extend(check_live(&read_exports()?, path, entry));
+    if !problems.is_empty() {
+        bail!(
+            "emhttp did not apply the NFS export cleanly: {}",
+            problems.join("; ")
+        );
+    }
+    Ok(wanted
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; "))
+}
+
+pub(crate) fn apply_nfs(path: &str, entry: Option<&ExportEntry>) -> Result<String> {
+    apply_nfs_in(
+        Path::new(SHARES_INI),
+        Path::new(SHARE_CFG_DIR),
+        Path::new(VAR_INI),
+        Path::new(EMHTTPD_SOCKET),
+        Path::new(EXPORTS_FILE),
+        path,
+        entry,
+    )
 }
 
 #[plugin_toolkit::orca_async]
@@ -484,76 +461,45 @@ impl StorageBackend for UnraidExports {
     /// actually serving rather than what the config intends — the right answer
     /// for a read, and the two can legitimately differ until `exportfs -ra`.
     async fn list_exports(&self) -> Result<Vec<ExportEntry>, StorageError> {
-        let text = fs::read_to_string(EXPORTS_FILE)
-            .map_err(|e| StorageError::Other(format!("read {EXPORTS_FILE}: {e}")))?;
-        let mut out: Vec<ExportEntry> = text.lines().filter_map(Self::entry_from_exports).collect();
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(out)
+        read_live()
     }
 
     async fn upsert_export(&self, entry: &ExportEntry) -> Result<ExportEntry, StorageError> {
-        let name = Self::share_name(&entry.path)?;
-        Self::validate_entry(entry)?;
-        let cfg = Self::cfg_path(&name);
-        // The share must already exist: creating one is array/disk business
-        // (`Capability::Create`), not export authoring.
-        let text = fs::read_to_string(&cfg).map_err(|e| Self::cfg_read_error(&name, &cfg, &e))?;
-
-        // 1. Persist intent first, so a crash between the two writes leaves the
-        //    durable record ahead of the live table rather than behind it.
-        let updates = vec![
-            ("shareExportNFS", NFS_ENABLED.to_string()),
-            ("shareExportNFSFsid", entry.fsid.clone().unwrap_or_default()),
-            (
-                "shareHostListNFS",
-                Self::render_host_list(&entry.allowed_clients, &entry.options),
-            ),
-        ];
-        Self::write_atomic(&cfg, &Self::write_cfg_keys(&text, &updates))?;
-
-        // 2. Make it live.
-        let current = fs::read_to_string(EXPORTS_FILE).unwrap_or_default();
-        let next = Self::rewrite_exports(&current, &entry.path, Some(&Self::exports_line(entry)));
-        if let Err(e) = Self::write_atomic(Path::new(EXPORTS_FILE), &next) {
-            return Err(match Self::write_atomic(&cfg, &text) {
-                Ok(()) => e,
-                Err(r) => StorageError::Other(format!("{e}; cfg rollback also failed: {r}")),
-            });
+        let path = format!("{USER_SHARE_ROOT}/{}", Self::share_name(&entry.path)?);
+        let entry = ExportEntry {
+            path: path.clone(),
+            ..entry.clone()
+        };
+        Self::validate_entry(&entry)?;
+        if let Some(fsid) = entry.fsid.as_deref().filter(|s| !s.is_empty()) {
+            let live = read_live()?;
+            let current = live
+                .iter()
+                .find(|e| e.path == path)
+                .and_then(|e| e.fsid.as_deref());
+            if current != Some(fsid) {
+                return Err(StorageError::Other(format!(
+                    "fsid {fsid} cannot be set through Unraid's share API: emhttp assigns it \
+                     (live fsid for {path} is {current:?})"
+                )));
+            }
         }
-        Self::reexport()?;
-
-        // 3. Read back rather than echo the request, so a value the host
-        //    normalized or refused is visible to the caller.
-        let after = fs::read_to_string(&cfg)
-            .map_err(|e| StorageError::Other(format!("re-read {}: {e}", cfg.display())))?;
-        Self::entry_from_cfg(&name, &after).ok_or_else(|| {
-            StorageError::Other(format!(
-                "share '{name}' is still not NFS-exported after the write"
-            ))
+        run_privileged(PrivilegedOp::SetShareNfs {
+            path: path.clone(),
+            clients: entry.allowed_clients.clone(),
+            options: entry.options.clone(),
         })
+        .await?;
+        read_live()?
+            .into_iter()
+            .find(|e| e.path == path)
+            .ok_or_else(|| StorageError::Other(format!("{path} is not in {EXPORTS_FILE}")))
     }
 
     async fn remove_export(&self, path: &str) -> Result<(), StorageError> {
-        let name = Self::share_name(path)?;
-        let cfg = Self::cfg_path(&name);
-
-        // Idempotent: a share with no config is already not exported. But only
-        // *absence* may be treated that way — an unreadable cfg (EACCES on the
-        // root-only vfat /boot) is an unknown, and reporting it as "already
-        // unexported" would claim a removal that never happened.
-        match fs::read_to_string(&cfg) {
-            Ok(text) => {
-                let updates = vec![("shareExportNFS", "-".to_string())];
-                Self::write_atomic(&cfg, &Self::write_cfg_keys(&text, &updates))?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(Self::cfg_read_error(&name, &cfg, &e)),
-        }
-
-        let current = fs::read_to_string(EXPORTS_FILE).unwrap_or_default();
-        let next = Self::rewrite_exports(&current, path, None);
-        Self::write_atomic(Path::new(EXPORTS_FILE), &next)?;
-        Self::reexport()
+        let path = format!("{USER_SHARE_ROOT}/{}", Self::share_name(path)?);
+        run_privileged(PrivilegedOp::RemoveShareNfs { path }).await?;
+        Ok(())
     }
 }
 
@@ -644,31 +590,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn permission_denied_on_the_root_only_cfg_explains_what_is_required() {
-        let e = UnraidExports::cfg_read_error(
-            "pbs",
-            Path::new("/boot/config/shares/pbs.cfg"),
-            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-        );
-        let msg = format!("{e:?}");
-        // Must not read as a fixable permission slip — no chmod can help on vfat.
-        assert!(msg.contains("vfat"), "{msg}");
-        assert!(msg.contains("exportfs -ra"), "{msg}");
-    }
-
-    #[test]
-    fn a_missing_cfg_is_reported_as_missing_not_as_a_privilege_problem() {
-        let e = UnraidExports::cfg_read_error(
-            "ghost",
-            Path::new("/boot/config/shares/ghost.cfg"),
-            &std::io::Error::from(std::io::ErrorKind::NotFound),
-        );
-        let msg = format!("{e:?}");
-        assert!(msg.contains("no config"), "{msg}");
-        assert!(!msg.contains("vfat"), "must not blame privilege: {msg}");
-    }
-
     /// The real `pbs` share cfg from a live Unraid host, verbatim.
     const PBS_CFG: &str = r#"# Generated settings:
 shareComment="Proxmox backup server"
@@ -682,36 +603,6 @@ shareExportNFSFsid="209"
 shareSecurityNFS="private"
 shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
 "#;
-
-    #[test]
-    fn parses_a_real_share_cfg() {
-        let e = UnraidExports::entry_from_cfg("pbs", PBS_CFG).expect("exported");
-        assert_eq!(e.path, "/mnt/user/pbs");
-        assert_eq!(e.allowed_clients, vec!["10.0.0.17"]);
-        assert_eq!(e.fsid.as_deref(), Some("209"));
-        assert_eq!(
-            e.options,
-            vec!["rw", "sync", "no_subtree_check", "no_root_squash"]
-        );
-    }
-
-    #[test]
-    fn a_share_that_is_not_nfs_exported_is_not_an_entry() {
-        let cfg = PBS_CFG.replace(r#"shareExportNFS="e""#, r#"shareExportNFS="-""#);
-        assert!(UnraidExports::entry_from_cfg("pbs", &cfg).is_none());
-    }
-
-    #[test]
-    fn host_list_round_trips() {
-        let (clients, opts) =
-            UnraidExports::parse_host_list("10.0.0.17(rw,sync) 10.0.0.18(rw,sync)");
-        assert_eq!(clients, vec!["10.0.0.17", "10.0.0.18"]);
-        assert_eq!(opts, vec!["rw", "sync"]);
-        assert_eq!(
-            UnraidExports::render_host_list(&clients, &opts),
-            "10.0.0.17(rw,sync) 10.0.0.18(rw,sync)"
-        );
-    }
 
     /// Keys the plugin does not model must survive a write untouched — a share
     /// cfg carries cache-pool, allocator and floor settings that losing would
@@ -737,15 +628,6 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         assert!(out.contains(r#"shareComment="x""#));
     }
 
-    #[test]
-    fn exports_line_matches_unraid_shape() {
-        let e = UnraidExports::entry_from_cfg("pbs", PBS_CFG).unwrap();
-        assert_eq!(
-            UnraidExports::exports_line(&e),
-            "\"/mnt/user/pbs\" -fsid=209 10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
-        );
-    }
-
     fn entry(options: &[&str]) -> ExportEntry {
         ExportEntry {
             path: "/mnt/user/pbs".to_string(),
@@ -753,57 +635,6 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
             options: options.iter().map(|o| o.to_string()).collect(),
             fsid: Some("209".to_string()),
         }
-    }
-
-    #[test]
-    fn exports_line_defaults_to_sync_and_never_forces_async() {
-        assert_eq!(
-            UnraidExports::exports_line(&entry(&["rw"])),
-            "\"/mnt/user/pbs\" -fsid=209,sync,no_subtree_check 10.0.0.17(rw)"
-        );
-        assert_eq!(
-            UnraidExports::exports_line(&entry(&["rw", "async", "subtree_check"])),
-            "\"/mnt/user/pbs\" -fsid=209 10.0.0.17(rw,async,subtree_check)"
-        );
-    }
-
-    #[test]
-    fn no_root_squash_is_emitted_only_when_requested() {
-        assert!(!UnraidExports::exports_line(&entry(&["rw", "sync"])).contains("no_root_squash"));
-        assert!(
-            UnraidExports::exports_line(&entry(&["rw", "no_root_squash"]))
-                .contains("(rw,no_root_squash)")
-        );
-    }
-
-    #[test]
-    fn atomic_write_replaces_contents_and_preserves_mode() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("unraid-exports-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("exports");
-        fs::write(&path, "old\n").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-        UnraidExports::write_atomic(&path, "new\n").unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o640
-        );
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn atomic_write_refuses_to_follow_or_reuse_a_planted_temp() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("exports");
-        let target = dir.path().join("victim");
-        fs::write(&target, "keep\n").unwrap();
-        std::os::unix::fs::symlink(&target, dir.path().join(".exports.tmp")).unwrap();
-        UnraidExports::write_atomic(&path, "new\n").unwrap();
-        assert_eq!(fs::read_to_string(&target).unwrap(), "keep\n");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
     }
 
     #[test]
@@ -829,20 +660,176 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
     }
 
     #[test]
-    fn rewrite_replaces_the_matching_line_only() {
-        let current = "\"/mnt/user/data\" -fsid=102 10.0.0.5(rw)\n\
-                       \"/mnt/user/pbs\" -fsid=209 10.0.0.17(rw)\n";
-        let out = UnraidExports::rewrite_exports(current, "/mnt/user/pbs", Some("NEW"));
-        assert!(out.contains("\"/mnt/user/data\""));
-        assert!(!out.contains("-fsid=209"));
-        assert!(out.contains("NEW"));
+    fn host_list_renders_one_option_set_per_client() {
+        assert_eq!(
+            UnraidExports::render_host_list(
+                &["10.0.0.17".into(), "10.0.0.18".into()],
+                &["rw".into(), "sync".into()]
+            ),
+            "10.0.0.17(rw,sync) 10.0.0.18(rw,sync)"
+        );
+    }
+
+    fn fake_emhttp(
+        f: &crate::test_support::FakeRoot,
+        requests: usize,
+        cfg: String,
+        exports: String,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use std::io::{BufRead, BufReader, Write};
+        let p = f.path().to_path_buf();
+        let l = std::os::unix::net::UnixListener::bind(p.join("emhttpd.sock")).unwrap();
+        std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            for n in 0..requests {
+                let (mut s, _) = l.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(&s).read_line(&mut line).unwrap();
+                lines.push(line);
+                if n + 1 == requests {
+                    fs::write(p.join("pbs.cfg"), &cfg).unwrap();
+                    fs::write(p.join("exports"), &exports).unwrap();
+                }
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+            }
+            lines
+        })
+    }
+
+    fn nfs_setup() -> crate::test_support::FakeRoot {
+        let f = crate::test_support::FakeRoot::new("exports");
+        f.write("shares.ini", "[\"pbs\"]\nname=\"pbs\"\n")
+            .write("pbs.cfg", PBS_CFG)
+            .write("var.ini", "csrf_token=\"TOK\"\n")
+            .write("exports", EXPORTS);
+        f
+    }
+
+    fn nfs_run(f: &crate::test_support::FakeRoot, entry: Option<&ExportEntry>) -> Result<String> {
+        let p = f.path();
+        apply_nfs_in(
+            &p.join("shares.ini"),
+            p,
+            &p.join("var.ini"),
+            &p.join("emhttpd.sock"),
+            &p.join("exports"),
+            "/mnt/user/pbs",
+            entry,
+        )
+    }
+
+    fn pbs_entry() -> ExportEntry {
+        ExportEntry {
+            path: "/mnt/user/pbs".into(),
+            allowed_clients: vec!["10.0.0.13".into()],
+            options: vec!["rw".into()],
+            fsid: None,
+        }
     }
 
     #[test]
-    fn rewrite_removes_when_no_line_given() {
-        let current = "\"/mnt/user/pbs\" -fsid=209 10.0.0.17(rw)\n";
-        let out = UnraidExports::rewrite_exports(current, "/mnt/user/pbs", None);
-        assert!(!out.contains("pbs"));
+    fn upsert_posts_the_nfs_forms_and_verifies_cfg_and_exports() {
+        let f = nfs_setup();
+        let cfg = PBS_CFG.replace(
+            "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)",
+            "10.0.0.13(rw)",
+        );
+        let exports = EXPORTS.replace(
+            "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)",
+            "10.0.0.13(rw)",
+        );
+        let srv = fake_emhttp(&f, 2, cfg, exports);
+        let out = nfs_run(&f, Some(&pbs_entry())).unwrap();
+        assert_eq!(
+            out,
+            "shareHostListNFS=10.0.0.13(rw); shareExportNFS=e; shareSecurityNFS=private"
+        );
+        assert_eq!(
+            srv.join().unwrap(),
+            vec![
+                "GET /update.htm?shareName=pbs&shareHostListNFS=10.0.0.13%28rw%29\
+                 &changeShareAccessNFS=Apply&csrf_token=TOK HTTP/1.0\r\n",
+                "GET /update.htm?shareName=pbs&shareExportNFS=e&shareSecurityNFS=private\
+                 &changeShareSecurityNFS=Apply&csrf_token=TOK HTTP/1.0\r\n",
+            ]
+        );
+    }
+
+    #[test]
+    fn upsert_fails_when_the_live_table_does_not_match() {
+        let f = nfs_setup();
+        let cfg = PBS_CFG.replace(
+            "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)",
+            "10.0.0.13(rw)",
+        );
+        let srv = fake_emhttp(&f, 2, cfg, EXPORTS.into());
+        let e = nfs_run(&f, Some(&pbs_entry())).unwrap_err().to_string();
+        srv.join().unwrap();
+        assert!(e.contains("clients: wanted [\"10.0.0.13\"]"), "{e}");
+    }
+
+    #[test]
+    fn upsert_fails_naming_another_share_key_emhttp_changed() {
+        let f = nfs_setup();
+        let cfg = PBS_CFG
+            .replace(
+                "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)",
+                "10.0.0.13(rw)",
+            )
+            .replace("shareFloor=\"188586393\"", "shareFloor=\"0\"");
+        let exports = EXPORTS.replace(
+            "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)",
+            "10.0.0.13(rw)",
+        );
+        let srv = fake_emhttp(&f, 2, cfg, exports);
+        let e = nfs_run(&f, Some(&pbs_entry())).unwrap_err().to_string();
+        srv.join().unwrap();
+        assert!(e.contains("shareFloor changed unexpectedly"), "{e}");
+    }
+
+    #[test]
+    fn remove_sets_no_export_keeping_security_and_verifies() {
+        let f = nfs_setup();
+        let cfg = PBS_CFG.replace("shareExportNFS=\"e\"", "shareExportNFS=\"-\"");
+        let exports: String = EXPORTS
+            .lines()
+            .filter(|l| !l.contains("/mnt/user/pbs"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let srv = fake_emhttp(&f, 1, cfg, exports);
+        assert_eq!(
+            nfs_run(&f, None).unwrap(),
+            "shareExportNFS=-; shareSecurityNFS=private"
+        );
+        assert_eq!(
+            srv.join().unwrap(),
+            vec![
+                "GET /update.htm?shareName=pbs&shareExportNFS=-&shareSecurityNFS=private\
+                 &changeShareSecurityNFS=Apply&csrf_token=TOK HTTP/1.0\r\n"
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_fails_when_the_share_is_still_exported() {
+        let f = nfs_setup();
+        let cfg = PBS_CFG.replace("shareExportNFS=\"e\"", "shareExportNFS=\"-\"");
+        let srv = fake_emhttp(&f, 1, cfg, EXPORTS.into());
+        let e = nfs_run(&f, None).unwrap_err().to_string();
+        srv.join().unwrap();
+        assert!(e.contains("/mnt/user/pbs is still exported"), "{e}");
+    }
+
+    #[test]
+    fn nfs_writes_refuse_injection_and_unknown_shares_before_posting() {
+        let f = nfs_setup();
+        let mut e = pbs_entry();
+        e.options = vec!["rw)\n/ *(rw".into()];
+        assert!(nfs_run(&f, Some(&e)).is_err());
+        f.write("shares.ini", "");
+        let err = nfs_run(&f, Some(&pbs_entry())).unwrap_err().to_string();
+        assert!(err.contains("no share 'pbs'"), "{err}");
     }
 
     /// Only user shares are addressable — anything else has no cfg to persist
