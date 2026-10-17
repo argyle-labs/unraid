@@ -64,34 +64,6 @@ jobs:
           target: x86_64-unknown-linux-musl
           bins: '["unraid"]'
 
-  build-aarch64-linux-gnu:
-    needs: ui-build
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
-      credentials:
-        username: ${{ secrets.CI_REGISTRY_USER }}
-        password: ${{ secrets.CI_REGISTRY_TOKEN }}
-    steps:
-      - uses: argyle-labs/.github/.github/actions/job-plugin-release-build@main
-        with:
-          target: aarch64-unknown-linux-gnu
-          bins: '["unraid"]'
-
-  build-aarch64-linux-musl:
-    needs: ui-build
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
-      credentials:
-        username: ${{ secrets.CI_REGISTRY_USER }}
-        password: ${{ secrets.CI_REGISTRY_TOKEN }}
-    steps:
-      - uses: argyle-labs/.github/.github/actions/job-plugin-release-build@main
-        with:
-          target: aarch64-unknown-linux-musl
-          bins: '["unraid"]'
-
   build-aarch64-darwin:
     needs: ui-build
     runs-on: macos
@@ -102,7 +74,7 @@ jobs:
           bins: '["unraid"]'
 
   publish:
-    needs: [build-x86_64-linux-gnu, build-x86_64-linux-musl, build-aarch64-linux-gnu, build-aarch64-linux-musl, build-aarch64-darwin]
+    needs: [build-x86_64-linux-gnu, build-x86_64-linux-musl, build-aarch64-darwin]
     runs-on: ubuntu-latest
     permissions:
       contents: write
