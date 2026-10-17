@@ -41,7 +41,7 @@ const SHARES_CFG_DIR: &str = "/boot/config/shares";
 /// The Share settings form's fields, paired with their `shares.ini` keys:
 /// the inputs unraid/webgui `emhttp/plugins/dynamix/ShareEdit.page` submits
 /// for an existing share (`shareCOW` is disabled there, so never sent).
-const EDIT_FIELDS: &[(&str, &str)] = &[
+pub(crate) const EDIT_FIELDS: &[(&str, &str)] = &[
     ("shareName", "name"),
     ("shareNameOrig", "name"),
     ("shareComment", "comment"),
@@ -220,6 +220,14 @@ fn edit_query(current: &BTreeMap<String, String>, req: &ShareCacheRequest, csrf:
     q.join("&")
 }
 
+static EMHTTP_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn emhttp_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    EMHTTP_WRITE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Send one GET to emhttpd's unix socket, as `emcmd` does with curl.
 pub(crate) fn emhttp_get(socket: &Path, query: &str) -> Result<()> {
     use std::io::{Read, Write};
@@ -259,6 +267,7 @@ pub(crate) fn apply_in(
     socket: &Path,
     req: &ShareCacheRequest,
 ) -> Result<String> {
+    let _guard = emhttp_write_lock();
     let read =
         |p: &Path| std::fs::read_to_string(p).map_err(|e| anyhow!("read {}: {e}", p.display()));
     let sections = parse_ini(&read(ini)?);
@@ -747,6 +756,17 @@ shareCaseSensitive=\"auto\"
         let e = run(&f, &req).unwrap_err().to_string();
         srv.join().unwrap();
         assert!(e.contains("shareCachePool2: sent \"\", got \"x\""), "{e}");
+    }
+
+    #[test]
+    fn a_poisoned_emhttp_write_lock_is_recovered() {
+        std::thread::spawn(|| {
+            let _g = emhttp_write_lock();
+            panic!("poison");
+        })
+        .join()
+        .unwrap_err();
+        drop(emhttp_write_lock());
     }
 
     #[test]
