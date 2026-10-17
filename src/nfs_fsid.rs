@@ -12,7 +12,8 @@
 //! Sources are the kernel's own interfaces: `/etc/exports` (the live table),
 //! `rmtab` (rpc.mountd's NFSv3 mount table) and `/proc/fs/nfsd/clients`
 //! (nfsd's NFSv4 client list). Client addresses are shown only to callers
-//! above `read`; `read` callers get counts.
+//! above `read`; `read` callers get counts. NFSv4 clients cannot be tied to
+//! one export, so each is counted against every export.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -34,7 +35,6 @@ const URANDOM: &str = "/dev/urandom";
 const SERVER_KEY_CONTEXT: &[u8] = b"unraid.nfs.serverKey/v1";
 const SERVER_KEY_SECRET: &str = "nfs_server_key_secret";
 const SECRET_INSTANCE: &str = "local";
-const CLIENT_ROLES: &[&str] = &["user", "member", "admin", "super-admin"];
 
 pub(crate) struct Paths {
     pub exports: PathBuf,
@@ -179,8 +179,25 @@ pub(crate) fn server_key(secret: &str, guid: &str) -> String {
 /// The per-install HMAC secret, generated from the kernel CSPRNG on first use
 /// and kept in orca's secrets store.
 pub(crate) fn install_secret(urandom: &Path) -> Result<String> {
+    static CACHE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    install_secret_in(&CACHE, urandom)
+}
+
+/// Generation is serialized by `cache` and the stored value is re-read after
+/// `set`, so concurrent first calls agree on one secret.
+pub(crate) fn install_secret_in(
+    cache: &std::sync::Mutex<Option<String>>,
+    urandom: &Path,
+) -> Result<String> {
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(s) = cached.as_ref() {
+        return Ok(s.clone());
+    }
     let name = secrets::scoped_name("unraid", SECRET_INSTANCE, SERVER_KEY_SECRET);
     if let Some(s) = secrets::get(&name)?.filter(|s| !s.is_empty()) {
+        *cached = Some(s.clone());
         return Ok(s);
     }
     use std::io::Read;
@@ -190,12 +207,25 @@ pub(crate) fn install_secret(urandom: &Path) -> Result<String> {
         .map_err(|e| anyhow!("read {}: {e}", urandom.display()))?;
     let secret = hash::hex_encode(&buf);
     secrets::set(&name, &secret, Some("unraid NFS serverKey HMAC secret"))?;
-    Ok(secret)
+    let stored = secrets::get_required(&name)?;
+    *cached = Some(stored.clone());
+    Ok(stored)
+}
+
+/// Rank over read < user < admin < super-admin; unknown roles rank lowest.
+fn role_rank(role: &str) -> u8 {
+    match role {
+        "read" => 1,
+        "user" => 2,
+        "admin" => 3,
+        "super-admin" => 4,
+        _ => 0,
+    }
 }
 
 pub(crate) fn shows_clients(ctx: &ToolCtx) -> bool {
     ctx.caller()
-        .is_some_and(|c| CLIENT_ROLES.contains(&c.role.as_str()))
+        .is_some_and(|c| role_rank(&c.role) >= role_rank("user"))
 }
 
 /// An `rmtab` line, `client:path:0xcount`, split from the right so an IPv6
@@ -418,6 +448,15 @@ mod tests {
             hash::hex_encode(&out),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+        assert_eq!(
+            hash::hex_encode(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        let block: Vec<u8> = (0..64).collect();
+        assert_eq!(
+            hash::hex_encode(&hmac_sha256(&block, b"orca")),
+            "a0eb7406e0b22a462fe73f5b55e7a8ea6d4b76fcc625fa5910336b5c5161476e"
+        );
         let long = hmac_sha256(
             &[0xaa; 131],
             b"Test Using Larger Than Block-Size Key - Hash Key First",
@@ -453,17 +492,61 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_first_calls_agree_on_one_secret() {
+        use plugin_toolkit::abi::{SecretOp, SecretReply};
+        use plugin_toolkit::capsink::with_cap_sink;
+        use plugin_toolkit::serde_json;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        let f = FakeRoot::new("nfsfsid-race");
+        f.write("urandom", &"z".repeat(64));
+        let store: Arc<Mutex<HashMap<String, String>>> = Arc::default();
+        let cache = Arc::new(Mutex::new(None));
+        let urandom = f.path().join("urandom");
+        let keys: Vec<String> = (0..8)
+            .map(|_| {
+                let (store, cache, urandom) = (store.clone(), cache.clone(), urandom.clone());
+                std::thread::spawn(move || {
+                    let sink = Box::new(move |_: &str, json: &str| {
+                        let op: SecretOp = serde_json::from_str(json).map_err(|e| e.to_string())?;
+                        let mut reply = SecretReply::default();
+                        let mut m = store.lock().unwrap();
+                        match op {
+                            SecretOp::Get { name } => reply.value = m.get(&name).cloned(),
+                            SecretOp::Set { name, value, .. } => {
+                                m.insert(name, value);
+                            }
+                            _ => {}
+                        }
+                        serde_json::to_string(&reply).map_err(|e| e.to_string())
+                    });
+                    with_cap_sink(sink, || install_secret_in(&cache, &urandom).unwrap())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        assert!(keys.windows(2).all(|w| w[0] == w[1]));
+        assert_eq!(store.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn install_secret_is_generated_once_and_reused() {
         use crate::test_support::{Store, with_store};
         use std::cell::RefCell;
         use std::rc::Rc;
         let f = FakeRoot::new("nfsfsid-rand");
         f.write("urandom", &"x".repeat(64));
+        let cache = std::sync::Mutex::new(None);
         let store = Rc::new(RefCell::new(Store::default()));
         let (a, b) = with_store(&store, || {
-            let a = install_secret(&f.path().join("urandom")).unwrap();
+            let a = install_secret_in(&cache, &f.path().join("urandom")).unwrap();
             f.write("urandom", &"y".repeat(64));
-            (a, install_secret(&f.path().join("urandom")).unwrap())
+            (
+                a,
+                install_secret_in(&cache, &f.path().join("urandom")).unwrap(),
+            )
         });
         assert_eq!(a, b);
         assert_eq!(a, hash::hex_encode(&[b'x'; 32]));
@@ -658,5 +741,7 @@ mod tests {
         assert!(!shows_clients(&ctx(None)));
         assert!(shows_clients(&ctx(Some("user"))));
         assert!(shows_clients(&ctx(Some("admin"))));
+        assert!(shows_clients(&ctx(Some("super-admin"))));
+        assert!(!shows_clients(&ctx(Some("member"))));
     }
 }
