@@ -176,18 +176,29 @@ pub(crate) fn server_key(secret: &str, guid: &str) -> String {
     hash::hex_encode(&hmac_sha256(secret.as_bytes(), &msg)[..16])
 }
 
+fn read_urandom(path: &Path) -> Result<[u8; 32]> {
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
+    Ok(buf)
+}
+
 /// The per-install HMAC secret, generated from the kernel CSPRNG on first use
 /// and kept in orca's secrets store.
-pub(crate) fn install_secret(urandom: &Path) -> Result<String> {
+fn install_secret() -> Result<String> {
     static CACHE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-    install_secret_in(&CACHE, urandom)
+    install_secret_in(&CACHE, &|| read_urandom(Path::new(URANDOM)))
 }
 
 /// Generation is serialized by `cache` and the stored value is re-read after
-/// `set`, so concurrent first calls agree on one secret.
+/// `set` (one retry), so concurrent first calls agree on one secret. The
+/// cached value lives for the process: fsids stay stable, and a rotated
+/// secret takes effect on plugin restart.
 pub(crate) fn install_secret_in(
     cache: &std::sync::Mutex<Option<String>>,
-    urandom: &Path,
+    random: &dyn Fn() -> Result<[u8; 32]>,
 ) -> Result<String> {
     let mut cached = cache
         .lock()
@@ -196,20 +207,21 @@ pub(crate) fn install_secret_in(
         return Ok(s.clone());
     }
     let name = secrets::scoped_name("unraid", SECRET_INSTANCE, SERVER_KEY_SECRET);
-    if let Some(s) = secrets::get(&name)?.filter(|s| !s.is_empty()) {
+    let stored =
+        |n: &str| -> Result<Option<String>> { Ok(secrets::get(n)?.filter(|s| !s.is_empty())) };
+    if let Some(s) = stored(&name)? {
         *cached = Some(s.clone());
         return Ok(s);
     }
-    use std::io::Read;
-    let mut buf = [0u8; 32];
-    fs::File::open(urandom)
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .map_err(|e| anyhow!("read {}: {e}", urandom.display()))?;
-    let secret = hash::hex_encode(&buf);
+    let secret = hash::hex_encode(&random()?);
     secrets::set(&name, &secret, Some("unraid NFS serverKey HMAC secret"))?;
-    let stored = secrets::get_required(&name)?;
-    *cached = Some(stored.clone());
-    Ok(stored)
+    let value = match stored(&name)? {
+        Some(v) => v,
+        None => stored(&name)?
+            .ok_or_else(|| anyhow!("secret '{name}' not readable after it was set"))?,
+    };
+    *cached = Some(value.clone());
+    Ok(value)
 }
 
 /// Rank over read < user < admin < super-admin; unknown roles rank lowest.
@@ -383,10 +395,12 @@ pub(crate) fn report_in(p: &Paths, secret: &str, show_clients: bool) -> Result<F
 pub struct UnraidNfsFsidsArgs {}
 
 /// Report this host's NFS fsids, duplicates among them, the planned fsid for
-/// each user share, and which clients hold mounts.
+/// each user share, and which clients hold mounts. The serverKey secret is
+/// read once per plugin process, so planned fsids stay stable; a rotated
+/// secret takes effect on plugin restart.
 #[orca_tool(domain = "unraid", verb = "nfs.fsids", role = "read")]
 async fn unraid_nfs_fsids(_args: UnraidNfsFsidsArgs, ctx: &ToolCtx) -> Result<FsidReport> {
-    let secret = install_secret(Path::new(URANDOM))?;
+    let secret = install_secret()?;
     let show = shows_clients(ctx);
     tokio::task::spawn_blocking(move || report_in(&Paths::live(), &secret, show)).await?
 }
@@ -395,6 +409,7 @@ async fn unraid_nfs_fsids(_args: UnraidNfsFsidsArgs, ctx: &ToolCtx) -> Result<Fs
 mod tests {
     use super::*;
     use crate::test_support::FakeRoot;
+    use std::collections::HashMap;
 
     const EXPORTS: &str = "\
 \"/mnt/user/backups\" -fsid=106,async,no_subtree_check 10.0.0.0/24(rw)
@@ -491,72 +506,106 @@ mod tests {
         assert!(err.contains("malformed"), "{err}");
     }
 
+    type Secrets = std::sync::Arc<std::sync::Mutex<(HashMap<String, String>, u32, u32)>>;
+
+    fn secret_sink(state: Secrets) -> plugin_toolkit::capsink::CapSink {
+        use plugin_toolkit::abi::{SecretOp, SecretReply};
+        use plugin_toolkit::serde_json;
+        Box::new(move |_: &str, json: &str| {
+            let op: SecretOp = serde_json::from_str(json).map_err(|e| e.to_string())?;
+            let mut reply = SecretReply::default();
+            let mut st = state.lock().unwrap();
+            match op {
+                SecretOp::Get { name } => {
+                    if st.2 > 0 {
+                        st.2 -= 1;
+                    } else {
+                        reply.value = st.0.get(&name).cloned();
+                    }
+                }
+                SecretOp::Set { name, value, .. } => {
+                    st.1 += 1;
+                    st.0.insert(name, value);
+                }
+                _ => {}
+            }
+            serde_json::to_string(&reply).map_err(|e| e.to_string())
+        })
+    }
+
+    fn counting_random() -> impl Fn() -> Result<[u8; 32]> + Send + Sync {
+        let n = std::sync::atomic::AtomicU8::new(0);
+        move || Ok([n.fetch_add(1, std::sync::atomic::Ordering::SeqCst); 32])
+    }
+
     #[test]
     fn concurrent_first_calls_agree_on_one_secret() {
-        use plugin_toolkit::abi::{SecretOp, SecretReply};
         use plugin_toolkit::capsink::with_cap_sink;
-        use plugin_toolkit::serde_json;
-        use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
-        let f = FakeRoot::new("nfsfsid-race");
-        f.write("urandom", &"z".repeat(64));
-        let store: Arc<Mutex<HashMap<String, String>>> = Arc::default();
+        let state: Secrets = Arc::default();
         let cache = Arc::new(Mutex::new(None));
-        let urandom = f.path().join("urandom");
+        let random = Arc::new(counting_random());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
         let keys: Vec<String> = (0..8)
             .map(|_| {
-                let (store, cache, urandom) = (store.clone(), cache.clone(), urandom.clone());
+                let (state, cache, random, barrier) = (
+                    state.clone(),
+                    cache.clone(),
+                    random.clone(),
+                    barrier.clone(),
+                );
                 std::thread::spawn(move || {
-                    let sink = Box::new(move |_: &str, json: &str| {
-                        let op: SecretOp = serde_json::from_str(json).map_err(|e| e.to_string())?;
-                        let mut reply = SecretReply::default();
-                        let mut m = store.lock().unwrap();
-                        match op {
-                            SecretOp::Get { name } => reply.value = m.get(&name).cloned(),
-                            SecretOp::Set { name, value, .. } => {
-                                m.insert(name, value);
-                            }
-                            _ => {}
-                        }
-                        serde_json::to_string(&reply).map_err(|e| e.to_string())
-                    });
-                    with_cap_sink(sink, || install_secret_in(&cache, &urandom).unwrap())
+                    with_cap_sink(secret_sink(state), || {
+                        barrier.wait();
+                        install_secret_in(&cache, &*random).unwrap()
+                    })
                 })
             })
             .collect::<Vec<_>>()
             .into_iter()
             .map(|h| h.join().unwrap())
             .collect();
-        assert!(keys.windows(2).all(|w| w[0] == w[1]));
-        assert_eq!(store.lock().unwrap().len(), 1);
+        assert!(keys.windows(2).all(|w| w[0] == w[1]), "{keys:?}");
+        assert_eq!(state.lock().unwrap().1, 1);
     }
 
     #[test]
     fn install_secret_is_generated_once_and_reused() {
-        use crate::test_support::{Store, with_store};
-        use std::cell::RefCell;
-        use std::rc::Rc;
-        let f = FakeRoot::new("nfsfsid-rand");
-        f.write("urandom", &"x".repeat(64));
-        let cache = std::sync::Mutex::new(None);
-        let store = Rc::new(RefCell::new(Store::default()));
-        let (a, b) = with_store(&store, || {
-            let a = install_secret_in(&cache, &f.path().join("urandom")).unwrap();
-            f.write("urandom", &"y".repeat(64));
-            (
-                a,
-                install_secret_in(&cache, &f.path().join("urandom")).unwrap(),
-            )
+        let state: Secrets = Default::default();
+        let random = counting_random();
+        let (a, b, c) = plugin_toolkit::capsink::with_cap_sink(secret_sink(state.clone()), || {
+            let a = install_secret_in(&std::sync::Mutex::new(None), &random).unwrap();
+            let fresh_process = install_secret_in(&std::sync::Mutex::new(None), &random).unwrap();
+            let cache = std::sync::Mutex::new(None);
+            let b = install_secret_in(&cache, &random).unwrap();
+            state.lock().unwrap().0.clear();
+            let c = install_secret_in(&cache, &random).unwrap();
+            assert_eq!(a, fresh_process);
+            (a, b, c)
         });
-        assert_eq!(a, b);
-        assert_eq!(a, hash::hex_encode(&[b'x'; 32]));
-        assert_eq!(
-            store
-                .borrow()
-                .secrets
-                .get("unraid.local.nfs_server_key_secret"),
-            Some(&a)
-        );
+        assert_eq!(a, hash::hex_encode(&[0; 32]));
+        assert_eq!((a.clone(), a), (b, c));
+        assert_eq!(state.lock().unwrap().1, 1);
+    }
+
+    #[test]
+    fn stored_value_is_reread_once_then_errors() {
+        let state: Secrets = Default::default();
+        let random = counting_random();
+        state.lock().unwrap().2 = 2;
+        let v = plugin_toolkit::capsink::with_cap_sink(secret_sink(state.clone()), || {
+            install_secret_in(&std::sync::Mutex::new(None), &random)
+        });
+        assert_eq!(v.unwrap(), hash::hex_encode(&[0; 32]));
+
+        state.lock().unwrap().0.clear();
+        state.lock().unwrap().2 = 3;
+        let err = plugin_toolkit::capsink::with_cap_sink(secret_sink(state), || {
+            install_secret_in(&std::sync::Mutex::new(None), &random)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not readable after it was set"), "{err}");
     }
 
     #[test]
