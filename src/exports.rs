@@ -33,8 +33,9 @@ const EXPORTS_FILE: &str = "/etc/exports";
 const SEC_NFS_INI: &str = "/var/local/emhttp/sec_nfs.ini";
 const EMHTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const EMHTTP_DEFAULT_OPTIONS: &[&str] = &["async", "no_subtree_check"];
-const SHARE_SETTING_EXTRA_KEYS: &[&str] = &["export", "security"];
-static NFS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const SHARE_SETTING_EXTRA_KEYS: &[&str] = &["cow", "exclusive"];
+const STATUS_LINE_MAX: u64 = 4096;
+const BODY_DRAIN_MAX: u64 = 64 * 1024;
 /// `shareExportNFS` value meaning "exported". `-` means not exported.
 const NFS_ENABLED: &str = "e";
 
@@ -311,11 +312,21 @@ fn emhttp_post(socket: &Path, body: &str, timeout: std::time::Duration) -> Resul
     s.set_write_timeout(Some(timeout))?;
     s.write_all(emhttp_request(body).as_bytes())
         .map_err(|e| anyhow!("emhttp /update: send: {e}"))?;
+    let mut r = BufReader::new(&s);
     let mut line = Vec::new();
-    BufReader::new((&s).take(4096))
+    r.by_ref()
+        .take(STATUS_LINE_MAX)
         .read_until(b'\n', &mut line)
         .map_err(|e| anyhow!("emhttp /update: read status: {e}"))?;
-    check_status(&String::from_utf8_lossy(&line))
+    if line.last() != Some(&b'\n') {
+        bail!(
+            "emhttp /update: no status line within {STATUS_LINE_MAX} bytes: {:?}",
+            String::from_utf8_lossy(&line)
+        );
+    }
+    check_status(&String::from_utf8_lossy(&line))?;
+    r.take(BODY_DRAIN_MAX).read_to_end(&mut Vec::new()).ok();
+    Ok(())
 }
 
 type ClientGroups = Vec<(String, Vec<String>)>;
@@ -505,9 +516,7 @@ fn apply_nfs_in(
     if let Some(e) = entry {
         UnraidExports::validate_entry(e).map_err(|e| anyhow!("{e}"))?;
     }
-    let _guard = NFS_WRITE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = share_cache::emhttp_write_lock();
     let read = |p: &Path| fs::read_to_string(p).map_err(|e| anyhow!("read {}: {e}", p.display()));
     let ini = read(shares_ini)?;
     if !share_cache::parse_ini(&ini)
@@ -520,6 +529,31 @@ fn apply_nfs_in(
         }
         bail!("no share '{share}' in {}", shares_ini.display());
     };
+    if let Some(fsid) = entry
+        .and_then(|e| e.fsid.as_deref())
+        .filter(|s| !s.is_empty())
+    {
+        let defaults = live_groups(&read(exports)?, path).map(|(d, _)| d);
+        let current = defaults
+            .as_deref()
+            .and_then(|d| d.iter().find_map(|o| o.strip_prefix("fsid=")));
+        if current != Some(fsid) {
+            bail!(
+                "fsid {fsid} cannot be set through Unraid's share API: emhttp assigns it \
+                 (live fsid for {path} is {current:?})"
+            );
+        }
+    }
+    let sec_ini = sec_nfs_ini.with_file_name("sec.ini");
+    let smb = |t: &str| {
+        share_cache::parse_ini(t)
+            .into_iter()
+            .skip(1)
+            .find(|(s, _)| *s == share)
+            .map(|(_, kv)| kv)
+            .unwrap_or_default()
+    };
+    let smb_before = smb(&read(&sec_ini)?);
     let csrf = share_cache::read_csrf(var_ini)?;
     let security = sec_key(&sec_nfs(sec_nfs_ini, &share)?, "security", &share)?.to_string();
     let forms = nfs_form(&share, entry, &security);
@@ -547,6 +581,7 @@ fn apply_nfs_in(
         &before,
         &share_settings(&read(shares_ini)?, &share),
     ));
+    problems.extend(check_settings(&share, &smb_before, &smb(&read(&sec_ini)?)));
     if post_err.is_none() && problems.is_empty() {
         return Ok(forms
             .iter()
@@ -657,19 +692,6 @@ impl StorageBackend for UnraidExports {
         };
         Self::validate_entry(&entry)?;
         off_executor(move || {
-            if let Some(fsid) = entry.fsid.as_deref().filter(|s| !s.is_empty()) {
-                let live = read_live()?;
-                let current = live
-                    .iter()
-                    .find(|e| e.path == path)
-                    .and_then(|e| e.fsid.as_deref());
-                if current != Some(fsid) {
-                    return Err(StorageError::Other(format!(
-                        "fsid {fsid} cannot be set through Unraid's share API: emhttp assigns it \
-                         (live fsid for {path} is {current:?})"
-                    )));
-                }
-            }
             apply_nfs(&path, Some(&entry))?;
             read_live()?
                 .into_iter()
@@ -854,12 +876,22 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
 
     fn nfs_setup() -> crate::test_support::FakeRoot {
         let f = crate::test_support::FakeRoot::new("exports");
-        f.write("shares.ini", "[\"pbs\"]\nname=\"pbs\"\n")
+        f.write("shares.ini", SHARES_FIXTURE)
+            .write("sec.ini", SEC_FIXTURE)
             .write("sec_nfs.ini", &sec_nfs_text("e", "private", PBS_HOSTS))
             .write("var.ini", "version=\"7.2.0\"\ncsrf_token=\"TOK\"\n")
             .write("exports", EXPORTS);
         f
     }
+
+    const SHARES_FIXTURE: &str = "[\"pbs\"]\nname=\"pbs\"\nnameOrig=\"pbs\"\n\
+        comment=\"Proxmox backup server\"\nallocator=\"highwater\"\nsplitLevel=\"\"\n\
+        floor=\"188586393\"\ninclude=\"\"\nexclude=\"\"\nuseCache=\"yes\"\n\
+        cachePool=\"cache\"\ncachePool2=\"\"\ncow=\"auto\"\ncolor=\"green-on\"\n\
+        size=\"0\"\nfree=\"100\"\nused=\"5\"\nluksStatus=\"0\"\nexclusive=\"no\"\nhasCfg=\"yes\"\n";
+
+    const SEC_FIXTURE: &str = "[\"pbs\"]\nexport=\"-\"\nsecurity=\"public\"\n\
+        readList=\"\"\nwriteList=\"\"\n";
 
     const PBS_HOSTS: &str = "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)";
 
@@ -1217,15 +1249,10 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         assert!(e.contains("stale csrf_token"), "{e}");
     }
 
-    #[test]
-    fn a_reset_share_setting_fails_the_write() {
+    fn remove_with(shares_after: String, sec_after: String) -> Result<String> {
         let f = nfs_setup();
-        f.write(
-            "shares.ini",
-            "[\"pbs\"]\nname=\"pbs\"\nfloor=\"100\"\nfree=\"5\"\n",
-        );
         let p = f.path().to_path_buf();
-        let e = apply_nfs_in(
+        apply_nfs_in(
             &p.join("shares.ini"),
             &p.join("sec_nfs.ini"),
             &p.join("var.ini"),
@@ -1233,11 +1260,8 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
             "/mnt/user/pbs",
             None,
             &mut |_| {
-                fs::write(
-                    p.join("shares.ini"),
-                    "[\"pbs\"]\nname=\"pbs\"\nfloor=\"0\"\nfree=\"9\"\n",
-                )
-                .unwrap();
+                fs::write(p.join("shares.ini"), &shares_after).unwrap();
+                fs::write(p.join("sec.ini"), &sec_after).unwrap();
                 fs::write(
                     p.join("sec_nfs.ini"),
                     sec_nfs_text("-", "private", PBS_HOSTS),
@@ -1255,10 +1279,56 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
                 Ok(())
             },
         )
+    }
+
+    #[test]
+    fn runtime_share_state_moving_is_accepted() {
+        let shares = SHARES_FIXTURE
+            .replace("free=\"100\"", "free=\"90\"")
+            .replace("color=\"green-on\"", "color=\"yellow-on\"");
+        remove_with(shares, SEC_FIXTURE.into()).unwrap();
+    }
+
+    #[test]
+    fn a_reset_share_setting_fails_the_write() {
+        for (from, to, key) in [
+            ("floor=\"188586393\"", "floor=\"0\"", "floor"),
+            ("cow=\"auto\"", "cow=\"no\"", "cow"),
+            ("exclusive=\"no\"", "exclusive=\"yes\"", "exclusive"),
+        ] {
+            let e = remove_with(SHARES_FIXTURE.replace(from, to), SEC_FIXTURE.into())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains(&format!("pbs {key} changed unexpectedly")),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_changed_smb_setting_in_sec_ini_fails_the_write() {
+        let e = remove_with(
+            SHARES_FIXTURE.into(),
+            SEC_FIXTURE.replace("security=\"public\"", "security=\"secure\""),
+        )
         .unwrap_err()
         .to_string();
-        assert!(e.contains("pbs floor changed unexpectedly"), "{e}");
-        assert!(!e.contains("free"), "{e}");
+        assert!(e.contains("pbs security changed unexpectedly"), "{e}");
+    }
+
+    #[test]
+    fn fsid_other_than_the_live_one_is_refused_before_posting() {
+        let f = nfs_setup();
+        let mut want = pbs_entry();
+        want.fsid = Some("300".into());
+        let (out, bodies) = nfs_run(&f, Some(&want), None);
+        let e = out.unwrap_err().to_string();
+        assert!(e.contains("fsid 300 cannot be set"), "{e}");
+        assert!(bodies.is_empty());
+        want.fsid = Some("209".into());
+        let (out, _) = nfs_run(&f, Some(&want), Some(pbs_exports_as_13()));
+        out.unwrap();
     }
 
     fn fake_server(
@@ -1289,13 +1359,13 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         let body = "shareName=pbs&csrf_token=TOK";
         let want = emhttp_request(body);
         let (h, tx) = fake_server(&f, b"HTTP/1.1 200 OK\r\n\r\n", want.len());
-        emhttp_post(&f.path().join("emhttpd.sock"), body, EMHTTP_TIMEOUT).unwrap();
         tx.send(()).unwrap();
+        emhttp_post(&f.path().join("emhttpd.sock"), body, EMHTTP_TIMEOUT).unwrap();
         assert_eq!(h.join().unwrap(), want.as_bytes());
     }
 
     #[test]
-    fn post_returns_on_the_status_line_while_the_server_holds_open() {
+    fn post_drains_within_the_timeout_while_the_server_holds_open() {
         let f = nfs_setup();
         let body = "a=b";
         let (h, tx) = fake_server(
@@ -1307,7 +1377,7 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         emhttp_post(
             &f.path().join("emhttpd.sock"),
             body,
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(200),
         )
         .unwrap();
         assert!(t.elapsed() < std::time::Duration::from_secs(2));
@@ -1324,11 +1394,11 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
             b"HTTP/1.1 403 Forbidden\r\n\r\n\xff\xfe",
             emhttp_request(body).len(),
         );
+        tx.send(()).unwrap();
         let e = emhttp_post(&f.path().join("emhttpd.sock"), body, EMHTTP_TIMEOUT)
             .unwrap_err()
             .to_string();
         assert!(e.contains("403"), "{e}");
-        tx.send(()).unwrap();
         h.join().unwrap();
     }
 
@@ -1347,6 +1417,28 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         assert!(e.contains("read status"), "{e}");
         tx.send(()).unwrap();
         h.join().unwrap();
+    }
+
+    #[test]
+    fn status_line_without_newline_or_too_long_is_rejected() {
+        for reply in [
+            b"HTTP/1.1 200 OK".as_slice(),
+            Box::leak(vec![b'x'; 5000].into_boxed_slice()),
+        ] {
+            let f = nfs_setup();
+            let body = "a=b";
+            let (h, tx) = fake_server(&f, reply, emhttp_request(body).len());
+            tx.send(()).unwrap();
+            let e = emhttp_post(
+                &f.path().join("emhttpd.sock"),
+                body,
+                std::time::Duration::from_millis(500),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains("no status line"), "{e}");
+            h.join().unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
