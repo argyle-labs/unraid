@@ -3,19 +3,24 @@
 //! Unraid derives a user share's fsid from its name, so two servers with the
 //! same share names serve the same fsids and a client mounting both gets
 //! `Stale file handle`. This reports the host's fsids, duplicates among them,
-//! and a non-identifying `serverKey` so orca can compare across servers. It
+//! and a non-identifying `serverKey` so orca can compare across servers: an
+//! HMAC-SHA256 of the flash GUID under a per-install secret held in orca's
+//! secrets store, never on the flash. It
 //! also reports the fsid each user share would be given by a per-server hash
 //! plan, and which clients hold mounts.
 //!
 //! Sources are the kernel's own interfaces: `/etc/exports` (the live table),
 //! `rmtab` (rpc.mountd's NFSv3 mount table) and `/proc/fs/nfsd/clients`
-//! (nfsd's NFSv4 client list).
+//! (nfsd's NFSv4 client list). Client addresses are shown only to callers
+//! above `read`; `read` callers get counts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use plugin_toolkit::prelude::*;
+
+use plugin_toolkit::{hash, secrets};
 
 use crate::share_cache::{self, VAR_INI};
 
@@ -25,6 +30,11 @@ const NFSD_CLIENTS: &str = "/proc/fs/nfsd/clients";
 const USER_SHARE_PREFIX: &str = "/mnt/user/";
 const FSID_BASE: u32 = 1000;
 const FSID_SPAN: u32 = 1 << 30;
+const URANDOM: &str = "/dev/urandom";
+const SERVER_KEY_CONTEXT: &[u8] = b"unraid.nfs.serverKey/v1";
+const SERVER_KEY_SECRET: &str = "nfs_server_key_secret";
+const SECRET_INSTANCE: &str = "local";
+const CLIENT_ROLES: &[&str] = &["user", "member", "admin", "super-admin"];
 
 pub(crate) struct Paths {
     pub exports: PathBuf,
@@ -55,8 +65,10 @@ pub struct FsidExport {
     /// The fsid the per-server plan gives this share; empty for non-share exports.
     pub planned_fsid: String,
     /// Clients holding a mount of this path or below it (NFSv3), plus every
-    /// NFSv4 client, which cannot be attributed to one export.
+    /// NFSv4 client, which cannot be attributed to one export. Empty for
+    /// `read` callers, who get only `mountCount`.
     pub mounted_by: Vec<String>,
+    pub mount_count: u32,
 }
 
 #[orca_struct]
@@ -71,7 +83,7 @@ pub struct FsidDuplicate {
 #[derive(Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FsidReport {
-    /// Stable per-server key: an FNV-1a 64 hash of the flash GUID.
+    /// HMAC-SHA256(install secret, context || flashGUID), first 128 bits, hex.
     pub server_key: String,
     pub exports: Vec<FsidExport>,
     pub duplicates: Vec<FsidDuplicate>,
@@ -85,10 +97,19 @@ pub(crate) fn fnv1a(s: &str) -> u32 {
     })
 }
 
-pub(crate) fn fnv1a64(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
+pub(crate) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&hash::sha256(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let pad = |b: u8| k.iter().map(|x| x ^ b).collect::<Vec<u8>>();
+    let mut inner = pad(0x36);
+    inner.extend_from_slice(msg);
+    let mut outer = pad(0x5c);
+    outer.extend_from_slice(&hash::sha256(&inner));
+    hash::sha256(&outer)
 }
 
 fn hashed_fsid(server_key: &str, share: &str) -> u32 {
@@ -124,7 +145,15 @@ pub(crate) fn plan_fsids(
     out
 }
 
-fn server_key(var_ini: &Path) -> Result<String> {
+/// Unraid's flash GUID: hex groups joined by `-` (`0781-5571-...`).
+pub(crate) fn valid_guid(g: &str) -> bool {
+    (9..=64).contains(&g.len())
+        && g.contains('-')
+        && g.split('-')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn flash_guid(var_ini: &Path) -> Result<String> {
     let text =
         fs::read_to_string(var_ini).map_err(|e| anyhow!("read {}: {e}", var_ini.display()))?;
     let guid = share_cache::parse_ini(&text)
@@ -132,7 +161,41 @@ fn server_key(var_ini: &Path) -> Result<String> {
         .find_map(|(_, kv)| kv.get("flashGUID").cloned())
         .filter(|g| !g.is_empty())
         .ok_or_else(|| anyhow!("no flashGUID in {}", var_ini.display()))?;
-    Ok(format!("{:016x}", fnv1a64(&guid)))
+    if !valid_guid(&guid) {
+        bail!(
+            "flashGUID in {} is malformed (expected hex groups joined by '-')",
+            var_ini.display()
+        );
+    }
+    Ok(guid)
+}
+
+pub(crate) fn server_key(secret: &str, guid: &str) -> String {
+    let mut msg = SERVER_KEY_CONTEXT.to_vec();
+    msg.extend_from_slice(guid.as_bytes());
+    hash::hex_encode(&hmac_sha256(secret.as_bytes(), &msg)[..16])
+}
+
+/// The per-install HMAC secret, generated from the kernel CSPRNG on first use
+/// and kept in orca's secrets store.
+pub(crate) fn install_secret(urandom: &Path) -> Result<String> {
+    let name = secrets::scoped_name("unraid", SECRET_INSTANCE, SERVER_KEY_SECRET);
+    if let Some(s) = secrets::get(&name)?.filter(|s| !s.is_empty()) {
+        return Ok(s);
+    }
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    fs::File::open(urandom)
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .map_err(|e| anyhow!("read {}: {e}", urandom.display()))?;
+    let secret = hash::hex_encode(&buf);
+    secrets::set(&name, &secret, Some("unraid NFS serverKey HMAC secret"))?;
+    Ok(secret)
+}
+
+pub(crate) fn shows_clients(ctx: &ToolCtx) -> bool {
+    ctx.caller()
+        .is_some_and(|c| CLIENT_ROLES.contains(&c.role.as_str()))
 }
 
 /// An `rmtab` line, `client:path:0xcount`, split from the right so an IPv6
@@ -211,8 +274,8 @@ fn share_of(path: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-pub(crate) fn report_in(p: &Paths) -> Result<FsidReport> {
-    let server_key = server_key(&p.var_ini)?;
+pub(crate) fn report_in(p: &Paths, secret: &str, show_clients: bool) -> Result<FsidReport> {
+    let server_key = server_key(secret, &flash_guid(&p.var_ini)?);
     let text =
         fs::read_to_string(&p.exports).map_err(|e| anyhow!("read {}: {e}", p.exports.display()))?;
     let parsed: Vec<_> = text
@@ -258,12 +321,17 @@ pub(crate) fn report_in(p: &Paths) -> Result<FsidReport> {
                 }
             }
             mounted_by.extend(m.v4.iter().cloned());
+            let mount_count = mounted_by.len() as u32;
+            if !show_clients {
+                mounted_by.clear();
+            }
             FsidExport {
                 planned_fsid: plan.get(&share).map(u32::to_string).unwrap_or_default(),
                 path: e.path.clone(),
                 share,
                 fsid,
                 mounted_by,
+                mount_count,
             }
         })
         .collect();
@@ -287,8 +355,10 @@ pub struct UnraidNfsFsidsArgs {}
 /// Report this host's NFS fsids, duplicates among them, the planned fsid for
 /// each user share, and which clients hold mounts.
 #[orca_tool(domain = "unraid", verb = "nfs.fsids", role = "read")]
-async fn unraid_nfs_fsids(_args: UnraidNfsFsidsArgs, _ctx: &ToolCtx) -> Result<FsidReport> {
-    tokio::task::spawn_blocking(|| report_in(&Paths::live())).await?
+async fn unraid_nfs_fsids(_args: UnraidNfsFsidsArgs, ctx: &ToolCtx) -> Result<FsidReport> {
+    let secret = install_secret(Path::new(URANDOM))?;
+    let show = shows_clients(ctx);
+    tokio::task::spawn_blocking(move || report_in(&Paths::live(), &secret, show)).await?
 }
 
 #[cfg(test)]
@@ -320,6 +390,12 @@ mod tests {
         }
     }
 
+    const SECRET: &str = "test-secret";
+
+    fn report(f: &FakeRoot) -> Result<FsidReport> {
+        report_in(&paths(f), SECRET, true)
+    }
+
     fn export(r: &FsidReport, path: &str) -> FsidExport {
         r.exports.iter().find(|e| e.path == path).unwrap().clone()
     }
@@ -333,9 +409,71 @@ mod tests {
         assert_eq!(fnv1a(""), 0x811c_9dc5);
         assert_eq!(fnv1a("a"), 0xe40c_292c);
         assert_eq!(fnv1a("foobar"), 0xbf9c_f968);
-        assert_eq!(fnv1a64(""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(fnv1a64("a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(fnv1a64("foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231() {
+        let out = hmac_sha256(&[0x0b; 20], b"Hi There");
+        assert_eq!(
+            hash::hex_encode(&out),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        let long = hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
+        assert_eq!(
+            hash::hex_encode(&long),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn server_key_is_stable_per_secret_and_hides_the_guid() {
+        let g = "0781-5571-AAAA";
+        let a = server_key("s1", g);
+        assert_eq!(a, server_key("s1", g));
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, server_key("s2", g));
+        assert_ne!(a, server_key("s1", "0781-5571-BBBB"));
+        assert!(!a.to_lowercase().contains("0781") && !a.contains("5571"));
+        assert!(!a.to_lowercase().contains("aaaa"));
+    }
+
+    #[test]
+    fn malformed_guid_is_rejected() {
+        assert!(valid_guid("0781-5571-AAAA-1234567890AB"));
+        for bad in ["", "07815571", "0781--5571", "0781-55Z1-AAAA", "-0781-5571"] {
+            assert!(!valid_guid(bad), "{bad}");
+        }
+        let f = fake("");
+        f.write("var.ini", "flashGUID=\"../etc\"\n");
+        let err = report(&f).unwrap_err().to_string();
+        assert!(err.contains("malformed"), "{err}");
+    }
+
+    #[test]
+    fn install_secret_is_generated_once_and_reused() {
+        use crate::test_support::{Store, with_store};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let f = FakeRoot::new("nfsfsid-rand");
+        f.write("urandom", &"x".repeat(64));
+        let store = Rc::new(RefCell::new(Store::default()));
+        let (a, b) = with_store(&store, || {
+            let a = install_secret(&f.path().join("urandom")).unwrap();
+            f.write("urandom", &"y".repeat(64));
+            (a, install_secret(&f.path().join("urandom")).unwrap())
+        });
+        assert_eq!(a, b);
+        assert_eq!(a, hash::hex_encode(&[b'x'; 32]));
+        assert_eq!(
+            store
+                .borrow()
+                .secrets
+                .get("unraid.local.nfs_server_key_secret"),
+            Some(&a)
+        );
     }
 
     #[test]
@@ -358,9 +496,8 @@ mod tests {
     #[test]
     fn duplicates_are_reported_with_a_hashed_server_key() {
         let f = fake("");
-        let r = report_in(&paths(&f)).unwrap();
-        assert_eq!(r.server_key, format!("{:016x}", fnv1a64("0781-5571-AAAA")));
-        assert!(!r.server_key.contains("0781"));
+        let r = report(&f).unwrap();
+        assert_eq!(r.server_key, server_key(SECRET, "0781-5571-AAAA"));
         assert_eq!(
             r.duplicates,
             vec![FsidDuplicate {
@@ -375,7 +512,7 @@ mod tests {
     #[test]
     fn share_names_with_spaces_are_planned() {
         let f = fake("");
-        let r = report_in(&paths(&f)).unwrap();
+        let r = report(&f).unwrap();
         let e = export(&r, "/mnt/user/My Media");
         assert_eq!(e.share, "My Media");
         assert_eq!(e.fsid, "103");
@@ -422,7 +559,7 @@ mod tests {
     #[test]
     fn plan_is_stable_once_applied() {
         let f = fake("");
-        let r = report_in(&paths(&f)).unwrap();
+        let r = report(&f).unwrap();
         let mut applied = EXPORTS.to_string();
         for e in r.exports.iter().filter(|e| !e.share.is_empty()) {
             applied = applied.replace(
@@ -431,7 +568,7 @@ mod tests {
             );
         }
         f.write("exports", &applied);
-        let again = report_in(&paths(&f)).unwrap();
+        let again = report(&f).unwrap();
         assert!(again.duplicates.is_empty());
         assert!(
             again
@@ -449,7 +586,7 @@ mod tests {
              10.0.0.8:/mnt/user/backupsX:0x00000001\n\
              10.0.0.7:/mnt/user/backups:0x00000000\n",
         );
-        let r = report_in(&paths(&f)).unwrap();
+        let r = report(&f).unwrap();
         assert_eq!(export(&r, "/mnt/user/pbs").mounted_by, vec!["fd00::17"]);
         assert_eq!(export(&r, "/mnt/user/backups").mounted_by, vec!["10.0.0.9"]);
         assert!(export(&r, "/mnt/user/My Media").mounted_by.is_empty());
@@ -475,7 +612,7 @@ mod tests {
             "clientid: 0x1\naddress: \"[fd00::5]:801\"\n",
         )
         .write("clients/8/info", "address: \"10.0.0.5:900\"\n");
-        let r = report_in(&paths(&f)).unwrap();
+        let r = report(&f).unwrap();
         assert_eq!(
             export(&r, "/mnt/user/pbs").mounted_by,
             vec!["nfsv4:10.0.0.5", "nfsv4:fd00::5"]
@@ -486,20 +623,40 @@ mod tests {
     fn unreadable_mount_tables_are_reported() {
         let f = FakeRoot::new("nfsfsid-unknown");
         f.write("exports", EXPORTS)
-            .write("var.ini", "flashGUID=\"G\"\n")
+            .write("var.ini", "flashGUID=\"0781-5571-CCCC\"\n")
             .mkdir("rmtab");
-        let r = report_in(&paths(&f)).unwrap();
+        let r = report(&f).unwrap();
         assert!(r.mounts_unknown.contains("rmtab"), "{}", r.mounts_unknown);
     }
 
     #[test]
-    fn tool_is_read_role_and_not_a_mutation() {
-        let src = include_str!("nfs_fsid.rs");
-        let attr = src
-            .lines()
-            .find(|l| l.starts_with("#[orca_tool(") && l.contains("nfs.fsids"))
-            .unwrap();
-        assert!(attr.contains("role = \"read\""), "{attr}");
-        assert!(!attr.contains("data_mutation"), "{attr}");
+    fn tool_is_registered_with_read_role() {
+        assert_eq!(
+            plugin_toolkit::dispatch::required_role("unraid.nfs.fsids"),
+            Some("read")
+        );
+        assert!(!plugin_toolkit::dispatch::data_mutation_names().contains(&"unraid.nfs.fsids"));
+    }
+
+    #[test]
+    fn read_callers_get_counts_and_users_get_clients() {
+        let f = fake("10.0.0.17:/mnt/user/pbs:0x00000001\n");
+        let pbs = |show| {
+            export(
+                &report_in(&paths(&f), SECRET, show).unwrap(),
+                "/mnt/user/pbs",
+            )
+        };
+        let hidden = pbs(false);
+        assert!(hidden.mounted_by.is_empty());
+        assert_eq!(hidden.mount_count, 1);
+        let shown = pbs(true);
+        assert_eq!(shown.mounted_by, vec!["10.0.0.17"]);
+        assert_eq!(shown.mount_count, 1);
+        let ctx = |r| crate::authz::test_ctx(r);
+        assert!(!shows_clients(&ctx(Some("read"))));
+        assert!(!shows_clients(&ctx(None)));
+        assert!(shows_clients(&ctx(Some("user"))));
+        assert!(shows_clients(&ctx(Some("admin"))));
     }
 }
