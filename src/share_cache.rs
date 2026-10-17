@@ -32,8 +32,8 @@ use crate::smb_share_write::validate_share_name;
 /// emhttp's per-share state, one `["name"]` section per user share.
 pub(crate) const SHARES_INI: &str = "/var/local/emhttp/shares.ini";
 const USE_CACHE_MODES: &[&str] = &["no", "yes", "only", "prefer"];
-const VAR_INI: &str = "/var/local/emhttp/var.ini";
-const EMHTTPD_SOCKET: &str = "/var/run/emhttpd.socket";
+pub(crate) const VAR_INI: &str = "/var/local/emhttp/var.ini";
+pub(crate) const EMHTTPD_SOCKET: &str = "/var/run/emhttpd.socket";
 /// `<share>.cfg` per user share: only `shareXxx="value"` settings, no runtime
 /// state; emhttpd rewrites it on `cmdEditShare` (the keys are ShareEdit.page's
 /// field names, unraid/webgui `emhttp/plugins/dynamix/ShareEdit.page`).
@@ -67,11 +67,11 @@ pub struct ShareCache {
     pub floor: String,
 }
 
-type Sections = Vec<(String, BTreeMap<String, String>)>;
+pub(crate) type Sections = Vec<(String, BTreeMap<String, String>)>;
 
 /// Parse an emhttp ini: optional `["name"]` headers, then `key="value"` lines.
 /// Keys before any header land in a section named "".
-fn parse_ini(text: &str) -> Sections {
+pub(crate) fn parse_ini(text: &str) -> Sections {
     let mut out: Sections = vec![(String::new(), BTreeMap::new())];
     for line in text.lines() {
         let t = line.trim();
@@ -176,7 +176,7 @@ impl ShareCacheRequest {
     }
 }
 
-fn urlencode(v: &str) -> String {
+pub(crate) fn urlencode(v: &str) -> String {
     v.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -221,7 +221,7 @@ fn edit_query(current: &BTreeMap<String, String>, req: &ShareCacheRequest, csrf:
 }
 
 /// Send one GET to emhttpd's unix socket, as `emcmd` does with curl.
-fn emhttp_get(socket: &Path, query: &str) -> Result<()> {
+pub(crate) fn emhttp_get(socket: &Path, query: &str) -> Result<()> {
     use std::io::{Read, Write};
     let mut s = std::os::unix::net::UnixStream::connect(socket)
         .map_err(|e| anyhow!("connect {}: {e}", socket.display()))?;
@@ -238,6 +238,16 @@ fn emhttp_get(socket: &Path, query: &str) -> Result<()> {
         bail!("emhttp update.htm: {status:?}");
     }
     Ok(())
+}
+
+pub(crate) fn read_csrf(var_ini: &Path) -> Result<String> {
+    let text =
+        std::fs::read_to_string(var_ini).map_err(|e| anyhow!("read {}: {e}", var_ini.display()))?;
+    parse_ini(&text)
+        .into_iter()
+        .find_map(|(_, kv)| kv.get("csrf_token").cloned())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| anyhow!("no csrf_token in {}", var_ini.display()))
 }
 
 /// Apply `req` through emhttp, then confirm it in the share's cfg. Returns
@@ -258,11 +268,7 @@ pub(crate) fn apply_in(
         .find(|(s, _)| *s == req.share)
         .map(|(_, kv)| kv)
         .ok_or_else(|| anyhow!("no share '{}' in {}", req.share, ini.display()))?;
-    let csrf = parse_ini(&read(var_ini)?)
-        .into_iter()
-        .find_map(|(_, kv)| kv.get("csrf_token").cloned())
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| anyhow!("no csrf_token in {}", var_ini.display()))?;
+    let csrf = read_csrf(var_ini)?;
     let cfg = cfg_dir.join(format!("{}.cfg", req.share));
     // A share never saved in the UI has no cfg yet: emhttp creates it.
     let snapshot = |p: &Path| -> Result<BTreeMap<String, String>> {

@@ -1,8 +1,7 @@
 //! `unraid.smb.share.set` — set a user share's SMB security and user lists.
 //!
-//! Like NFS exports ([`crate::exports`]), an SMB share lives in two places that
-//! must agree: `/boot/config/shares/<name>.cfg` (persistent intent) and the
-//! live `[<name>]` section of `/etc/samba/smb-shares.conf`. [`apply_in`] writes
+//! An SMB share lives in two places that must agree:
+//! `/boot/config/shares/<name>.cfg` (persistent intent) and the live `[<name>]` section of `/etc/samba/smb-shares.conf`. [`apply_in`] writes
 //! the cfg first, then only the access keys of the existing section (every
 //! other line is kept), then reloads smbd; if the conf write or the reload
 //! fails, both files are put back as they were. A share with no live section
