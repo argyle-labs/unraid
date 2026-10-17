@@ -36,6 +36,7 @@ const EMHTTP_DEFAULT_OPTIONS: &[&str] = &["async", "no_subtree_check"];
 const SHARE_SETTING_EXTRA_KEYS: &[&str] = &["cow", "exclusive"];
 const STATUS_LINE_MAX: u64 = 4096;
 const BODY_DRAIN_MAX: u64 = 64 * 1024;
+const BODY_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// `shareExportNFS` value meaning "exported". `-` means not exported.
 const NFS_ENABLED: &str = "e";
 
@@ -325,7 +326,12 @@ fn emhttp_post(socket: &Path, body: &str, timeout: std::time::Duration) -> Resul
         );
     }
     check_status(&String::from_utf8_lossy(&line))?;
-    r.take(BODY_DRAIN_MAX).read_to_end(&mut Vec::new()).ok();
+    if let Err(e) = s
+        .set_read_timeout(Some(BODY_DRAIN_TIMEOUT.min(timeout)))
+        .and_then(|()| r.take(BODY_DRAIN_MAX).read_to_end(&mut Vec::new()))
+    {
+        plugin_toolkit::tracing::debug!("emhttp /update: drain response body: {e}");
+    }
     Ok(())
 }
 
@@ -551,9 +557,9 @@ fn apply_nfs_in(
             .skip(1)
             .find(|(s, _)| *s == share)
             .map(|(_, kv)| kv)
-            .unwrap_or_default()
     };
-    let smb_before = smb(&read(&sec_ini)?);
+    let smb_before = smb(&read(&sec_ini)?)
+        .ok_or_else(|| anyhow!("no share '{share}' in {}", sec_ini.display()))?;
     let csrf = share_cache::read_csrf(var_ini)?;
     let security = sec_key(&sec_nfs(sec_nfs_ini, &share)?, "security", &share)?.to_string();
     let forms = nfs_form(&share, entry, &security);
@@ -581,7 +587,11 @@ fn apply_nfs_in(
         &before,
         &share_settings(&read(shares_ini)?, &share),
     ));
-    problems.extend(check_settings(&share, &smb_before, &smb(&read(&sec_ini)?)));
+    problems.extend(check_settings(
+        &share,
+        &smb_before,
+        &smb(&read(&sec_ini)?).unwrap_or_default(),
+    ));
     if post_err.is_none() && problems.is_empty() {
         return Ok(forms
             .iter()
@@ -1318,6 +1328,16 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
     }
 
     #[test]
+    fn missing_sec_ini_section_errors_before_posting() {
+        let f = nfs_setup();
+        f.write("sec.ini", "[\"backups\"]\nsecurity=\"public\"\n");
+        let (out, bodies) = nfs_run(&f, None, None);
+        let e = out.unwrap_err().to_string();
+        assert!(e.contains("no share 'pbs'") && e.contains("sec.ini"), "{e}");
+        assert!(bodies.is_empty());
+    }
+
+    #[test]
     fn fsid_other_than_the_live_one_is_refused_before_posting() {
         let f = nfs_setup();
         let mut want = pbs_entry();
@@ -1381,6 +1401,20 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         )
         .unwrap();
         assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        tx.send(()).unwrap();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn keep_alive_server_is_released_after_the_short_drain_timeout() {
+        let f = nfs_setup();
+        let body = "a=b";
+        let (h, tx) = fake_server(&f, b"HTTP/1.1 200 OK\r\n\r\n", emhttp_request(body).len());
+        let t = std::time::Instant::now();
+        emhttp_post(&f.path().join("emhttpd.sock"), body, EMHTTP_TIMEOUT).unwrap();
+        let took = t.elapsed();
+        assert!(took >= BODY_DRAIN_TIMEOUT, "{took:?}");
+        assert!(took < BODY_DRAIN_TIMEOUT * 3, "{took:?}");
         tx.send(()).unwrap();
         h.join().unwrap();
     }
