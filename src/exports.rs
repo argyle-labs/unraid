@@ -3,11 +3,11 @@
 //! Reads come from `/etc/exports`, which is world-readable and is the live
 //! table the kernel serves. Writes go through Unraid's own share API: the NFS
 //! Security Settings forms of unraid/webgui `SecurityNFS.page`
-//! (`changeShareAccessNFS`, then `changeShareSecurityNFS`), posted to emhttpd's
-//! local socket the way [`crate::share_cache`] posts `cmdEditShare`. emhttp
-//! persists the share cfg, regenerates `/etc/exports` and re-exports. The
-//! socket and the root-only cfg need root, so the write runs as
-//! [`PrivilegedOp::SetShareNfs`] / [`PrivilegedOp::RemoveShareNfs`].
+//! (`changeShareAccessNFS`, then `changeShareSecurityNFS`), POSTed to emhttpd's
+//! `/update` over its world-writable local socket, with the `csrf_token` from
+//! world-readable `var.ini`, the way Unraid's `emcmd` does. emhttp persists the
+//! share cfg, regenerates `/etc/exports` and re-exports, so the unprivileged
+//! daemon writes directly; every write is verified against `/etc/exports`.
 //!
 //! `/etc/exports` keeps options **per client**, while `ExportEntry` models one
 //! option set. Reads union them; authoring writes every client with one set.
@@ -15,15 +15,12 @@
 //! `fsid` is assigned by Unraid and cannot be set through its share API. A
 //! requested fsid must already be the live one, or the write is refused.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use plugin_toolkit::prelude::{Result, anyhow, bail};
 use plugin_toolkit::storage::{Capability, ExportEntry, StorageBackend, StorageError, StorageKind};
 
-use crate::docker_adopt::privileged::{self, PrivilegedOp};
-use crate::docker_adopt::safefs;
 use crate::share_cache::{self, EMHTTPD_SOCKET, SHARES_INI, VAR_INI};
 
 /// Where Unraid persists per-share settings.
@@ -34,7 +31,6 @@ const USER_SHARE_ROOT: &str = "/mnt/user";
 const EXPORTS_FILE: &str = "/etc/exports";
 /// `shareExportNFS` value meaning "exported". `-` means not exported.
 const NFS_ENABLED: &str = "e";
-const NFS_KEYS: &[&str] = &["shareExportNFS", "shareSecurityNFS", "shareHostListNFS"];
 
 /// The `storage` facet unraid registers: authoritative for the exports this
 /// Unraid host serves. It deliberately does **not** implement mount/unmount —
@@ -240,15 +236,6 @@ fn read_live() -> Result<Vec<ExportEntry>, StorageError> {
     Ok(out)
 }
 
-async fn run_privileged(op: PrivilegedOp) -> Result<String, StorageError> {
-    let runner = privileged::runner()
-        .ok_or_else(|| StorageError::Other(privileged::missing_runner_blocker()))?;
-    runner
-        .run(&op)
-        .await
-        .map_err(|e| StorageError::Other(format!("{e:#}")))
-}
-
 fn nfs_form(
     share: &str,
     entry: Option<&ExportEntry>,
@@ -281,7 +268,7 @@ fn nfs_form(
     }
 }
 
-fn nfs_query(fields: &[(&str, String)], csrf: &str) -> String {
+fn nfs_body(fields: &[(&str, String)], csrf: &str) -> String {
     fields
         .iter()
         .map(|(k, v)| format!("{k}={}", share_cache::urlencode(v)))
@@ -293,27 +280,33 @@ fn nfs_query(fields: &[(&str, String)], csrf: &str) -> String {
         .join("&")
 }
 
-fn check_cfg(
-    before: &BTreeMap<String, String>,
-    after: &BTreeMap<String, String>,
-    wanted: &[(&str, String)],
-) -> Vec<String> {
-    let mut problems = Vec::new();
-    for (k, v) in wanted {
-        let got = after.get(*k).map(String::as_str);
-        if got != Some(v.as_str()) {
-            problems.push(format!("{k}: wanted {v:?}, got {got:?}"));
-        }
+fn emhttp_request(body: &str) -> String {
+    format!(
+        "POST /update HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn check_status(resp: &str) -> Result<()> {
+    let status = resp.lines().next().unwrap_or_default();
+    match status.split_whitespace().nth(1) {
+        Some(code) if code.starts_with('2') => Ok(()),
+        _ => bail!("emhttp /update: {status:?}"),
     }
-    for (k, b) in before {
-        if !NFS_KEYS.contains(&k.as_str()) && after.get(k) != Some(b) {
-            problems.push(format!(
-                "{k} changed unexpectedly: {b:?} -> {:?}",
-                after.get(k)
-            ));
-        }
-    }
-    problems
+}
+
+fn emhttp_post(socket: &Path, body: &str) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|e| anyhow!("connect {}: {e}", socket.display()))?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    s.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+    s.write_all(emhttp_request(body).as_bytes())?;
+    let mut resp = String::new();
+    s.read_to_string(&mut resp)?;
+    check_status(&resp)
 }
 
 fn check_live(exports: &str, path: &str, entry: Option<&ExportEntry>) -> Vec<String> {
@@ -347,14 +340,13 @@ fn check_live(exports: &str, path: &str, entry: Option<&ExportEntry>) -> Vec<Str
     }
 }
 
-pub(crate) fn apply_nfs_in(
+fn apply_nfs_in(
     shares_ini: &Path,
-    cfg_dir: &Path,
     var_ini: &Path,
-    socket: &Path,
     exports: &Path,
     path: &str,
     entry: Option<&ExportEntry>,
+    post: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<String> {
     let share = UnraidExports::share_name(path).map_err(|e| anyhow!("{e}"))?;
     if let Some(e) = entry {
@@ -364,68 +356,52 @@ pub(crate) fn apply_nfs_in(
         || fs::read_to_string(exports).map_err(|e| anyhow!("read {}: {e}", exports.display()));
     let ini = fs::read_to_string(shares_ini)
         .map_err(|e| anyhow!("read {}: {e}", shares_ini.display()))?;
-    if !share_cache::parse_ini(&ini)
-        .iter()
+    let Some(current) = share_cache::parse_ini(&ini)
+        .into_iter()
         .skip(1)
-        .any(|(s, _)| *s == share)
-    {
+        .find(|(s, _)| *s == share)
+        .map(|(_, kv)| kv)
+    else {
         if entry.is_none() && check_live(&read_exports()?, path, None).is_empty() {
             return Ok("not exported".into());
         }
         bail!("no share '{share}' in {}", shares_ini.display());
-    }
-    let csrf = share_cache::read_csrf(var_ini)?;
-    let cfg = cfg_dir.join(format!("{share}.cfg"));
-    let snapshot = |p: &Path| -> Result<BTreeMap<String, String>> {
-        Ok(match safefs::read_file(p)? {
-            Some(b) => {
-                share_cache::parse_ini(&String::from_utf8_lossy(&b))
-                    .remove(0)
-                    .1
-            }
-            None => BTreeMap::new(),
-        })
     };
-    let before = snapshot(&cfg)?;
-    let security = before
-        .get("shareSecurityNFS")
+    let csrf = share_cache::read_csrf(var_ini)?;
+    let security = current
+        .get("securityNFS")
         .cloned()
         .unwrap_or_else(|| "public".into());
     let forms = nfs_form(&share, entry, &security);
     for form in &forms {
-        share_cache::emhttp_get(socket, &nfs_query(form, &csrf))?;
+        post(&nfs_body(form, &csrf))?;
     }
-    let wanted: Vec<(&str, String)> = forms
-        .iter()
-        .flatten()
-        .filter(|(k, _)| NFS_KEYS.contains(k))
-        .cloned()
-        .collect();
-    let mut problems = check_cfg(&before, &snapshot(&cfg)?, &wanted);
-    problems.extend(check_live(&read_exports()?, path, entry));
+    let problems = check_live(&read_exports()?, path, entry);
     if !problems.is_empty() {
         bail!(
-            "emhttp did not apply the NFS export cleanly: {}",
+            "emhttp did not apply the NFS export: {}",
             problems.join("; ")
         );
     }
-    Ok(wanted
+    Ok(forms
         .iter()
+        .flatten()
+        .filter(|(k, _)| !k.starts_with("change") && *k != "shareName")
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("; "))
 }
 
-pub(crate) fn apply_nfs(path: &str, entry: Option<&ExportEntry>) -> Result<String> {
+fn apply_nfs(path: &str, entry: Option<&ExportEntry>) -> Result<String, StorageError> {
     apply_nfs_in(
         Path::new(SHARES_INI),
-        Path::new(SHARE_CFG_DIR),
         Path::new(VAR_INI),
-        Path::new(EMHTTPD_SOCKET),
         Path::new(EXPORTS_FILE),
         path,
         entry,
+        &mut |body| emhttp_post(Path::new(EMHTTPD_SOCKET), body),
     )
+    .map_err(|e| StorageError::Other(format!("{e:#}")))
 }
 
 #[plugin_toolkit::orca_async]
@@ -484,12 +460,7 @@ impl StorageBackend for UnraidExports {
                 )));
             }
         }
-        run_privileged(PrivilegedOp::SetShareNfs {
-            path: path.clone(),
-            clients: entry.allowed_clients.clone(),
-            options: entry.options.clone(),
-        })
-        .await?;
+        apply_nfs(&path, Some(&entry))?;
         read_live()?
             .into_iter()
             .find(|e| e.path == path)
@@ -498,7 +469,7 @@ impl StorageBackend for UnraidExports {
 
     async fn remove_export(&self, path: &str) -> Result<(), StorageError> {
         let path = format!("{USER_SHARE_ROOT}/{}", Self::share_name(path)?);
-        run_privileged(PrivilegedOp::RemoveShareNfs { path }).await?;
+        apply_nfs(&path, None)?;
         Ok(())
     }
 }
@@ -670,53 +641,42 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         );
     }
 
-    fn fake_emhttp(
-        f: &crate::test_support::FakeRoot,
-        requests: usize,
-        cfg: String,
-        exports: String,
-    ) -> std::thread::JoinHandle<Vec<String>> {
-        use std::io::{BufRead, BufReader, Write};
-        let p = f.path().to_path_buf();
-        let l = std::os::unix::net::UnixListener::bind(p.join("emhttpd.sock")).unwrap();
-        std::thread::spawn(move || {
-            let mut lines = Vec::new();
-            for n in 0..requests {
-                let (mut s, _) = l.accept().unwrap();
-                let mut line = String::new();
-                BufReader::new(&s).read_line(&mut line).unwrap();
-                lines.push(line);
-                if n + 1 == requests {
-                    fs::write(p.join("pbs.cfg"), &cfg).unwrap();
-                    fs::write(p.join("exports"), &exports).unwrap();
-                }
-                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                    .unwrap();
-            }
-            lines
-        })
-    }
-
     fn nfs_setup() -> crate::test_support::FakeRoot {
         let f = crate::test_support::FakeRoot::new("exports");
-        f.write("shares.ini", "[\"pbs\"]\nname=\"pbs\"\n")
-            .write("pbs.cfg", PBS_CFG)
-            .write("var.ini", "csrf_token=\"TOK\"\n")
-            .write("exports", EXPORTS);
+        f.write(
+            "shares.ini",
+            "[\"pbs\"]\nname=\"pbs\"\nsecurityNFS=\"private\"\n",
+        )
+        .write("var.ini", "version=\"7.2.0\"\ncsrf_token=\"TOK\"\n")
+        .write("exports", EXPORTS);
         f
     }
 
-    fn nfs_run(f: &crate::test_support::FakeRoot, entry: Option<&ExportEntry>) -> Result<String> {
-        let p = f.path();
-        apply_nfs_in(
+    fn nfs_run(
+        f: &crate::test_support::FakeRoot,
+        entry: Option<&ExportEntry>,
+        after: Option<String>,
+    ) -> (Result<String>, Vec<String>) {
+        let p = f.path().to_path_buf();
+        let mut bodies = Vec::new();
+        let n = if entry.is_some() { 2 } else { 1 };
+        let out = apply_nfs_in(
             &p.join("shares.ini"),
-            p,
             &p.join("var.ini"),
-            &p.join("emhttpd.sock"),
             &p.join("exports"),
             "/mnt/user/pbs",
             entry,
-        )
+            &mut |body| {
+                bodies.push(body.to_string());
+                if bodies.len() == n
+                    && let Some(a) = &after
+                {
+                    fs::write(p.join("exports"), a).unwrap();
+                }
+                Ok(())
+            },
+        );
+        (out, bodies)
     }
 
     fn pbs_entry() -> ExportEntry {
@@ -728,85 +688,113 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         }
     }
 
+    fn pbs_exports_as_13() -> String {
+        EXPORTS.replace(
+            "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)",
+            "10.0.0.13(rw)",
+        )
+    }
+
     #[test]
-    fn upsert_posts_the_nfs_forms_and_verifies_cfg_and_exports() {
-        let f = nfs_setup();
-        let cfg = PBS_CFG.replace(
-            "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)",
-            "10.0.0.13(rw)",
-        );
-        let exports = EXPORTS.replace(
-            "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)",
-            "10.0.0.13(rw)",
-        );
-        let srv = fake_emhttp(&f, 2, cfg, exports);
-        let out = nfs_run(&f, Some(&pbs_entry())).unwrap();
+    fn request_is_a_form_post_to_update_with_exact_length() {
+        let body = "shareName=pbs&csrf_token=TOK";
         assert_eq!(
-            out,
+            emhttp_request(body),
+            "POST /update HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: 28\r\nConnection: close\r\n\r\n\
+             shareName=pbs&csrf_token=TOK"
+        );
+    }
+
+    #[test]
+    fn non_2xx_emhttp_status_is_an_error() {
+        assert!(check_status("HTTP/1.1 200 OK\r\n\r\n").is_ok());
+        assert!(check_status("HTTP/1.1 403 Forbidden\r\n\r\n").is_err());
+        assert!(check_status("").is_err());
+    }
+
+    #[test]
+    fn csrf_token_is_read_from_var_ini() {
+        let f = nfs_setup();
+        assert_eq!(
+            share_cache::read_csrf(&f.path().join("var.ini")).unwrap(),
+            "TOK"
+        );
+        f.write("var.ini", "version=\"7.2.0\"\ncsrf_token=\"\"\n");
+        assert!(share_cache::read_csrf(&f.path().join("var.ini")).is_err());
+    }
+
+    #[test]
+    fn upsert_posts_the_nfs_forms_and_verifies_exports() {
+        let f = nfs_setup();
+        let (out, bodies) = nfs_run(&f, Some(&pbs_entry()), Some(pbs_exports_as_13()));
+        assert_eq!(
+            out.unwrap(),
             "shareHostListNFS=10.0.0.13(rw); shareExportNFS=e; shareSecurityNFS=private"
         );
         assert_eq!(
-            srv.join().unwrap(),
+            bodies,
             vec![
-                "GET /update.htm?shareName=pbs&shareHostListNFS=10.0.0.13%28rw%29\
-                 &changeShareAccessNFS=Apply&csrf_token=TOK HTTP/1.0\r\n",
-                "GET /update.htm?shareName=pbs&shareExportNFS=e&shareSecurityNFS=private\
-                 &changeShareSecurityNFS=Apply&csrf_token=TOK HTTP/1.0\r\n",
+                "shareName=pbs&shareHostListNFS=10.0.0.13%28rw%29\
+                 &changeShareAccessNFS=Apply&csrf_token=TOK",
+                "shareName=pbs&shareExportNFS=e&shareSecurityNFS=private\
+                 &changeShareSecurityNFS=Apply&csrf_token=TOK",
             ]
         );
     }
 
     #[test]
-    fn upsert_fails_when_the_live_table_does_not_match() {
+    fn upsert_that_changes_nothing_fails() {
         let f = nfs_setup();
-        let cfg = PBS_CFG.replace(
-            "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)",
-            "10.0.0.13(rw)",
-        );
-        let srv = fake_emhttp(&f, 2, cfg, EXPORTS.into());
-        let e = nfs_run(&f, Some(&pbs_entry())).unwrap_err().to_string();
-        srv.join().unwrap();
+        let (out, bodies) = nfs_run(&f, Some(&pbs_entry()), None);
+        assert_eq!(bodies.len(), 2);
+        let e = out.unwrap_err().to_string();
         assert!(e.contains("clients: wanted [\"10.0.0.13\"]"), "{e}");
     }
 
     #[test]
-    fn upsert_fails_naming_another_share_key_emhttp_changed() {
+    fn upsert_fails_when_options_are_missing_from_the_live_table() {
         let f = nfs_setup();
-        let cfg = PBS_CFG
-            .replace(
-                "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)",
-                "10.0.0.13(rw)",
-            )
-            .replace("shareFloor=\"188586393\"", "shareFloor=\"0\"");
-        let exports = EXPORTS.replace(
-            "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)",
-            "10.0.0.13(rw)",
-        );
-        let srv = fake_emhttp(&f, 2, cfg, exports);
-        let e = nfs_run(&f, Some(&pbs_entry())).unwrap_err().to_string();
-        srv.join().unwrap();
-        assert!(e.contains("shareFloor changed unexpectedly"), "{e}");
+        let mut want = pbs_entry();
+        want.options.push("sync".into());
+        let (out, _) = nfs_run(&f, Some(&want), Some(pbs_exports_as_13()));
+        let e = out.unwrap_err().to_string();
+        assert!(e.contains("options missing: [\"sync\"]"), "{e}");
+    }
+
+    #[test]
+    fn transport_errors_propagate() {
+        let f = nfs_setup();
+        let p = f.path();
+        let e = apply_nfs_in(
+            &p.join("shares.ini"),
+            &p.join("var.ini"),
+            &p.join("exports"),
+            "/mnt/user/pbs",
+            Some(&pbs_entry()),
+            &mut |_| bail!("emhttp /update: \"HTTP/1.1 500\""),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("500"), "{e}");
     }
 
     #[test]
     fn remove_sets_no_export_keeping_security_and_verifies() {
         let f = nfs_setup();
-        let cfg = PBS_CFG.replace("shareExportNFS=\"e\"", "shareExportNFS=\"-\"");
         let exports: String = EXPORTS
             .lines()
             .filter(|l| !l.contains("/mnt/user/pbs"))
             .map(|l| format!("{l}\n"))
             .collect();
-        let srv = fake_emhttp(&f, 1, cfg, exports);
+        let (out, bodies) = nfs_run(&f, None, Some(exports));
+        assert_eq!(out.unwrap(), "shareExportNFS=-; shareSecurityNFS=private");
         assert_eq!(
-            nfs_run(&f, None).unwrap(),
-            "shareExportNFS=-; shareSecurityNFS=private"
-        );
-        assert_eq!(
-            srv.join().unwrap(),
+            bodies,
             vec![
-                "GET /update.htm?shareName=pbs&shareExportNFS=-&shareSecurityNFS=private\
-                 &changeShareSecurityNFS=Apply&csrf_token=TOK HTTP/1.0\r\n"
+                "shareName=pbs&shareExportNFS=-&shareSecurityNFS=private\
+                 &changeShareSecurityNFS=Apply&csrf_token=TOK"
             ]
         );
     }
@@ -814,10 +802,8 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
     #[test]
     fn remove_fails_when_the_share_is_still_exported() {
         let f = nfs_setup();
-        let cfg = PBS_CFG.replace("shareExportNFS=\"e\"", "shareExportNFS=\"-\"");
-        let srv = fake_emhttp(&f, 1, cfg, EXPORTS.into());
-        let e = nfs_run(&f, None).unwrap_err().to_string();
-        srv.join().unwrap();
+        let (out, _) = nfs_run(&f, None, None);
+        let e = out.unwrap_err().to_string();
         assert!(e.contains("/mnt/user/pbs is still exported"), "{e}");
     }
 
@@ -826,10 +812,14 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         let f = nfs_setup();
         let mut e = pbs_entry();
         e.options = vec!["rw)\n/ *(rw".into()];
-        assert!(nfs_run(&f, Some(&e)).is_err());
+        let (out, bodies) = nfs_run(&f, Some(&e), None);
+        assert!(out.is_err());
+        assert!(bodies.is_empty());
         f.write("shares.ini", "");
-        let err = nfs_run(&f, Some(&pbs_entry())).unwrap_err().to_string();
+        let (out, bodies) = nfs_run(&f, Some(&pbs_entry()), None);
+        let err = out.unwrap_err().to_string();
         assert!(err.contains("no share 'pbs'"), "{err}");
+        assert!(bodies.is_empty());
     }
 
     /// Only user shares are addressable — anything else has no cfg to persist
