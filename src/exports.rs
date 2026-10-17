@@ -7,7 +7,8 @@
 //! `/update` over its world-writable local socket, with the `csrf_token` from
 //! world-readable `var.ini`, the way Unraid's `emcmd` does. emhttp persists the
 //! share cfg, regenerates `/etc/exports` and re-exports, so the unprivileged
-//! daemon writes directly; every write is verified against `/etc/exports`.
+//! daemon writes directly; every write is verified against `/etc/exports` and
+//! emhttp's world-readable per-share NFS state, `sec_nfs.ini`.
 //!
 //! `/etc/exports` keeps options **per client**, while `ExportEntry` models one
 //! option set. Reads union them; authoring writes every client with one set.
@@ -29,6 +30,7 @@ const SHARE_CFG_DIR: &str = "/boot/config/shares";
 const USER_SHARE_ROOT: &str = "/mnt/user";
 /// The live NFS export table.
 const EXPORTS_FILE: &str = "/etc/exports";
+const SEC_NFS_INI: &str = "/var/local/emhttp/sec_nfs.ini";
 /// `shareExportNFS` value meaning "exported". `-` means not exported.
 const NFS_ENABLED: &str = "e";
 
@@ -340,8 +342,50 @@ fn check_live(exports: &str, path: &str, entry: Option<&ExportEntry>) -> Vec<Str
     }
 }
 
+fn sec_nfs(sec_nfs_ini: &Path, share: &str) -> Result<std::collections::BTreeMap<String, String>> {
+    let text = fs::read_to_string(sec_nfs_ini)
+        .map_err(|e| anyhow!("read {}: {e}", sec_nfs_ini.display()))?;
+    share_cache::parse_ini(&text)
+        .into_iter()
+        .skip(1)
+        .find(|(s, _)| s == share)
+        .map(|(_, kv)| kv)
+        .ok_or_else(|| anyhow!("no share '{share}' in {}", sec_nfs_ini.display()))
+}
+
+fn sec_key<'a>(
+    sec: &'a std::collections::BTreeMap<String, String>,
+    key: &str,
+    share: &str,
+) -> Result<&'a str> {
+    sec.get(key)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("no {key} for share '{share}' in {SEC_NFS_INI}"))
+}
+
+fn check_sec(
+    share: &str,
+    sec: &std::collections::BTreeMap<String, String>,
+    form: &[Vec<(&str, String)>],
+) -> Vec<String> {
+    let keys = [
+        ("shareExportNFS", "export"),
+        ("shareSecurityNFS", "security"),
+        ("shareHostListNFS", "hostList"),
+    ];
+    form.iter()
+        .flatten()
+        .filter_map(|(k, v)| {
+            let (_, sk) = keys.iter().find(|(f, _)| f == k)?;
+            let got = sec.get(*sk).map(String::as_str);
+            (got != Some(v.as_str())).then(|| format!("{share} {sk}: wanted {v:?}, got {got:?}"))
+        })
+        .collect()
+}
+
 fn apply_nfs_in(
     shares_ini: &Path,
+    sec_nfs_ini: &Path,
     var_ini: &Path,
     exports: &Path,
     path: &str,
@@ -356,27 +400,24 @@ fn apply_nfs_in(
         || fs::read_to_string(exports).map_err(|e| anyhow!("read {}: {e}", exports.display()));
     let ini = fs::read_to_string(shares_ini)
         .map_err(|e| anyhow!("read {}: {e}", shares_ini.display()))?;
-    let Some(current) = share_cache::parse_ini(&ini)
-        .into_iter()
+    if !share_cache::parse_ini(&ini)
+        .iter()
         .skip(1)
-        .find(|(s, _)| *s == share)
-        .map(|(_, kv)| kv)
-    else {
+        .any(|(s, _)| *s == share)
+    {
         if entry.is_none() && check_live(&read_exports()?, path, None).is_empty() {
             return Ok("not exported".into());
         }
         bail!("no share '{share}' in {}", shares_ini.display());
     };
     let csrf = share_cache::read_csrf(var_ini)?;
-    let security = current
-        .get("securityNFS")
-        .cloned()
-        .unwrap_or_else(|| "public".into());
+    let security = sec_key(&sec_nfs(sec_nfs_ini, &share)?, "security", &share)?.to_string();
     let forms = nfs_form(&share, entry, &security);
     for form in &forms {
         post(&nfs_body(form, &csrf))?;
     }
-    let problems = check_live(&read_exports()?, path, entry);
+    let mut problems = check_sec(&share, &sec_nfs(sec_nfs_ini, &share)?, &forms);
+    problems.extend(check_live(&read_exports()?, path, entry));
     if !problems.is_empty() {
         bail!(
             "emhttp did not apply the NFS export: {}",
@@ -395,6 +436,7 @@ fn apply_nfs_in(
 fn apply_nfs(path: &str, entry: Option<&ExportEntry>) -> Result<String, StorageError> {
     apply_nfs_in(
         Path::new(SHARES_INI),
+        Path::new(SEC_NFS_INI),
         Path::new(VAR_INI),
         Path::new(EXPORTS_FILE),
         path,
@@ -643,13 +685,20 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
 
     fn nfs_setup() -> crate::test_support::FakeRoot {
         let f = crate::test_support::FakeRoot::new("exports");
-        f.write(
-            "shares.ini",
-            "[\"pbs\"]\nname=\"pbs\"\nsecurityNFS=\"private\"\n",
-        )
-        .write("var.ini", "version=\"7.2.0\"\ncsrf_token=\"TOK\"\n")
-        .write("exports", EXPORTS);
+        f.write("shares.ini", "[\"pbs\"]\nname=\"pbs\"\n")
+            .write("sec_nfs.ini", &sec_nfs_text("e", "private", PBS_HOSTS))
+            .write("var.ini", "version=\"7.2.0\"\ncsrf_token=\"TOK\"\n")
+            .write("exports", EXPORTS);
         f
+    }
+
+    const PBS_HOSTS: &str = "10.0.0.17(rw,sync,no_subtree_check,no_root_squash)";
+
+    fn sec_nfs_text(export: &str, security: &str, hosts: &str) -> String {
+        format!(
+            "[\"backups\"]\nexport=\"e\"\nsecurity=\"public\"\nhostList=\"\"\n\
+             [\"pbs\"]\nexport=\"{export}\"\nsecurity=\"{security}\"\nhostList=\"{hosts}\"\n"
+        )
     }
 
     fn nfs_run(
@@ -657,21 +706,38 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         entry: Option<&ExportEntry>,
         after: Option<String>,
     ) -> (Result<String>, Vec<String>) {
+        let sec = match entry {
+            Some(_) => sec_nfs_text("e", "private", "10.0.0.13(rw)"),
+            None => sec_nfs_text("-", "private", PBS_HOSTS),
+        };
+        nfs_run_sec(f, entry, after, Some(sec))
+    }
+
+    fn nfs_run_sec(
+        f: &crate::test_support::FakeRoot,
+        entry: Option<&ExportEntry>,
+        after: Option<String>,
+        after_sec: Option<String>,
+    ) -> (Result<String>, Vec<String>) {
         let p = f.path().to_path_buf();
         let mut bodies = Vec::new();
         let n = if entry.is_some() { 2 } else { 1 };
         let out = apply_nfs_in(
             &p.join("shares.ini"),
+            &p.join("sec_nfs.ini"),
             &p.join("var.ini"),
             &p.join("exports"),
             "/mnt/user/pbs",
             entry,
             &mut |body| {
                 bodies.push(body.to_string());
-                if bodies.len() == n
-                    && let Some(a) = &after
-                {
-                    fs::write(p.join("exports"), a).unwrap();
+                if bodies.len() == n {
+                    if let Some(a) = &after {
+                        fs::write(p.join("exports"), a).unwrap();
+                    }
+                    if let Some(a) = &after_sec {
+                        fs::write(p.join("sec_nfs.ini"), a).unwrap();
+                    }
                 }
                 Ok(())
             },
@@ -769,6 +835,7 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
         let p = f.path();
         let e = apply_nfs_in(
             &p.join("shares.ini"),
+            &p.join("sec_nfs.ini"),
             &p.join("var.ini"),
             &p.join("exports"),
             "/mnt/user/pbs",
@@ -797,6 +864,43 @@ shareHostListNFS="10.0.0.17(rw,sync,no_subtree_check,no_root_squash)"
                  &changeShareSecurityNFS=Apply&csrf_token=TOK"
             ]
         );
+    }
+
+    #[test]
+    fn sec_nfs_parses_the_share_section() {
+        let f = nfs_setup();
+        let sec = sec_nfs(&f.path().join("sec_nfs.ini"), "pbs").unwrap();
+        assert_eq!(sec_key(&sec, "export", "pbs").unwrap(), "e");
+        assert_eq!(sec_key(&sec, "security", "pbs").unwrap(), "private");
+        assert_eq!(sec_key(&sec, "hostList", "pbs").unwrap(), PBS_HOSTS);
+    }
+
+    #[test]
+    fn missing_sec_nfs_share_or_security_errors_before_posting() {
+        let f = nfs_setup();
+        f.write("sec_nfs.ini", "[\"backups\"]\nsecurity=\"public\"\n");
+        let (out, bodies) = nfs_run(&f, None, None);
+        let e = out.unwrap_err().to_string();
+        assert!(e.contains("no share 'pbs'"), "{e}");
+        assert!(bodies.is_empty());
+        f.write("sec_nfs.ini", "[\"pbs\"]\nexport=\"e\"\n");
+        let (out, bodies) = nfs_run(&f, None, None);
+        let e = out.unwrap_err().to_string();
+        assert!(e.contains("no security for share 'pbs'"), "{e}");
+        assert!(bodies.is_empty());
+    }
+
+    #[test]
+    fn upsert_fails_when_sec_nfs_host_list_does_not_match() {
+        let f = nfs_setup();
+        let (out, _) = nfs_run_sec(
+            &f,
+            Some(&pbs_entry()),
+            Some(pbs_exports_as_13()),
+            Some(sec_nfs_text("e", "private", PBS_HOSTS)),
+        );
+        let e = out.unwrap_err().to_string();
+        assert!(e.contains("pbs hostList: wanted \"10.0.0.13(rw)\""), "{e}");
     }
 
     #[test]
