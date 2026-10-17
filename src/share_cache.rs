@@ -41,7 +41,7 @@ const SHARES_CFG_DIR: &str = "/boot/config/shares";
 /// The Share settings form's fields, paired with their `shares.ini` keys:
 /// the inputs unraid/webgui `emhttp/plugins/dynamix/ShareEdit.page` submits
 /// for an existing share (`shareCOW` is disabled there, so never sent).
-const EDIT_FIELDS: &[(&str, &str)] = &[
+pub(crate) const EDIT_FIELDS: &[(&str, &str)] = &[
     ("shareName", "name"),
     ("shareNameOrig", "name"),
     ("shareComment", "comment"),
