@@ -1,48 +1,31 @@
 name: Release
-run-name: Release ${{ inputs.channel }} ${{ inputs.bump }}
+run-name: Release ${{ github.event.release.tag_name || inputs.version }}
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
-      channel:
-        description: "Release channel: rc (prerelease) or stable"
-        required: true
-        type: choice
-        options: [rc, stable]
-        default: rc
-      bump:
-        description: "Version bump from latest stable tag"
-        required: true
-        type: choice
-        options: [patch, minor, major]
-        default: patch
-      notes:
-        description: "Extra release notes (optional)"
-        required: false
+      version:
+        description: 'Already-published tag to rebuild: vX.Y.Z-rc.N or vX.Y.Z'
         type: string
-        default: ""
+        required: true
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.repository }}-release-${{ github.event.release.tag_name || inputs.version }}
+  cancel-in-progress: false
+
 env:
-  TARGETS: '["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl","aarch64-unknown-linux-gnu","aarch64-unknown-linux-musl","aarch64-apple-darwin"]'
+  TAG: ${{ github.event.release.tag_name || inputs.version }}
+  ORCA_FETCH_TOKEN: ${{ secrets.ORCA_FETCH_TOKEN }}
+  SCCACHE_ENDPOINT: ${{ vars.SCCACHE_ENDPOINT }}
+  SCCACHE_S3_ACCESS_KEY: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+  SCCACHE_S3_SECRET_KEY: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
 
 jobs:
-  version:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.v.outputs.version }}
-      tag: ${{ steps.v.outputs.tag }}
-      prerelease: ${{ steps.v.outputs.prerelease }}
-    steps:
-      - name: Version
-        id: v
-        uses: argyle-labs/.github/.github/actions/job-plugin-release-version@main
-        with:
-          channel: ${{ inputs.channel }}
-          bump: ${{ inputs.bump }}
-
   ui-build:
     runs-on: ubuntu-latest
     container:
@@ -50,181 +33,82 @@ jobs:
       credentials:
         username: ${{ secrets.CI_REGISTRY_USER }}
         password: ${{ secrets.CI_REGISTRY_TOKEN }}
-    defaults:
-      run:
-        shell: bash
-    outputs:
-      has-ui: ${{ steps.ui.outputs.has-ui }}
     steps:
-      - name: UI build
-        id: ui
-        uses: argyle-labs/.github/.github/actions/job-plugin-release-ui-build@main
+      - uses: argyle-labs/.github/.github/actions/job-plugin-release-ui-build@main
 
   build-x86_64-linux-gnu:
-    needs: [version, ui-build]
+    needs: ui-build
     runs-on: ubuntu-latest
     container:
       image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
       credentials:
         username: ${{ secrets.CI_REGISTRY_USER }}
         password: ${{ secrets.CI_REGISTRY_TOKEN }}
-    defaults:
-      run:
-        shell: bash
-    outputs:
-      orca-source: ${{ steps.build.outputs.orca-source }}
     steps:
-      - name: Build x86_64-unknown-linux-gnu
-        id: build
-        uses: argyle-labs/.github/.github/actions/job-plugin-release-build@main
+      - uses: argyle-labs/.github/.github/actions/job-plugin-release-build@main
         with:
           target: x86_64-unknown-linux-gnu
-          version: ${{ needs.version.outputs.version }}
-          tag: ${{ needs.version.outputs.tag }}
-          has-ui: ${{ needs.ui-build.outputs.has-ui }}
           bins: '["unraid"]'
-          orca-fetch-token: ${{ secrets.ORCA_FETCH_TOKEN }}
-          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
-          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
-          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
 
   build-x86_64-linux-musl:
-    needs: [version, ui-build]
+    needs: ui-build
     runs-on: ubuntu-latest
     container:
       image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
       credentials:
         username: ${{ secrets.CI_REGISTRY_USER }}
         password: ${{ secrets.CI_REGISTRY_TOKEN }}
-    defaults:
-      run:
-        shell: bash
-    outputs:
-      orca-source: ${{ steps.build.outputs.orca-source }}
     steps:
-      - name: Build x86_64-unknown-linux-musl
-        id: build
-        uses: argyle-labs/.github/.github/actions/job-plugin-release-build@main
+      - uses: argyle-labs/.github/.github/actions/job-plugin-release-build@main
         with:
           target: x86_64-unknown-linux-musl
-          version: ${{ needs.version.outputs.version }}
-          tag: ${{ needs.version.outputs.tag }}
-          has-ui: ${{ needs.ui-build.outputs.has-ui }}
           bins: '["unraid"]'
-          orca-fetch-token: ${{ secrets.ORCA_FETCH_TOKEN }}
-          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
-          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
-          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
 
   build-aarch64-linux-gnu:
-    needs: [version, ui-build]
+    needs: ui-build
     runs-on: ubuntu-latest
     container:
       image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
       credentials:
         username: ${{ secrets.CI_REGISTRY_USER }}
         password: ${{ secrets.CI_REGISTRY_TOKEN }}
-    defaults:
-      run:
-        shell: bash
-    outputs:
-      orca-source: ${{ steps.build.outputs.orca-source }}
     steps:
-      - name: Build aarch64-unknown-linux-gnu
-        id: build
-        uses: argyle-labs/.github/.github/actions/job-plugin-release-build@main
+      - uses: argyle-labs/.github/.github/actions/job-plugin-release-build@main
         with:
           target: aarch64-unknown-linux-gnu
-          version: ${{ needs.version.outputs.version }}
-          tag: ${{ needs.version.outputs.tag }}
-          has-ui: ${{ needs.ui-build.outputs.has-ui }}
           bins: '["unraid"]'
-          orca-fetch-token: ${{ secrets.ORCA_FETCH_TOKEN }}
-          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
-          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
-          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
-
 
   build-aarch64-linux-musl:
-    needs: [version, ui-build]
+    needs: ui-build
     runs-on: ubuntu-latest
     container:
       image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
       credentials:
         username: ${{ secrets.CI_REGISTRY_USER }}
         password: ${{ secrets.CI_REGISTRY_TOKEN }}
-    defaults:
-      run:
-        shell: bash
-    outputs:
-      orca-source: ${{ steps.build.outputs.orca-source }}
     steps:
-      - name: Build aarch64-unknown-linux-musl
-        id: build
-        uses: argyle-labs/.github/.github/actions/job-plugin-release-build@main
+      - uses: argyle-labs/.github/.github/actions/job-plugin-release-build@main
         with:
           target: aarch64-unknown-linux-musl
-          version: ${{ needs.version.outputs.version }}
-          tag: ${{ needs.version.outputs.tag }}
-          has-ui: ${{ needs.ui-build.outputs.has-ui }}
           bins: '["unraid"]'
-          orca-fetch-token: ${{ secrets.ORCA_FETCH_TOKEN }}
-          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
-          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
-          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
-
 
   build-aarch64-darwin:
-    needs: [version, ui-build]
+    needs: ui-build
     runs-on: macos
-    outputs:
-      orca-source: ${{ steps.build.outputs.orca-source }}
     steps:
-      - name: Build aarch64-apple-darwin
-        id: build
-        uses: argyle-labs/.github/.github/actions/job-plugin-release-build@main
+      - uses: argyle-labs/.github/.github/actions/job-plugin-release-build@main
         with:
           target: aarch64-apple-darwin
-          version: ${{ needs.version.outputs.version }}
-          tag: ${{ needs.version.outputs.tag }}
-          has-ui: ${{ needs.ui-build.outputs.has-ui }}
           bins: '["unraid"]'
-          orca-fetch-token: ${{ secrets.ORCA_FETCH_TOKEN }}
-          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
-          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
-          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
 
   publish:
-    needs: [version, ui-build, build-x86_64-linux-gnu, build-x86_64-linux-musl, build-aarch64-linux-gnu, build-aarch64-linux-musl, build-aarch64-darwin]
+    needs: [build-x86_64-linux-gnu, build-x86_64-linux-musl, build-aarch64-linux-gnu, build-aarch64-linux-musl, build-aarch64-darwin]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    concurrency:
-      group: release-${{ github.repository }}-${{ inputs.channel }}-${{ inputs.bump }}
-      cancel-in-progress: false
     steps:
-      - name: Publish
-        uses: argyle-labs/.github/.github/actions/job-plugin-release-publish@main
+      - uses: argyle-labs/.github/.github/actions/job-plugin-release-publish@main
         with:
-          version: ${{ needs.version.outputs.version }}
-          tag: ${{ needs.version.outputs.tag }}
-          prerelease: ${{ needs.version.outputs.prerelease }}
-          channel: ${{ inputs.channel }}
-          targets: ${{ env.TARGETS }}
-          notes: ${{ inputs.notes }}
-          orca-source: >-
-            ${{ needs.build-x86_64-linux-musl.outputs.orca-source
-            || needs.build-x86_64-linux-gnu.outputs.orca-source
-            || needs.build-aarch64-darwin.outputs.orca-source
-            || needs.build-aarch64-linux-musl.outputs.orca-source
-            || needs.build-aarch64-linux-gnu.outputs.orca-source }}
-          build-results: |
-            ui-build:${{ needs.ui-build.result }}
-            gnu-x86:${{ needs.build-x86_64-linux-gnu.result }}
-            musl-x86:${{ needs.build-x86_64-linux-musl.result }}
-            gnu-arm:${{ needs.build-aarch64-linux-gnu.result }}
-            musl-arm:${{ needs.build-aarch64-linux-musl.result }}
-            darwin-arm:${{ needs.build-aarch64-darwin.result }}
           signing-key: ${{ secrets.PLUGIN_SIGNING_KEY }}
           release-token: ${{ secrets.ORCA_RELEASE_TOKEN }}
           registry: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}
@@ -232,3 +116,15 @@ jobs:
           registry-user: ${{ secrets.CI_REGISTRY_USER }}
           registry-token: ${{ secrets.CI_REGISTRY_TOKEN }}
           github-token: ${{ secrets.GH_TOKEN }}
+
+  stable-draft:
+    needs: publish
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.repository }}-stable
+      cancel-in-progress: true
+    steps:
+      - uses: argyle-labs/.github/.github/actions/job-release-stable-draft@main
+        with:
+          tag: ${{ env.TAG }}
+          release-token: ${{ secrets.ORCA_RELEASE_TOKEN }}
