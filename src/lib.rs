@@ -41,6 +41,7 @@ pub mod host_settings;
 pub mod host_settings_write;
 pub mod labels;
 pub mod libvirt_stack;
+pub mod nfs_fsid;
 pub mod nfs_hygiene;
 pub mod parity;
 pub mod parity_control;
