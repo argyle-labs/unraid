@@ -289,7 +289,7 @@ pub(crate) fn protected_set(extra: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-fn endpoint_protected(endpoint: &str) -> Result<Vec<String>> {
+pub(crate) fn endpoint_protected(endpoint: &str) -> Result<Vec<String>> {
     let extra = secrets::get(&protected_secret(endpoint)).map_err(|e| {
         anyhow!("cannot read the protected list for endpoint '{endpoint}'; refusing to act: {e}")
     })?;
@@ -830,6 +830,71 @@ pub(crate) async fn delete_with(
         id.name, c.id
     );
     Ok(plan(id, text))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct ContainerDeleteOutput {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub stop_first: bool,
+    pub plan: String,
+    pub executed: bool,
+}
+
+pub(crate) async fn container_delete_with(
+    client: &Client,
+    endpoint: &str,
+    protected: &[String],
+    name: &str,
+    force: bool,
+    dry_run: bool,
+) -> Result<ContainerDeleteOutput> {
+    let all = containers(client).await?;
+    let c = resolve(&all, name)?;
+    refuse_orca(c)?;
+    warn_unmatched(endpoint, &all, protected);
+    let name = first_name(&c.names);
+    let state = state_of(c);
+    let guards = remove_guards(protected_match(c, protected).as_deref(), c);
+    if !guards.is_empty() && !force {
+        bail!(
+            "refusing to delete '{name}': {}; pass force to override",
+            guards.join(", ")
+        );
+    }
+    let stop_first = !is_stopped(c);
+    let plan = format!(
+        "{}docker.removeContainer '{name}' ({}), state={state}, withImage=false",
+        if stop_first { "docker.stop then " } else { "" },
+        c.id
+    );
+    let mut out = ContainerDeleteOutput {
+        id: c.id.clone(),
+        name,
+        state,
+        stop_first,
+        plan,
+        executed: false,
+    };
+    if dry_run {
+        return Ok(out);
+    }
+    if stop_first {
+        let data = mutate(client, &simple_document("stop"), json!({ "id": out.id })).await?;
+        expect_container(&data, "stop")?;
+    }
+    let data = mutate(
+        client,
+        REMOVE_DOCUMENT,
+        json!({ "id": out.id, "withImage": false }),
+    )
+    .await?;
+    expect_true(&data, "removeContainer")?;
+    out.executed = true;
+    Ok(out)
 }
 
 pub(crate) async fn detail_with(

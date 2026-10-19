@@ -34,6 +34,7 @@ pub mod cifs_mounts;
 pub mod deploy;
 pub mod disk_health;
 pub mod docker_adopt;
+pub mod docker_container_delete;
 pub mod dstate;
 pub mod endpoint;
 pub mod exports;

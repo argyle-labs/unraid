@@ -982,3 +982,128 @@ fn a_missing_protected_secret_means_defaults_only() {
     let got = crate::test_support::isolated(|| endpoint_protected("willow")).unwrap();
     assert_eq!(got.len(), DEFAULT_PROTECTED.len());
 }
+
+async fn delete_server() -> MockServer {
+    let s = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("DockerContainers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture()))
+        .mount(&s)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("stop(id"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"data": {"docker": {"stop": {"id": PLEX, "state": "EXITED"}}}}),
+            ),
+        )
+        .mount(&s)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("removeContainer"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": {"docker": {"removeContainer": true}}})),
+        )
+        .mount(&s)
+        .await;
+    s
+}
+
+#[test]
+fn container_delete_refuses_running_without_force_in_both_modes() {
+    let rt = rt();
+    let (dry, live, n) = rt.block_on(async {
+        let s = delete_server().await;
+        let c = client(&s);
+        let dry = container_delete_with(&c, "willow", &prot(), "plex", false, true)
+            .await
+            .unwrap_err();
+        let live = container_delete_with(&c, "willow", &prot(), "plex", false, false)
+            .await
+            .unwrap_err();
+        (dry, live, mutation_bodies(&s).await.len())
+    });
+    assert_eq!(dry.to_string(), live.to_string());
+    assert!(dry.to_string().contains("running (state=running)"), "{dry}");
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn container_delete_dry_run_reports_without_mutating() {
+    let rt = rt();
+    let (out, n) = rt.block_on(async {
+        let s = delete_server().await;
+        let out = container_delete_with(&client(&s), "willow", &prot(), "plex", true, true)
+            .await
+            .unwrap();
+        (out, mutation_bodies(&s).await.len())
+    });
+    assert!(!out.executed);
+    assert!(out.stop_first);
+    assert_eq!(out.id, PLEX);
+    assert!(
+        out.plan
+            .starts_with("docker.stop then docker.removeContainer 'plex'")
+    );
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn container_delete_forced_stops_then_removes_container_only() {
+    let rt = rt();
+    let (out, bodies) = rt.block_on(async {
+        let s = delete_server().await;
+        let out = container_delete_with(&client(&s), "willow", &prot(), "plex", true, false)
+            .await
+            .unwrap();
+        (out, mutation_bodies(&s).await)
+    });
+    assert!(out.executed);
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies[0]["query"].as_str().unwrap().contains("stop(id"));
+    assert!(
+        bodies[1]["query"]
+            .as_str()
+            .unwrap()
+            .contains("removeContainer")
+    );
+    assert_eq!(
+        bodies[1]["variables"],
+        json!({"id": PLEX, "withImage": false})
+    );
+}
+
+#[test]
+fn container_delete_skips_stop_for_a_stopped_container() {
+    let rt = rt();
+    let (out, bodies) = rt.block_on(async {
+        let s = delete_server().await;
+        let out = container_delete_with(&client(&s), "willow", &prot(), "plex-dev", false, false)
+            .await
+            .unwrap();
+        (out, mutation_bodies(&s).await)
+    });
+    assert!(out.executed && !out.stop_first);
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0]["query"]
+            .as_str()
+            .unwrap()
+            .contains("removeContainer")
+    );
+}
+
+#[test]
+fn container_delete_refuses_orca_even_with_force() {
+    let rt = rt();
+    let (err, n) = rt.block_on(async {
+        let s = delete_server().await;
+        let err = container_delete_with(&client(&s), "willow", &prot(), "orca", true, false)
+            .await
+            .unwrap_err();
+        (err, mutation_bodies(&s).await.len())
+    });
+    assert!(err.to_string().contains("orca's own container"), "{err}");
+    assert_eq!(n, 0);
+}
