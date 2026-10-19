@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use plugin_toolkit::prelude::*;
 
-use crate::endpoint::{self, endpoint_db};
+use crate::endpoint::{self, EndpointRow, endpoint_db};
 use crate::{Client, Config, schema_pull};
 
 /// [`Config`] for an explicit `from` override; carries this host's CSRF token
@@ -42,7 +42,13 @@ pub(crate) async fn surface_client(
             "`from`/`api_key`/`insecure` overrides are not accepted on surface tools — register an endpoint with `unraid.create`"
         );
     }
-    let row = match endpoint {
+    let row = surface_endpoint(endpoint)?;
+    Ok(Client::new(endpoint::resolve_config(&row).await?))
+}
+
+/// The named endpoint, or the sole registered one when `endpoint` is omitted.
+pub(crate) fn surface_endpoint(endpoint: Option<String>) -> Result<EndpointRow> {
+    Ok(match endpoint {
         Some(name) => endpoint_db::get(&name)?
             .ok_or_else(|| anyhow!("no unraid endpoint named `{name}` — see `unraid.list`"))?,
         None => {
@@ -53,8 +59,7 @@ pub(crate) async fn surface_client(
                 n => bail!("{n} unraid endpoints registered — pass `endpoint` to pick one"),
             }
         }
-    };
-    Ok(Client::new(endpoint::resolve_config(&row).await?))
+    })
 }
 
 #[orca_struct(args)]

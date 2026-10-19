@@ -230,7 +230,7 @@ fn dry_run_sends_no_mutation() {
             &client(&s),
             "willow",
             &prot(),
-            update("plex", "remove", Some(r#"{"dryRun":true}"#)),
+            update("plex", "remove", Some(r#"{"dryRun":true,"force":true}"#)),
         )
         .await;
         (out, mutation_bodies(&s).await)
@@ -468,20 +468,20 @@ fn own_id_must_match_the_full_bare_id() {
 #[test]
 fn with_image_is_refused_while_another_container_uses_it() {
     let rt = rt();
-    let (plan_out, err, bodies) = rt.block_on(async {
+    let (dry, err, bodies) = rt.block_on(async {
         let s = server("removeContainer", json!(true)).await;
-        let plan_out = update_with(
+        let dry = update_with(
             &client(&s),
             "willow",
             &prot(),
             update(
                 "plex",
                 "remove",
-                Some(r#"{"withImage":true,"dryRun":true}"#),
+                Some(r#"{"withImage":true,"force":true,"dryRun":true}"#),
             ),
         )
         .await
-        .unwrap();
+        .unwrap_err();
         let err = update_with(
             &client(&s),
             "willow",
@@ -490,12 +490,9 @@ fn with_image_is_refused_while_another_container_uses_it() {
         )
         .await
         .unwrap_err();
-        (plan_out, err, mutation_bodies(&s).await)
+        (dry, err, mutation_bodies(&s).await)
     });
-    let VerbOutcome::Item(i) = plan_out else {
-        panic!("expected plan")
-    };
-    assert!(i.payload.contains("plex-dev"), "{}", i.payload);
+    assert_eq!(dry.to_string(), err.to_string());
     assert!(err.to_string().contains("plex-dev"), "{err}");
     assert!(bodies.is_empty());
 }
@@ -676,17 +673,17 @@ fn cgroup_id_wins_when_sources_disagree() {
 #[test]
 fn remove_needs_a_stopped_container_unless_forced() {
     let rt = rt();
-    let (plan_out, refused, forced, n) = rt.block_on(async {
-        let s = server("removeContainer", json!(true)).await;
+    let (dry, refused, forced, n) = rt.block_on(async {
+        let s = delete_server().await;
         let c = client(&s);
-        let plan_out = update_with(
+        let dry = update_with(
             &c,
             "willow",
             &prot(),
             update("plex", "remove", Some(r#"{"dryRun":true}"#)),
         )
         .await
-        .unwrap();
+        .unwrap_err();
         let refused = update_with(&c, "willow", &prot(), update("plex", "remove", None))
             .await
             .unwrap_err();
@@ -697,18 +694,15 @@ fn remove_needs_a_stopped_container_unless_forced() {
             update("plex", "remove", Some(r#"{"force":true}"#)),
         )
         .await;
-        (plan_out, refused, forced, mutation_bodies(&s).await.len())
+        (dry, refused, forced, mutation_bodies(&s).await.len())
     });
-    let VerbOutcome::Item(i) = plan_out else {
-        panic!("expected plan")
-    };
-    assert!(i.payload.contains("state=running"), "{}", i.payload);
+    assert_eq!(dry.to_string(), refused.to_string());
     assert!(
         refused.to_string().contains("running (state=running)"),
         "{refused}"
     );
     assert!(forced.is_ok());
-    assert_eq!(n, 1);
+    assert_eq!(n, 2);
 }
 
 #[test]
@@ -981,4 +975,129 @@ fn a_secret_backend_error_fails_closed() {
 fn a_missing_protected_secret_means_defaults_only() {
     let got = crate::test_support::isolated(|| endpoint_protected("willow")).unwrap();
     assert_eq!(got.len(), DEFAULT_PROTECTED.len());
+}
+
+async fn delete_server() -> MockServer {
+    let s = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("DockerContainers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture()))
+        .mount(&s)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("stop(id"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"data": {"docker": {"stop": {"id": PLEX, "state": "EXITED"}}}}),
+            ),
+        )
+        .mount(&s)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("removeContainer"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": {"docker": {"removeContainer": true}}})),
+        )
+        .mount(&s)
+        .await;
+    s
+}
+
+#[test]
+fn container_delete_refuses_running_without_force_in_both_modes() {
+    let rt = rt();
+    let (dry, live, n) = rt.block_on(async {
+        let s = delete_server().await;
+        let c = client(&s);
+        let dry = container_delete_with(&c, "willow", &prot(), "plex", false, true)
+            .await
+            .unwrap_err();
+        let live = container_delete_with(&c, "willow", &prot(), "plex", false, false)
+            .await
+            .unwrap_err();
+        (dry, live, mutation_bodies(&s).await.len())
+    });
+    assert_eq!(dry.to_string(), live.to_string());
+    assert!(dry.to_string().contains("running (state=running)"), "{dry}");
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn container_delete_dry_run_reports_without_mutating() {
+    let rt = rt();
+    let (out, n) = rt.block_on(async {
+        let s = delete_server().await;
+        let out = container_delete_with(&client(&s), "willow", &prot(), "plex", true, true)
+            .await
+            .unwrap();
+        (out, mutation_bodies(&s).await.len())
+    });
+    assert!(!out.executed);
+    assert!(out.stop_first);
+    assert_eq!(out.id, PLEX);
+    assert!(
+        out.plan
+            .starts_with("docker.stop then docker.removeContainer 'plex'")
+    );
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn container_delete_forced_stops_then_removes_container_only() {
+    let rt = rt();
+    let (out, bodies) = rt.block_on(async {
+        let s = delete_server().await;
+        let out = container_delete_with(&client(&s), "willow", &prot(), "plex", true, false)
+            .await
+            .unwrap();
+        (out, mutation_bodies(&s).await)
+    });
+    assert!(out.executed);
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies[0]["query"].as_str().unwrap().contains("stop(id"));
+    assert!(
+        bodies[1]["query"]
+            .as_str()
+            .unwrap()
+            .contains("removeContainer")
+    );
+    assert_eq!(
+        bodies[1]["variables"],
+        json!({"id": PLEX, "withImage": false})
+    );
+}
+
+#[test]
+fn container_delete_skips_stop_for_a_stopped_container() {
+    let rt = rt();
+    let (out, bodies) = rt.block_on(async {
+        let s = delete_server().await;
+        let out = container_delete_with(&client(&s), "willow", &prot(), "plex-dev", false, false)
+            .await
+            .unwrap();
+        (out, mutation_bodies(&s).await)
+    });
+    assert!(out.executed && !out.stop_first);
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0]["query"]
+            .as_str()
+            .unwrap()
+            .contains("removeContainer")
+    );
+}
+
+#[test]
+fn container_delete_refuses_orca_even_with_force() {
+    let rt = rt();
+    let (err, n) = rt.block_on(async {
+        let s = delete_server().await;
+        let err = container_delete_with(&client(&s), "willow", &prot(), "orca", true, false)
+            .await
+            .unwrap_err();
+        (err, mutation_bodies(&s).await.len())
+    });
+    assert!(err.to_string().contains("orca's own container"), "{err}");
+    assert_eq!(n, 0);
 }

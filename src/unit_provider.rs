@@ -289,7 +289,7 @@ pub(crate) fn protected_set(extra: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-fn endpoint_protected(endpoint: &str) -> Result<Vec<String>> {
+pub(crate) fn endpoint_protected(endpoint: &str) -> Result<Vec<String>> {
     let extra = secrets::get(&protected_secret(endpoint)).map_err(|e| {
         anyhow!("cannot read the protected list for endpoint '{endpoint}'; refusing to act: {e}")
     })?;
@@ -763,50 +763,19 @@ pub(crate) async fn update_with(
         }
         ACTION_REMOVE => {
             let p: RemovePayload = parse_payload(action, payload)?;
-            let sharers = image_sharers(&all, c);
-            let shared = if p.with_image && c.image_id.is_empty() {
-                "; withImage refused: Unraid reported no imageId".to_string()
-            } else if p.with_image && !sharers.is_empty() {
-                format!(
-                    "; withImage refused: image also used by {}",
-                    names_of(&sharers)
-                )
-            } else {
-                String::new()
-            };
-            let state = state_of(c);
-            let guards = remove_guards(protected_by.as_deref(), c);
-            let guard_note = match (guards.is_empty(), p.force) {
-                (true, _) => String::new(),
-                (false, true) => format!("; force overrides: {}", guards.join(", ")),
-                (false, false) => format!("; force required by: {}", guards.join(", ")),
-            };
-            if p.dry_run {
-                return Ok(plan(
-                    id,
-                    format!(
-                        "docker.removeContainer '{name}' ({}), state={state}, withImage={}{shared}{guard_note}",
-                        c.id, p.with_image
-                    ),
-                ));
-            }
-            if !guards.is_empty() && !p.force {
-                bail!(
-                    "refusing to remove '{name}': {}; pass {{\"force\": true}} to override {}",
-                    guards.join(", "),
-                    if guards.len() > 1 { "both" } else { "it" }
-                );
-            }
-            if !shared.is_empty() {
-                bail!("refusing withImage for '{name}'{shared}");
-            }
-            let data = mutate(
+            let out = container_delete_in(
                 client,
-                REMOVE_DOCUMENT,
-                json!({ "id": c.id, "withImage": p.with_image }),
+                &all,
+                c,
+                protected_by.as_deref(),
+                p.with_image,
+                p.force,
+                p.dry_run,
             )
             .await?;
-            expect_true(&data, "removeContainer")?;
+            if p.dry_run {
+                return Ok(plan(id, out.plan));
+            }
             Ok(changed(format!("removed {name}")))
         }
         other => bail!("unknown container update action: {other}"),
@@ -830,6 +799,111 @@ pub(crate) async fn delete_with(
         id.name, c.id
     );
     Ok(plan(id, text))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct ContainerDeleteOutput {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub stop_first: bool,
+    pub plan: String,
+    pub executed: bool,
+}
+
+pub(crate) async fn container_delete_with(
+    client: &Client,
+    endpoint: &str,
+    protected: &[String],
+    name: &str,
+    force: bool,
+    dry_run: bool,
+) -> Result<ContainerDeleteOutput> {
+    let all = containers(client).await?;
+    let c = resolve(&all, name)?;
+    refuse_orca(c)?;
+    warn_unmatched(endpoint, &all, protected);
+    let protected_by = protected_match(c, protected);
+    container_delete_in(
+        client,
+        &all,
+        c,
+        protected_by.as_deref(),
+        false,
+        force,
+        dry_run,
+    )
+    .await
+}
+
+async fn container_delete_in(
+    client: &Client,
+    all: &[Container],
+    c: &Container,
+    protected_by: Option<&str>,
+    with_image: bool,
+    force: bool,
+    dry_run: bool,
+) -> Result<ContainerDeleteOutput> {
+    let name = first_name(&c.names);
+    let state = state_of(c);
+    let guards = remove_guards(protected_by, c);
+    if !guards.is_empty() && !force {
+        bail!(
+            "refusing to remove '{name}': {}; pass {{\"force\": true}} to override {}",
+            guards.join(", "),
+            if guards.len() > 1 { "both" } else { "it" }
+        );
+    }
+    if with_image {
+        if c.image_id.is_empty() {
+            bail!("refusing withImage for '{name}': Unraid reported no imageId");
+        }
+        let sharers = image_sharers(all, c);
+        if !sharers.is_empty() {
+            bail!(
+                "refusing withImage for '{name}': image also used by {}",
+                names_of(&sharers)
+            );
+        }
+    }
+    let stop_first = !is_stopped(c);
+    let overrides = if guards.is_empty() {
+        String::new()
+    } else {
+        format!("; force overrides: {}", guards.join(", "))
+    };
+    let plan = format!(
+        "{}docker.removeContainer '{name}' ({}), state={state}, withImage={with_image}{overrides}",
+        if stop_first { "docker.stop then " } else { "" },
+        c.id
+    );
+    let mut out = ContainerDeleteOutput {
+        id: c.id.clone(),
+        name,
+        state,
+        stop_first,
+        plan,
+        executed: false,
+    };
+    if dry_run {
+        return Ok(out);
+    }
+    if stop_first {
+        let data = mutate(client, &simple_document("stop"), json!({ "id": out.id })).await?;
+        expect_container(&data, "stop")?;
+    }
+    let data = mutate(
+        client,
+        REMOVE_DOCUMENT,
+        json!({ "id": out.id, "withImage": with_image }),
+    )
+    .await?;
+    expect_true(&data, "removeContainer")?;
+    out.executed = true;
+    Ok(out)
 }
 
 pub(crate) async fn detail_with(
