@@ -28,8 +28,9 @@ use plugin_toolkit::plugin::Plugin;
 // is purely for its link-time side effect.
 #[allow(unused_imports)]
 use unraid::{
-    docker_adopt as _, docker_container_delete as _, host_settings_write as _, share_cache as _,
-    surface as _, tools as _, vm_autostart as _, vm_availability as _, vm_power as _, vm_xml as _,
+    docker_adopt as _, docker_container_delete as _, host_settings_write as _, nfs_fsid as _,
+    parity_control as _, share_cache as _, smb_share_write as _, surface as _, tools as _,
+    vm_autostart as _, vm_availability as _, vm_power as _, vm_xml as _,
 };
 
 fn main() -> plugin_toolkit::anyhow::Result<()> {
@@ -55,4 +56,39 @@ fn main() -> plugin_toolkit::anyhow::Result<()> {
             Box::new(unraid::registration::backup_dispatcher),
         )
         .serve()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_hand_written_tool_is_linked() {
+        let linked: Vec<&str> =
+            plugin_toolkit::inventory::iter::<plugin_toolkit::dispatch::ToolRegistration>
+                .into_iter()
+                .map(|r| r.name)
+                .collect();
+        for verb in [
+            "create",
+            "update",
+            "delete",
+            "schema",
+            "docker.adopt",
+            "docker.container.delete",
+            "docker.set_icon",
+            "docker.status",
+            "host.settings.set",
+            "nfs.fsids",
+            "parity.control",
+            "share.cache",
+            "share.cache.set",
+            "smb.share.set",
+            "vm.autostart",
+            "vm.availability",
+            "vm.power",
+            "vm.xml",
+        ] {
+            let name = format!("unraid.{verb}");
+            assert!(linked.contains(&name.as_str()), "{name} not linked");
+        }
+    }
 }

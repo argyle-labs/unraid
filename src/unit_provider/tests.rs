@@ -230,7 +230,7 @@ fn dry_run_sends_no_mutation() {
             &client(&s),
             "willow",
             &prot(),
-            update("plex", "remove", Some(r#"{"dryRun":true}"#)),
+            update("plex", "remove", Some(r#"{"dryRun":true,"force":true}"#)),
         )
         .await;
         (out, mutation_bodies(&s).await)
@@ -468,20 +468,20 @@ fn own_id_must_match_the_full_bare_id() {
 #[test]
 fn with_image_is_refused_while_another_container_uses_it() {
     let rt = rt();
-    let (plan_out, err, bodies) = rt.block_on(async {
+    let (dry, err, bodies) = rt.block_on(async {
         let s = server("removeContainer", json!(true)).await;
-        let plan_out = update_with(
+        let dry = update_with(
             &client(&s),
             "willow",
             &prot(),
             update(
                 "plex",
                 "remove",
-                Some(r#"{"withImage":true,"dryRun":true}"#),
+                Some(r#"{"withImage":true,"force":true,"dryRun":true}"#),
             ),
         )
         .await
-        .unwrap();
+        .unwrap_err();
         let err = update_with(
             &client(&s),
             "willow",
@@ -490,12 +490,9 @@ fn with_image_is_refused_while_another_container_uses_it() {
         )
         .await
         .unwrap_err();
-        (plan_out, err, mutation_bodies(&s).await)
+        (dry, err, mutation_bodies(&s).await)
     });
-    let VerbOutcome::Item(i) = plan_out else {
-        panic!("expected plan")
-    };
-    assert!(i.payload.contains("plex-dev"), "{}", i.payload);
+    assert_eq!(dry.to_string(), err.to_string());
     assert!(err.to_string().contains("plex-dev"), "{err}");
     assert!(bodies.is_empty());
 }
@@ -676,17 +673,17 @@ fn cgroup_id_wins_when_sources_disagree() {
 #[test]
 fn remove_needs_a_stopped_container_unless_forced() {
     let rt = rt();
-    let (plan_out, refused, forced, n) = rt.block_on(async {
-        let s = server("removeContainer", json!(true)).await;
+    let (dry, refused, forced, n) = rt.block_on(async {
+        let s = delete_server().await;
         let c = client(&s);
-        let plan_out = update_with(
+        let dry = update_with(
             &c,
             "willow",
             &prot(),
             update("plex", "remove", Some(r#"{"dryRun":true}"#)),
         )
         .await
-        .unwrap();
+        .unwrap_err();
         let refused = update_with(&c, "willow", &prot(), update("plex", "remove", None))
             .await
             .unwrap_err();
@@ -697,18 +694,15 @@ fn remove_needs_a_stopped_container_unless_forced() {
             update("plex", "remove", Some(r#"{"force":true}"#)),
         )
         .await;
-        (plan_out, refused, forced, mutation_bodies(&s).await.len())
+        (dry, refused, forced, mutation_bodies(&s).await.len())
     });
-    let VerbOutcome::Item(i) = plan_out else {
-        panic!("expected plan")
-    };
-    assert!(i.payload.contains("state=running"), "{}", i.payload);
+    assert_eq!(dry.to_string(), refused.to_string());
     assert!(
         refused.to_string().contains("running (state=running)"),
         "{refused}"
     );
     assert!(forced.is_ok());
-    assert_eq!(n, 1);
+    assert_eq!(n, 2);
 }
 
 #[test]
