@@ -240,7 +240,7 @@ pub(crate) fn read_redacted_as_root(name: &str) -> Result<String> {
 }
 
 /// Export this machine's libvirt VM definitions with checksums. Read-only.
-#[orca_tool(domain = "unraid", verb = "vm.xml", role = "admin")]
+#[orca_tool(domain = "unraid", verb = "vm.xml", role = "admin", reaches = ["privileged.apply"])]
 async fn unraid_vm_xml(args: UnraidVmXmlArgs, ctx: &ToolCtx) -> Result<VmXmlOutput> {
     require_admin("unraid.vm.xml", ctx.caller().as_ref())?;
     crate::vm_availability::require().await?;

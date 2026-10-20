@@ -474,7 +474,8 @@ pub(crate) fn plan_in(
     verb = "share.cache.set",
     role = "admin",
     data_mutation = true,
-    execute_gated = false
+    execute_gated = false,
+    reaches = ["privileged.apply"]
 )]
 async fn unraid_share_cache_set(
     args: UnraidShareCacheSetArgs,

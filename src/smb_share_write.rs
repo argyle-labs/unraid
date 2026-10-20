@@ -386,7 +386,8 @@ pub(crate) fn plan_in(
     verb = "smb.share.set",
     role = "admin",
     data_mutation = true,
-    execute_gated = false
+    execute_gated = false,
+    reaches = ["privileged.apply"]
 )]
 async fn unraid_smb_share_set(
     args: UnraidSmbShareSetArgs,

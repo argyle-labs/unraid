@@ -23,18 +23,6 @@ fn main() {
     println!("cargo:rerun-if-changed=schemas");
     plugin_toolkit_build::graphql::generate(&schemas_dir, &queries_dir)
         .expect("unraid graphql codegen");
-    let modules = out_dir.join("modules.rs");
-    let src = std::fs::read_to_string(&modules).expect("read modules.rs");
-    let src = src
-        .replace(
-            "pub type DateTime = String;\n",
-            "pub type DateTime = String;\npub type JSON = ::plugin_toolkit::serde_json::Value;\npub type Port = i64;\npub type URL = String;\n",
-        )
-        .replace(
-            "use super::{BigInt, DateTime, PrefixedID};",
-            "use super::{BigInt, DateTime, JSON, Port, PrefixedID, URL};",
-        );
-    std::fs::write(&modules, src).expect("write modules.rs");
 
     // Generate the orca tool surface from the just-emitted query modules via the
     // shared toolkit pass (was the local `build/surface.rs` prototype). Mutations

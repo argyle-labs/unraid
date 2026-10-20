@@ -32,13 +32,13 @@ pub struct UnraidEndpoint {
     pub insecure: bool,
 }
 
-fn api_key_secret(name: &str) -> String {
+fn api_key_secret(name: &str) -> Result<secrets::SecretRef> {
     secrets::scoped_name(PROVIDER, name, "api_key")
 }
 
 fn set_api_key(name: &str, key: &str) -> Result<()> {
     secrets::set(
-        &api_key_secret(name),
+        api_key_secret(name)?.as_str(),
         key,
         Some(&format!("unraid API key for endpoint '{name}'")),
     )?;
@@ -46,7 +46,8 @@ fn set_api_key(name: &str, key: &str) -> Result<()> {
 }
 
 fn api_key(name: &str) -> Result<String> {
-    secrets::get(&api_key_secret(name))?
+    secrets::get(api_key_secret(name)?.as_str())?
+        .map(|k| k.expose_secret().clone())
         .filter(|k| !k.is_empty())
         .ok_or_else(|| {
             anyhow!(
@@ -298,7 +299,7 @@ pub struct UnraidDeleteOutput {
 async fn unraid_delete(args: UnraidDeleteArgs, _ctx: &ToolCtx) -> Result<UnraidDeleteOutput> {
     validate_name(&args.name)?;
     let changed = endpoint_db::remove(&args.name)?;
-    let secret_removed = secrets::delete(&api_key_secret(&args.name))?;
+    let secret_removed = secrets::delete(api_key_secret(&args.name)?.as_str())?;
     Ok(UnraidDeleteOutput {
         name: args.name,
         changed,

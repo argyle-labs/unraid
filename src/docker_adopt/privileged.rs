@@ -1064,61 +1064,12 @@ impl PrivilegedRunner for Sudo {
 
 impl Sudo {
     async fn run_sudo(&self, op: &PrivilegedOp) -> Result<String> {
-        let mut req = serde_json::to_value(op)?;
-        if let Some(o) = req.as_object_mut() {
-            o.insert("plugin".to_string(), Value::from("unraid"));
-        }
-        let mut child = tokio::process::Command::new("/usr/bin/sudo")
-            .args(["-n", &self.orca_bin, "admin", "plugin-apply"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .context("spawn sudo")?;
-        let mut stdin = child.stdin.take().context("sudo stdin")?;
-        let body = serde_json::to_vec(&req)?;
-        // The seam reads until EOF, so stdin is dropped once written; the
-        // write and the output drain run together so a full pipe cannot stall.
-        let write = async move {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(&body).await
-        };
-        let (written, out) = tokio::join!(write, child.wait_with_output());
-        let out = out.context("wait for sudo")?;
-        written.context("write request to sudo")?;
-        parse_reply(
-            out.status.success(),
-            out.status.code(),
-            &String::from_utf8_lossy(&out.stdout),
-            &String::from_utf8_lossy(&out.stderr),
-        )
-    }
-}
-
-/// Success needs both a zero exit and an `ok: true` reply.
-pub fn parse_reply(success: bool, code: Option<i32>, stdout: &str, stderr: &str) -> Result<String> {
-    let reply: Option<PrivilegedReply> = stdout
-        .lines()
-        .rev()
-        .find_map(|l| serde_json::from_str(l.trim()).ok());
-    match reply {
-        Some(PrivilegedReply {
-            ok: true, detail, ..
-        }) if success => Ok(detail.unwrap_or_default()),
-        Some(PrivilegedReply { ok: true, .. }) => {
-            bail!(
-                "privileged seam exited {code:?} despite an ok reply: {}",
-                stderr.trim()
-            )
-        }
-        Some(PrivilegedReply { error, .. }) => {
-            bail!("{}", error.unwrap_or_else(|| "privileged op failed".into()))
-        }
-        None => bail!(
-            "privileged seam gave no reply (exit {code:?}): {}",
-            stderr.trim()
-        ),
+        let req = serde_json::to_value(op)?;
+        let name = req
+            .get("op")
+            .and_then(Value::as_str)
+            .context("privileged op has no name")?;
+        plugin_toolkit::privileged::apply("unraid", name, req.get("payload")).await
     }
 }
 
@@ -1756,15 +1707,6 @@ mod tests {
         assert!(validate_run_id("20230229-000000-0123abcd").is_err());
         assert!(validate_nonce(NONCE).is_ok());
         assert!(validate_nonce("xyz").is_err());
-    }
-
-    #[test]
-    fn replies_need_zero_exit_and_ok() {
-        let ok = r#"{"ok":true,"detail":"root"}"#;
-        assert_eq!(parse_reply(true, Some(0), ok, "").unwrap(), "root");
-        assert!(parse_reply(false, Some(1), ok, "").is_err());
-        assert!(parse_reply(true, Some(0), r#"{"ok":false,"error":"no"}"#, "").is_err());
-        assert!(parse_reply(true, Some(0), "", "").is_err());
     }
 
     #[tokio::test]
