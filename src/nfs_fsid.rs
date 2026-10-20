@@ -206,19 +206,24 @@ pub(crate) fn install_secret_in(
     if let Some(s) = cached.as_ref() {
         return Ok(s.clone());
     }
-    let name = secrets::scoped_name("unraid", SECRET_INSTANCE, SERVER_KEY_SECRET);
-    let stored =
-        |n: &str| -> Result<Option<String>> { Ok(secrets::get(n)?.filter(|s| !s.is_empty())) };
-    if let Some(s) = stored(&name)? {
+    let secret_ref = secrets::scoped_name("unraid", SECRET_INSTANCE, SERVER_KEY_SECRET)?;
+    let name = secret_ref.as_str();
+    let stored = |n: &str| -> Result<Option<String>> {
+        Ok(secrets::get(n)?
+            .map(|s| s.expose_secret().clone())
+            .filter(|s| !s.is_empty()))
+    };
+    if let Some(s) = stored(name)? {
         *cached = Some(s.clone());
         return Ok(s);
     }
     let secret = hash::hex_encode(&random()?);
-    secrets::set(&name, &secret, Some("unraid NFS serverKey HMAC secret"))?;
-    let value = match stored(&name)? {
+    secrets::set(name, &secret, Some("unraid NFS serverKey HMAC secret"))?;
+    let value = match stored(name)? {
         Some(v) => v,
-        None => stored(&name)?
-            .ok_or_else(|| anyhow!("secret '{name}' not readable after it was set"))?,
+        None => {
+            stored(name)?.ok_or_else(|| anyhow!("secret '{name}' not readable after it was set"))?
+        }
     };
     *cached = Some(value.clone());
     Ok(value)

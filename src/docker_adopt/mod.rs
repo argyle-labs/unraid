@@ -1874,7 +1874,8 @@ pub fn set_icon_blockers(s: &Snapshot) -> Vec<String> {
     domain = "unraid",
     verb = "docker.set_icon",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    reaches = ["privileged.apply"]
 )]
 async fn unraid_docker_set_icon(
     args: UnraidDockerSetIconArgs,
@@ -2129,7 +2130,8 @@ pub struct UnraidDockerAdoptArgs {
     domain = "unraid",
     verb = "docker.adopt",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    reaches = ["privileged.apply"]
 )]
 async fn unraid_docker_adopt(args: UnraidDockerAdoptArgs, ctx: &ToolCtx) -> Result<DockerChange> {
     const TOOL: &str = "unraid.docker.adopt";

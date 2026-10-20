@@ -270,7 +270,7 @@ fn refuse_orca(c: &Container) -> Result<()> {
     Ok(())
 }
 
-fn protected_secret(endpoint: &str) -> String {
+fn protected_secret(endpoint: &str) -> Result<secrets::SecretRef> {
     secrets::scoped_name(MANAGER, endpoint, "protected")
 }
 
@@ -290,10 +290,12 @@ pub(crate) fn protected_set(extra: Option<&str>) -> Vec<String> {
 }
 
 pub(crate) fn endpoint_protected(endpoint: &str) -> Result<Vec<String>> {
-    let extra = secrets::get(&protected_secret(endpoint)).map_err(|e| {
+    let extra = secrets::get(protected_secret(endpoint)?.as_str()).map_err(|e| {
         anyhow!("cannot read the protected list for endpoint '{endpoint}'; refusing to act: {e}")
     })?;
-    Ok(protected_set(extra.as_deref()))
+    Ok(protected_set(
+        extra.as_ref().map(|s| s.expose_secret().as_str()),
+    ))
 }
 
 fn image_path(image: &str) -> &str {

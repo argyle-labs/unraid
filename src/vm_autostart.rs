@@ -142,7 +142,8 @@ pub struct VmAutostartOutput {
     verb = "vm.autostart",
     role = "admin",
     data_mutation = true,
-    execute_gated = false
+    execute_gated = false,
+    reaches = ["privileged.apply"]
 )]
 async fn unraid_vm_autostart(
     args: UnraidVmAutostartArgs,
