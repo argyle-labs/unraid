@@ -397,14 +397,18 @@ fn every_hand_written_write_tool_is_admin() {
                 .join(" ");
             rest = &attr_start[end..];
             seen += 1;
+            assert!(
+                !attr.replace(' ', "").contains("data_mutation=true"),
+                "{}: {attr}",
+                path.display()
+            );
             let verb = attr
                 .split("verb = \"")
                 .nth(1)
                 .and_then(|v| v.split('"').next())
                 .unwrap_or_default();
             let last = verb.rsplit('.').next().unwrap_or_default();
-            let writes = attr.contains("data_mutation = true")
-                || WRITE_VERBS.iter().any(|w| last.starts_with(w));
+            let writes = WRITE_VERBS.iter().any(|w| last.starts_with(w));
             if writes {
                 assert!(
                     attr.contains("role = \"admin\""),

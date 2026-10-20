@@ -241,7 +241,6 @@ pub(crate) fn partial_apply(
     domain = "unraid",
     verb = "host.settings.set",
     role = "admin",
-    data_mutation = true,
     execute_gated = false
 )]
 async fn unraid_host_settings_set(

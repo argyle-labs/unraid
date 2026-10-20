@@ -115,7 +115,6 @@ pub struct ParityControlOutput {
     domain = "unraid",
     verb = "parity.control",
     role = "admin",
-    data_mutation = true,
     execute_gated = false
 )]
 async fn unraid_parity_control(

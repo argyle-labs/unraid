@@ -141,7 +141,6 @@ pub struct VmAutostartOutput {
     domain = "unraid",
     verb = "vm.autostart",
     role = "admin",
-    data_mutation = true,
     execute_gated = false,
     reaches = ["privileged.apply"]
 )]
