@@ -319,9 +319,7 @@ fn every_mutation_tool_is_admin() {
         .filter(|l| l.starts_with("#[orca_tool("))
         .collect();
     for attr in &attrs {
-        if attr.contains("data_mutation = true") {
-            assert!(attr.contains("role = \"admin\""), "{attr}");
-        }
+        assert!(!attr.contains("data_mutation = true"), "{attr}");
     }
     for (stem, doc) in query_docs() {
         if operation(&doc).0 != "mutation" {
@@ -332,7 +330,7 @@ fn every_mutation_tool_is_admin() {
             continue;
         };
         assert!(
-            attr.contains("role = \"admin\"") && attr.contains("data_mutation = true"),
+            attr.contains("role = \"admin\"") && !attr.contains("data_mutation = true"),
             "{attr}"
         );
     }

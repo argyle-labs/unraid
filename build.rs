@@ -26,9 +26,8 @@ fn main() {
 
     // Generate the orca tool surface from the just-emitted query modules via the
     // shared toolkit pass (was the local `build/surface.rs` prototype). Mutations
-    // surface as `data_mutation = true` + `role = "admin"`; a specific operation
-    // can opt out to `role = "read"` via a `# @orca:user-callable` comment in its
-    // `.graphql` file.
+    // surface as `role = "admin"`; `data_mutation = true` is never emitted
+    // because it opens a tool to non-admin `can_mutate` callers.
     plugin_toolkit_build::surface::graphql::generate(&out_dir, &queries_dir, "unraid")
         .expect("unraid surface codegen");
     let surface = out_dir.join("unraid_surface.rs");
