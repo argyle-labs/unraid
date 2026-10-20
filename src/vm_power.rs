@@ -101,7 +101,6 @@ pub struct VmPowerOutput {
     domain = "unraid",
     verb = "vm.power",
     role = "admin",
-    data_mutation = true,
     execute_gated = false
 )]
 async fn unraid_vm_power(args: UnraidVmPowerArgs, ctx: &ToolCtx) -> Result<VmPowerOutput> {

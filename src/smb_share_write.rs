@@ -385,7 +385,6 @@ pub(crate) fn plan_in(
     domain = "unraid",
     verb = "smb.share.set",
     role = "admin",
-    data_mutation = true,
     execute_gated = false,
     reaches = ["privileged.apply"]
 )]

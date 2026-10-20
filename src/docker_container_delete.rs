@@ -33,7 +33,6 @@ pub struct UnraidDockerContainerDeleteArgs {
     domain = "unraid",
     verb = "docker.container.delete",
     role = "admin",
-    data_mutation = true,
     execute_gated = false
 )]
 async fn unraid_docker_container_delete(
