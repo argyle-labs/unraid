@@ -46,7 +46,7 @@ path = "src/main.rs"
 # bollard, git2, toml and roxmltree into this binary. Only the four features
 # below are used: `db` because `plugin_toolkit::runtime` is gated on it, `http`
 # because this plugin makes real outbound calls, `graphql` for the Unraid API.
-plugin-toolkit = { version = "=0.2.1-rc.47", registry = "gitea", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db", "graphql", "http", "delegated-http"] }
+plugin-toolkit = { version = ">=0.2.1-rc.47", registry = "gitea", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db", "graphql", "http", "delegated-http"] }
 # Root-side file operations for `unraid.docker.*` hold directory descriptors
 # (openat/openat2, mkdirat, unlinkat, renameat) so a path swapped mid-operation
 # under the world-writable /mnt/user/appdata is never followed; the toolkit
@@ -69,7 +69,7 @@ tempfile = "3"
 rustls   = "0.23"
 
 [build-dependencies]
-plugin-toolkit-build = { version = "=0.2.1-rc.47", registry = "gitea", package = "orca-plugin-toolkit-build" }
+plugin-toolkit-build = { version = ">=0.2.1-rc.47", registry = "gitea", package = "orca-plugin-toolkit-build" }
 
 # Prototype GraphQL→orca-surface generator (build/surface.rs). Walks the emitted
 # query modules, pairs each operation via its `OPERATION_NAME`/`QUERY` consts,
